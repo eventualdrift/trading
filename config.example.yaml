@@ -1,0 +1,84 @@
+# tradebot configuration. Copy to config.yaml (`tradebot init`) and edit.
+# Secrets (API keys, Telegram token) go in .env, never in this file.
+
+# paper = simulated trades on real market data (signals are still sent to you)
+# live  = real orders on your exchange account. Only after a good paper record!
+mode: paper
+
+exchange:
+  id: binance            # any ccxt exchange id: binance, bybit, okx, kraken, kucoin, luno, ...
+  market_type: spot      # live trading is spot (long-only, no leverage) in this version
+  sandbox: false         # true = exchange testnet (binance/bybit/okx support it)
+  quote: USDT            # trade pairs quoted in this currency
+  data_exchange_id: null # optionally read market data from a different exchange
+
+universe:                # which markets the scanner watches
+  top_n: 20              # the N most liquid pairs by 24h volume
+  min_quote_volume: 5000000
+  whitelist: []          # e.g. [BTC/USDT, ETH/USDT, SOL/USDT] to scan only these
+  blacklist: []
+  refresh_hours: 6
+
+# Candidate timeframes. The learning cycle backtests every strategy on each one and
+# only trades the combinations that are profitable out-of-sample.
+timeframes: [15m, 1h, 4h, 1d]
+
+# Strategy families (override any parameter, e.g. trend: {rr: 2.5})
+strategies:
+  trend: {}              # buy pullbacks in an established trend
+  breakout: {}           # buy breakouts of the recent range on high volume
+  meanrev: {}            # buy oversold dips in ranging markets
+
+allow_short: false       # short signals (paper/signals only; live spot cannot short)
+
+data:
+  dir: data
+  history_days: {15m: 180, 1h: 540, 4h: 1095, 1d: 1825}
+
+costs:                   # used by backtests and paper trading - be pessimistic
+  fee_rate: 0.001        # 0.1% per side
+  slippage_rate: 0.0005  # 0.05% on market orders and stops
+
+risk:
+  risk_per_trade_pct: 1.0      # lose at most 1% of the account per trade
+  max_open_positions: 3
+  max_position_pct: 30         # no single position above 30% of the account
+  max_total_exposure_pct: 100  # never more than the account value in total (no leverage)
+  daily_loss_limit_pct: 3      # stop opening trades for the day after -3%
+  max_drawdown_pct: 15         # halt (until /resume) after -15% from the peak
+  min_reward_risk: 1.5         # only take trades that aim for >= 1.5x the risk
+  breakeven_at_r: 1.0          # move the stop to entry once the trade is +1R (0 = off)
+  max_chase_r: 0.3             # skip if price already ran 0.3R past the signal
+
+selection:                     # how strict strategy validation is
+  in_sample_fraction: 0.7
+  min_trades_in_sample: 30
+  min_trades_out_of_sample: 15
+  min_expectancy_r: 0.05
+  min_profit_factor: 1.1
+  min_symbol_win_fraction: 0.5
+
+ml:                            # self-learning trade filter
+  enabled: true
+  min_candidates: 400
+  min_test_trades: 30
+  min_improvement_r: 0.02
+  min_probability: null        # null = use the threshold learned from data
+
+learning:
+  retrain_every_hours: 168     # re-select strategies and retrain the model weekly
+  learn_on_start: true
+
+paper:
+  starting_balance: 1000
+
+live:
+  native_stop_loss: true       # also keep a stop-loss order on the exchange
+
+telegram:
+  enabled: true
+  daily_summary_hour_utc: 0
+
+poll_seconds: 30
+candle_close_delay_seconds: 15
+state_dir: state

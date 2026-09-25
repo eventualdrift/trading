@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# Secrets and runtime state - never commit these
+.env
+config.yaml
+data/
+state/
+*.db
+*.sqlite
+*.log

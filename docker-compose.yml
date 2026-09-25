@@ -1,0 +1,11 @@
+# Run 24/7 on a VPS:  docker compose up -d --build   ·   logs: docker compose logs -f
+services:
+  tradebot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./state:/app/state   # database, selected strategies, ML model
+      - ./data:/app/data     # cached price history
+    command: ["run"]
