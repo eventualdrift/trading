@@ -7,11 +7,12 @@ venv/
 build/
 dist/
 
-# Secrets and runtime state - never commit these
+# Secrets and runtime state - never commit these.
+# Leading "/" anchors to the repo root, so the tradebot/data/ source package is NOT ignored.
 .env
-config.yaml
-data/
-state/
+/config.yaml
+/data/
+/state/
 *.db
 *.sqlite
 *.log
