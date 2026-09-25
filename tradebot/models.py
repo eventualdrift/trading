@@ -67,7 +67,9 @@ class Position:
     max_hold_until: int
     signal_id: int | None = None
     confidence: float | None = None
-    status: str = "open"  # open | closed
+    # pending: recorded before the entry order is sent · open · closed
+    # failed: the entry definitely bought nothing · unknown: entry outcome unclear (check exchange)
+    status: str = "open"
     exit_price: float | None = None
     closed_at: int | None = None
     exit_reason: str | None = None
@@ -76,10 +78,29 @@ class Position:
     fees: float = 0.0
     entry_order_id: str | None = None
     sl_order_id: str | None = None
+    client_order_id: str | None = None
     breakeven_moved: bool = False
     last_checked_ms: int = 0
+    exit_filled: float = 0.0  # amount already sold (partial exits)
+    exit_value: float = 0.0  # quote proceeds of those sales
+    closing_reason: str | None = None  # a close was started but not completed; retried
     features: dict = field(default_factory=dict, repr=False)
     id: int | None = None
+
+    @classmethod
+    def from_signal(cls, sig: Signal, mode: str, amount: float, now_ms: int) -> "Position":
+        """A pending position, persisted *before* any order is sent."""
+        return cls(
+            symbol=sig.symbol, timeframe=sig.timeframe, strategy=sig.strategy, side=sig.side,
+            mode=mode, amount=amount, entry_price=sig.entry, stop_loss=sig.stop_loss,
+            take_profit=sig.take_profit, initial_stop=sig.stop_loss, opened_at=now_ms,
+            max_hold_until=sig.max_hold_until, signal_id=sig.id, confidence=sig.confidence,
+            status="pending", features=dict(sig.features),
+        )
+
+    @property
+    def open_amount(self) -> float:
+        return max(self.amount - self.exit_filled, 0.0)
 
     @property
     def sign(self) -> float:
@@ -87,14 +108,14 @@ class Position:
 
     @property
     def notional(self) -> float:
-        return self.entry_price * self.amount
+        return self.entry_price * self.open_amount
 
     @property
     def initial_risk(self) -> float:
         return abs(self.entry_price - self.initial_stop) * self.amount
 
     def unrealized(self, price: float) -> float:
-        return self.sign * (price - self.entry_price) * self.amount
+        return self.sign * (price - self.entry_price) * self.open_amount
 
     def r_at(self, price: float) -> float:
         per_unit = abs(self.entry_price - self.initial_stop)

@@ -155,8 +155,12 @@ def cmd_run(args, cfg):
     market = _market(cfg, authenticated=live)
     learn_market = _market(cfg)  # separate connection: learning runs in a background thread
     store = _store(cfg, learn_market)
-    broker = (LiveBroker(market, cfg.exchange.quote, cfg.live.native_stop_loss) if live
-              else PaperBroker(db, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), cfg.paper.starting_balance, market))
+    try:
+        broker = (LiveBroker(market, cfg.exchange.quote, cfg.live.native_stop_loss, cfg.live.fill_timeout_seconds)
+                  if live else
+                  PaperBroker(db, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), cfg.paper.starting_balance, market))
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     def learner(current):
         res = learning_cycle(cfg, learn_market, store=store, db=db, current_model=current, log_fn=log.info)

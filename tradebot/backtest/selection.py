@@ -92,13 +92,18 @@ def run_combo(
             continue
         pop = strategy.populate(df)
         split = strategy.warmup + int((len(df) - strategy.warmup) * frac)
+        split_time = pop.index[min(split, len(pop) - 1)]
         trades = backtest_populated(
             pop, strategy, costs, symbol=symbol, timeframe=timeframe,
             allow_short=cfg.allow_short, breakeven_at_r=cfg.risk.breakeven_at_r,
             min_reward_risk=cfg.risk.min_reward_risk,
         )
         for t in trades:
-            (is_trades if t.signal_idx < split else oos_trades).append(t)
+            if t.signal_idx >= split:
+                oos_trades.append(t)
+            elif t.exit_time < split_time:
+                is_trades.append(t)
+            # else: straddles the split - purged from both periods
         if len(trades) >= 3:
             per_symbol[symbol] = sum(t.r_multiple for t in trades) / len(trades)
     return is_trades, oos_trades, per_symbol

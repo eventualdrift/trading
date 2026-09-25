@@ -91,7 +91,9 @@ class PaperConfig:
 
 @dataclass
 class LiveConfig:
-    native_stop_loss: bool = True  # also place a stop order on the exchange as a safety net
+    native_stop_loss: bool = True  # keep a stop-loss order on the exchange (protects if the bot is down)
+    require_exchange_stop: bool = True  # sell at once if that stop can't be placed and verified
+    fill_timeout_seconds: float = 30  # cancel any unfilled part of a market order after this
 
 
 @dataclass
@@ -172,6 +174,8 @@ class BotConfig:
             errors.append("risk.min_reward_risk must be > 0")
         if self.mode == "live" and self.allow_short and self.exchange.market_type == "spot":
             errors.append("allow_short cannot be used for live spot trading")
+        if self.live.require_exchange_stop and not self.live.native_stop_loss:
+            errors.append("live.require_exchange_stop needs live.native_stop_loss: true")
         if not 0.3 <= self.selection.in_sample_fraction <= 0.9:
             errors.append("selection.in_sample_fraction must be in [0.3, 0.9]")
         if errors:

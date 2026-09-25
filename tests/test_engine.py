@@ -26,7 +26,9 @@ def test_take_profit_long_with_fees():
     entry = 100 * 1.0005
     assert out.reason == "take_profit" and out.exit_idx == 2
     assert out.entry_price == pytest.approx(entry)
-    net = (110 * 0.999 - entry * 1.001) / entry
+    exit_ = 110 * (1 - 0.0005)  # the bot sells at market once the target trades
+    assert out.exit_price == pytest.approx(exit_)
+    net = (exit_ * 0.999 - entry * 1.001) / entry
     assert out.return_pct == pytest.approx(net)
     assert out.r_multiple == pytest.approx(net * entry / (entry - 95))
 
@@ -78,7 +80,7 @@ def test_short_take_profit():
     out = run(rows, side="short", sl=105, tp=90)
     entry = 100 * (1 - 0.0005)
     assert out.reason == "take_profit"
-    net = (entry * 0.999 - 90 * 1.001) / entry
+    net = (entry * 0.999 - 90 * (1 + 0.0005) * 1.001) / entry
     assert out.return_pct == pytest.approx(net)
 
 

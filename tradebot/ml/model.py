@@ -199,6 +199,9 @@ def train_model(
                               "current_expectancy_r": cur_exp, "current_taken": cur_n}
             if cur_n >= 10 and new_exp < cur_exp:
                 problems.append(f"worse than current model on unseen data ({new_exp:+.3f}R vs {cur_exp:+.3f}R)")
+        else:
+            problems.append(f"only {len(unseen)} signals since the current model was trained "
+                            f"(need {cfg.min_test_trades} to compare) - keeping the current model")
 
     if problems:
         rep.reason = "; ".join(problems)

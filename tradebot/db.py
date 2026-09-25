@@ -123,6 +123,11 @@ class Database:
     def open_positions(self, mode: str) -> list[Position]:
         return self._select(Position, "SELECT * FROM positions WHERE status='open' AND mode=? ORDER BY id", (mode,))
 
+    def positions_with_status(self, mode: str, statuses: tuple[str, ...]) -> list[Position]:
+        marks = ", ".join("?" * len(statuses))
+        return self._select(Position, f"SELECT * FROM positions WHERE mode=? AND status IN ({marks}) ORDER BY id",
+                            (mode, *statuses))
+
     def closed_positions(self, mode: str, since_ms: int = 0) -> list[Position]:
         return self._select(
             Position,

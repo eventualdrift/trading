@@ -16,6 +16,9 @@ REASONS = {
     "time_stop": "Time limit reached",
     "manual": "Closed manually",
     "kill_switch": "Closed by /closeall",
+    "no_protection": "Closed for safety: no exchange stop-loss could be placed",
+    "stop_order_executed": "The exchange executed the stop order immediately",
+    "forgotten": "Removed with /forget (no trade was made)",
 }
 
 

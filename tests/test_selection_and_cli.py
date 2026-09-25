@@ -19,6 +19,20 @@ def test_selection_runs_and_roundtrips(cfg, tmp_path):
     assert again.timeframes() == sel.timeframes()
 
 
+def test_trades_straddling_the_split_are_purged(cfg):
+    """Review #11: an in-sample trade must not use out-of-sample prices."""
+    from tradebot.backtest.selection import run_combo
+    from tradebot.strategies import make_strategy
+
+    df = generate_ohlcv(4000, "1h", seed=2)
+    is_t, oos_t, _ = run_combo({"A/USDT": df}, "breakout", {}, "1h", cfg)
+    warmup = make_strategy("breakout").warmup
+    split = warmup + int((len(df) - warmup) * cfg.selection.in_sample_fraction)
+    assert is_t and oos_t
+    assert all(t.exit_time < df.index[split] for t in is_t)
+    assert all(t.signal_idx >= split for t in oos_t)
+
+
 def test_demo_runs_offline(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     main(["demo", "--days", "240", "--sim-days", "4", "--symbols-n", "2"])

@@ -76,6 +76,15 @@ def test_new_model_must_not_be_worse_than_current():
     assert model is None
 
 
+def test_current_model_kept_until_it_can_be_compared():
+    """Review #12: no replacement without enough genuinely unseen signals."""
+    good = _fake_candidates(3000, informative=True)
+    current, _ = train_model(good, MLConfig())
+    assert current is not None
+    model, rep = train_model(good, MLConfig(), current=current)  # nothing new since it was trained
+    assert model is None and "keeping the current model" in rep.reason
+
+
 def test_build_candidates_on_prices(cfg):
     df = generate_ohlcv(20000, "15m", seed=4)
     cands = build_candidates({"15m": {"A/USDT": df}}, cfg)

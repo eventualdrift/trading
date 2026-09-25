@@ -11,7 +11,7 @@ import pandas as pd
 from .backtest.selection import Selection
 from .config import BotConfig
 from .db import Database
-from .execution.base import Broker
+from .execution.base import Broker, NotFilled, finalize_close
 from .ml.model import SignalModel
 from .models import Position, Signal
 from .notify import formatting as fmt
@@ -30,6 +30,7 @@ HELP = """<b>Commands</b>
 /resume – resume trading (also clears a drawdown halt)
 /close &lt;id&gt; – close one position at market
 /closeall – close everything and pause
+/forget &lt;id&gt; – mark a position closed WITHOUT trading (after fixing it on the exchange yourself)
 /learn – run the self-learning cycle now"""
 
 Learner = Callable[[SignalModel | None], "tuple[Selection, SignalModel | None, str]"]
@@ -63,7 +64,7 @@ class TradingBot:
         self._symbols_at = 0
         self._lock = threading.RLock()
         self._learn_thread: threading.Thread | None = None
-        self._last_error_notice = 0.0
+        self._last_error_notice: dict[str, float] = {}
         self._last_equity_record = 0
         self._stop = threading.Event()
 
@@ -110,11 +111,18 @@ class TradingBot:
         except Exception as exc:
             log.warning("notification failed: %s", exc)
 
-    def _notify_error(self, text: str) -> None:
+    def _notify_error(self, text: str, key: str = "general") -> None:
+        """Log every error; message the user at most every 30 min per ``key``."""
         log.error(text)
-        if time.time() - self._last_error_notice > 1800:
-            self._last_error_notice = time.time()
+        if time.time() - self._last_error_notice.get(key, 0.0) > 1800:
+            self._last_error_notice[key] = time.time()
             self.notify(f"⚠️ <b>Bot error</b>\n{fmt.esc(text)[:1500]}")
+
+    def _halt(self, reason: str) -> None:
+        if not self._get("halted"):
+            self._set("halted", reason)
+            self.notify(f"🚨 <b>New entries halted</b>: {fmt.esc(reason)}\nOpen trades are still managed. "
+                        f"Check your exchange account, then send /resume.")
 
     # --------------------------------------------------------------- equity
     def equity(self) -> tuple[float, dict[str, float]]:
@@ -168,6 +176,10 @@ class TradingBot:
         listener = getattr(self.notifier, "start_listener", None)
         if callable(listener):
             listener(self.handle_command)
+        try:
+            self.check_unresolved()
+        except Exception as exc:
+            self._notify_error(f"start-up reconciliation failed: {exc}")
         while not self._stop.is_set():
             try:
                 self.tick(self.market.now_ms())
@@ -251,72 +263,175 @@ class TradingBot:
 
         sig.status = "opened"
         self.db.insert_signal(sig)
+        pos = Position.from_signal(sig, self.mode, size.amount, now_ms)
+        self.db.insert_position(pos)  # recorded BEFORE any order is sent
         try:
-            pos = self.broker.open_position(sig, size.amount, price, now_ms)
-        except Exception as exc:
-            sig.status, sig.note = "skipped", f"order failed: {exc}"
+            self.broker.open_position(pos, price, now_ms)
+        except NotFilled as exc:
+            pos.status, pos.exit_reason = "failed", str(exc)[:300]
+            self.db.update_position(pos)
+            sig.status, sig.note = "skipped", f"entry failed: {exc}"
             self.db.update_signal(sig)
-            self._notify_error(f"Entry order for {sig.symbol} failed: {exc}")
+            self._notify_error(f"Entry for {sig.symbol} failed (nothing was bought): {exc}", key="entry")
+            return None
+        except Exception as exc:
+            pos.status, pos.exit_reason = "unknown", str(exc)[:300]
+            self.db.update_position(pos)
+            self._halt(f"entry #{pos.id} for {sig.symbol} has an unknown outcome ({exc})")
             return None
         bar = self.market.price_bar_ms
         pos.last_checked_ms = (now_ms // bar + 1) * bar
-        self.db.insert_position(pos)
-        self.notify(fmt.format_signal(sig, pos, equity, self.mode, self.cfg.exchange.quote,
-                                      self.cfg.risk.max_chase_r, self.ml_active))
+        self.db.update_position(pos)
+        self._protect(pos, now_ms)
+        if pos.status == "open":
+            self.notify(fmt.format_signal(sig, pos, equity, self.mode, self.cfg.exchange.quote,
+                                          self.cfg.risk.max_chase_r, self.ml_active))
         return pos
 
+    def _protect(self, pos: Position, now_ms: int) -> None:
+        try:
+            self.broker.protect(pos, now_ms)
+        except Exception as exc:
+            self.db.update_position(pos)
+            self._unprotected(pos, str(exc), now_ms)
+            return
+        self.db.update_position(pos)
+        if pos.status == "closed":  # the "stop" executed straight away
+            self.notify(fmt.format_exit(pos, self.cfg.exchange.quote))
+
+    def _unprotected(self, pos: Position, why: str, now_ms: int) -> None:
+        if pos.status != "open":
+            return
+        sym = fmt.esc(pos.symbol)
+        if self.cfg.live.require_exchange_stop:
+            self.notify(f"🚨 <b>No exchange stop-loss for {sym}</b> #{pos.id}: {fmt.esc(why)}\n"
+                        f"Closing the position for safety.")
+            self._close(pos, self._price(pos), "no_protection", now_ms)
+        else:
+            self.notify(f"⚠️ No exchange stop-loss for {sym} #{pos.id}: {fmt.esc(why)}\n"
+                        f"The bot enforces the stop itself - but only while it is running.")
+
+    def _price(self, pos: Position) -> float:
+        try:
+            return self.market.fetch_last_price(pos.symbol)
+        except Exception:
+            return pos.entry_price
+
     # ---------------------------------------------------- position management
+    def check_unresolved(self) -> None:
+        """At start-up: surface entries whose outcome was never confirmed and make
+        sure every live position is protected."""
+        for pos in self.db.positions_with_status(self.mode, ("pending", "unknown")):
+            if self.mode == "paper":
+                pos.status = "failed"
+                self.db.update_position(pos)
+                continue
+            pos.status = "unknown"
+            self.db.update_position(pos)
+            self._halt(f"entry #{pos.id} {pos.symbol} (client order id {pos.client_order_id}) was never "
+                       f"confirmed - check the exchange; /forget {pos.id} if nothing was bought")
+        if getattr(self.broker, "native_stop_loss", False):
+            now = self.market.now_ms()
+            for pos in self.db.open_positions(self.mode):
+                if not pos.sl_order_id and not pos.closing_reason:
+                    self._protect(pos, now)
+
     def manage_positions(self, now_ms: int) -> None:
         positions = self.db.open_positions(self.mode)
         if not positions:
             return
+        issues = []
         try:
-            self.broker.sync(positions, now_ms)
+            issues = self.broker.sync(positions, now_ms)
         except Exception as exc:
-            self._notify_error(f"sync failed: {exc}")
+            self._notify_error(f"exchange sync failed: {exc}", key="sync")
         for pos in positions:
             self.db.update_position(pos)
             if pos.status == "closed":
                 self.notify(fmt.format_exit(pos, self.cfg.exchange.quote))
+        for issue in issues:
+            p = issue.position
+            if issue.kind == "unprotected":
+                self._unprotected(p, issue.message, now_ms)
+            elif issue.kind == "mismatch":
+                self._halt(f"#{p.id} {p.symbol}: {issue.message}")
+            else:
+                self._notify_error(f"#{p.id} {p.symbol}: {issue.message}", key=f"sync:{p.id}")
+        for pos in positions:
+            if pos.status != "open":
                 continue
             try:
-                self._check_position(pos, now_ms)
+                if pos.closing_reason:  # an earlier exit didn't complete - finish it
+                    self._close(pos, self._price(pos), pos.closing_reason, now_ms)
+                else:
+                    self._check_position(pos, now_ms)
             except Exception as exc:
-                self._notify_error(f"managing #{pos.id} {pos.symbol} failed: {exc}")
+                self._notify_error(f"managing #{pos.id} {pos.symbol} failed: {exc}", key=f"manage:{pos.id}")
 
     def _check_position(self, pos: Position, now_ms: int) -> None:
+        """Exit rules - identical for paper and live:
+
+        * the protective stop is a stop-market order on the exchange: any traded price
+          through it triggers, filling at the stop (or at a worse gap open);
+        * take-profit, breakeven stop and time stop are bot-managed market exits at the
+          price available NOW - an old wick through the target is not a fill;
+        * breakeven activates after a bar trades +1R and applies from the next bar.
+        """
+        bar_ms = self.market.price_bar_ms
+        long = pos.side == "long"
         bars = self.market.fetch_price_bars(pos.symbol, pos.last_checked_ms)
         if len(bars):
-            bars = bars[index_ms(bars.index) >= pos.last_checked_ms]
-        long = pos.side == "long"
+            opens = index_ms(bars.index)
+            bars = bars[(opens >= pos.last_checked_ms) & (opens + bar_ms <= now_ms)]  # completed, unseen bars
         be_r = self.cfg.risk.breakeven_at_r
-        reason, price, limit_fill = None, None, False
+        reason, price = None, None
         for o, h, l in zip(bars["open"].to_numpy(), bars["high"].to_numpy(), bars["low"].to_numpy()):
-            stop_hit = l <= pos.stop_loss if long else h >= pos.stop_loss
-            if stop_hit:
-                reason = "breakeven_stop" if pos.breakeven_moved else "stop_loss"
-                gapped = o < pos.stop_loss if long else o > pos.stop_loss
-                price = o if gapped else pos.stop_loss
-                break
-            if (h >= pos.take_profit) if long else (l <= pos.take_profit):
-                reason, price, limit_fill = "take_profit", pos.take_profit, True
+            if (l <= pos.stop_loss) if long else (h >= pos.stop_loss):
+                if pos.breakeven_moved:
+                    reason = "breakeven_stop"  # bot-managed: sells at the current price below
+                else:
+                    gapped = o < pos.stop_loss if long else o > pos.stop_loss
+                    reason, price = "stop_loss", (o if gapped else pos.stop_loss)
                 break
             if be_r > 0 and not pos.breakeven_moved and pos.r_at(h if long else l) >= be_r:
-                self.broker.move_stop(pos, pos.entry_price)
-                pos.breakeven_moved = True
-                self.db.update_position(pos)
-                self.notify(fmt.format_stop_move(pos))
+                self._move_to_breakeven(pos)
         if len(bars):
-            pos.last_checked_ms = int(index_ms(bars.index)[-1])
-        if reason is None and now_ms >= pos.max_hold_until:
-            reason, price = "time_stop", self.market.fetch_last_price(pos.symbol)
+            pos.last_checked_ms = int(index_ms(bars.index)[-1]) + bar_ms
+        if reason is None:
+            current = self.market.fetch_last_price(pos.symbol)
+            if (current <= pos.stop_loss) if long else (current >= pos.stop_loss):
+                reason = "breakeven_stop" if pos.breakeven_moved else "stop_loss"
+            elif (current >= pos.take_profit) if long else (current <= pos.take_profit):
+                reason = "take_profit"
+            elif now_ms >= pos.max_hold_until:
+                reason = "time_stop"
+            elif be_r > 0 and not pos.breakeven_moved and pos.r_at(current) >= be_r:
+                self._move_to_breakeven(pos)
+                # the new stop applies from here on: don't judge it against the part of
+                # the current bar that happened before (the live price covers the rest)
+                pos.last_checked_ms = max(pos.last_checked_ms, (now_ms // bar_ms + 1) * bar_ms)
+        elif price is None:
+            current = self.market.fetch_last_price(pos.symbol)
         if reason is not None:
-            self._close(pos, price, reason, now_ms, limit_fill)
+            self._close(pos, price if price is not None else current, reason, now_ms)
         else:
             self.db.update_position(pos)
 
-    def _close(self, pos: Position, price: float, reason: str, now_ms: int, limit_fill: bool = False) -> Position:
-        pos = self.broker.close_position(pos, price, reason, now_ms, limit_fill)
+    def _move_to_breakeven(self, pos: Position) -> None:
+        self.broker.move_stop(pos, pos.entry_price)
+        pos.breakeven_moved = True
+        self.db.update_position(pos)
+        self.notify(fmt.format_stop_move(pos))
+
+    def _close(self, pos: Position, price: float, reason: str, now_ms: int) -> Position:
+        try:
+            self.broker.close_position(pos, price, reason, now_ms)
+        except Exception as exc:
+            pos.closing_reason = pos.closing_reason or reason
+            self.db.update_position(pos)
+            self._notify_error(f"Closing #{pos.id} {pos.symbol} ({reason}) is not complete: {exc}. "
+                               f"Retrying every poll.", key=f"close:{pos.id}")
+            return pos
         self.db.update_position(pos)
         self.notify(fmt.format_exit(pos, self.cfg.exchange.quote))
         return pos
@@ -406,6 +521,17 @@ class TradingBot:
                 for pos in self.db.open_positions(self.mode):
                     self._close(pos, self.market.fetch_last_price(pos.symbol), "kill_switch", self.market.now_ms())
                 return "🛑 All positions closed and trading paused. /resume to continue."
+            if cmd == "forget":
+                if not args or not args[0].lstrip("#").isdigit():
+                    return "Usage: /forget &lt;id&gt;"
+                pos = self.db.get_position(int(args[0].lstrip("#")))
+                if not pos or pos.mode != self.mode or pos.status == "closed":
+                    return "No such position."
+                price = self._price(pos) if pos.status == "open" else pos.entry_price
+                finalize_close(pos, price, 0.0, "forgotten", self.market.now_ms())
+                self.db.update_position(pos)
+                return (f"#{pos.id} {fmt.esc(pos.symbol)} marked closed without trading "
+                        f"(P&amp;L estimated at {fmt.fmt_price(price)}). Make sure the exchange account matches.")
             if cmd == "learn":
                 started = self._maybe_learn(self.market.now_ms(), force=True)
                 return "🧠 Learning cycle started - I'll report back when done." if started \

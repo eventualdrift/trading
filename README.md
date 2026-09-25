@@ -84,7 +84,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 85 tests
+pytest -q              # 117 tests
 ```
 
 ### 1. Configure
@@ -134,15 +134,32 @@ Go-live readiness (paper track record):
 
 ### 5. Go live (only when ready)
 
-1. Create an API key on your exchange with **trade permission only**, **withdrawals disabled**,
-   and **IP-whitelisted** to your server. Put it in `.env`.
-2. Optionally test on the exchange testnet first: `exchange.sandbox: true`.
-3. Set `mode: live` in `config.yaml`, fund the account with a small amount and `tradebot run`.
+Live trading is supported on **Binance, Bybit, Kraken and OKX** (the exchanges whose stop-loss
+order handling has been checked against ccxt); other exchanges are refused.
+
+1. Use a **dedicated account or sub-account** for the bot, and don't hold or trade the same
+   coins there by hand - the bot reconciles positions against the account balance.
+2. Create an API key with **trade permission only**, **withdrawals disabled**, and
+   **IP-whitelisted** to your server. Put it in `.env`.
+3. Run on the exchange **testnet** first (`exchange.sandbox: true`) and watch a few full
+   trades: entry, stop order visible on the exchange, exit.
+4. Set `mode: live`, fund the account with a small amount and `tradebot run`.
    The bot refuses to start live if the paper checklist fails (`--force-live` overrides; don't).
 
-Live mode is spot-only and long-only (no leverage, so no liquidation). After each market buy the
-bot places a stop-loss order **on the exchange**, so your downside stays protected if the bot or
-server goes offline.
+How live orders are handled:
+- Every entry is written to the database *before* the order is sent. If the outcome is unclear
+  (e.g. a network timeout), the bot checks the balance; if it still can't tell, it halts new
+  entries and tells you.
+- After each buy it places a stop-loss **on the exchange**, reads it back and checks it's a real,
+  open stop at the right price. If that fails, the position is sold immediately
+  (`live.require_exchange_stop`). So your downside stays protected even if the bot goes offline.
+- To exit, it cancels the exchange stop, reads its final state and sells only what's still held,
+  so a stop that fills at the same moment never causes a second sale. Partial fills are tracked
+  and the rest is retried.
+- Take-profit, breakeven and time exits are market orders the bot sends at the current price.
+  The exchange stop stays at the original level as a safety net.
+- If the coins disappear from the account (e.g. sold by hand), the bot halts new entries and
+  asks you to check. `/forget <id>` then removes a position from its books without trading.
 
 ## Telegram commands
 
@@ -155,6 +172,7 @@ server goes offline.
 | `/pause` · `/resume` | stop / restart new entries (open trades keep being managed) |
 | `/close <id>` | close one trade at market |
 | `/closeall` | kill switch: close everything and pause |
+| `/forget <id>` | remove a position from the books without trading (after fixing it on the exchange) |
 | `/learn` | run the self-learning cycle now |
 
 ## Risk controls
@@ -169,7 +187,7 @@ server goes offline.
 | daily loss limit → no new trades until 00:00 UTC | 3% |
 | drawdown from peak → halt until `/resume` | 15% |
 | don't chase: skip if price already moved past the signal | 0.3R |
-| exchange-side stop-loss (live) | on |
+| exchange-side stop-loss (live), verified after placing | on; sell if it can't be placed |
 
 ## Commands
 
@@ -213,17 +231,19 @@ tradebot/
   bot.py          main loop, position management, commands
   learning.py     the self-learning cycle
   report.py       go-live readiness
-tests/            85 tests, including look-ahead-bias checks and a fake exchange
+tests/            117 tests: look-ahead checks, live-vs-backtest parity, a fake exchange with
+                  trigger-order routing, partial fills, races and network timeouts
 ```
 
 ## Limitations and next steps
 
 - Live trading is **spot, long-only**. Shorts only exist in paper/signal mode (`allow_short: true`).
-- Live execution is tested against a fake exchange, not yet against every real one; exchanges
-  differ in stop-order support. The bot falls back to stop-limit, then to managing the stop
-  itself, and tells you which. Try the testnet first.
-- Backtests assume the stop is hit first when stop and target fall in the same candle
-  (pessimistic), but still can't model everything (e.g. order-book depth on small coins).
+- Live execution is tested against a simulated exchange that mimics each venue's order routing,
+  not against the real exchanges. **Run on the testnet before real money.**
+- Backtests: the stop wins when stop and target fall in the same candle, and take-profits pay
+  slippage. They're still slightly optimistic when price pokes through the target and reverses
+  within the bot's 30-second polling interval (live would miss that exit), and they can't model
+  order-book depth on small coins.
 - Possible additions: futures/shorting, multiple take-profit levels, a web dashboard,
   news/sentiment features, more strategy families.
 

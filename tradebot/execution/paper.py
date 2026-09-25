@@ -1,9 +1,15 @@
-"""Paper trading: simulated fills with fees and slippage, persisted in the DB."""
+"""Paper trading: simulated fills with fees and slippage, persisted in the DB.
+
+Fills mirror what the live broker does: entries and exits are market orders at
+the current price plus slippage. The one exception is the protective stop-loss,
+which live trading keeps on the exchange; the bot passes its trigger level (or
+the gap price) here, like a stop-market order would fill.
+"""
 from __future__ import annotations
 
 from ..backtest.engine import Costs
 from ..db import Database
-from ..models import Position, Signal
+from ..models import Position
 from .base import Broker, finalize_close
 
 
@@ -29,21 +35,18 @@ class PaperBroker(Broker):
         # Margin-style accounting: cash holds realised P&L; open trades add unrealised P&L.
         return self.cash + sum(p.unrealized(prices.get(p.symbol, p.entry_price)) for p in positions)
 
-    def open_position(self, signal: Signal, amount: float, price: float, now_ms: int) -> Position:
-        fill = price * (1 + signal.sign * self.costs.slippage_rate)
-        fee = fill * amount * self.costs.fee_rate
+    def open_position(self, pos: Position, price: float, now_ms: int) -> Position:
+        fill = price * (1 + pos.sign * self.costs.slippage_rate)
+        fee = fill * pos.amount * self.costs.fee_rate
         self._add_cash(-fee)
-        return Position(
-            symbol=signal.symbol, timeframe=signal.timeframe, strategy=signal.strategy,
-            side=signal.side, mode=self.mode, amount=amount, entry_price=fill,
-            stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-            initial_stop=signal.stop_loss, opened_at=now_ms, max_hold_until=signal.max_hold_until,
-            signal_id=signal.id, confidence=signal.confidence, fees=fee,
-            features=dict(signal.features),
-        )
+        pos.entry_price = fill
+        pos.fees = fee
+        pos.opened_at = now_ms
+        pos.status = "open"
+        return pos
 
-    def close_position(self, pos: Position, price: float, reason: str, now_ms: int, limit_fill: bool = False) -> Position:
-        fill = price if limit_fill else price * (1 - pos.sign * self.costs.slippage_rate)
+    def close_position(self, pos: Position, price: float, reason: str, now_ms: int) -> Position:
+        fill = price * (1 - pos.sign * self.costs.slippage_rate)
         fee = fill * pos.amount * self.costs.fee_rate
         self._add_cash(pos.sign * (fill - pos.entry_price) * pos.amount - fee)
         return finalize_close(pos, fill, fee, reason, now_ms)

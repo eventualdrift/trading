@@ -6,7 +6,10 @@ Execution model (kept deliberately conservative):
   * if bar i+1 already gaps past the stop or target, the trade is skipped;
   * if the stop and target are both inside the same bar, the STOP wins;
   * a stop that gaps is filled at the (worse) open price;
-  * stops/market exits pay slippage, take-profits are limit orders (no slippage);
+  * the take-profit is a market sell once price reaches the target (that's what
+    the bot does live), so it pays slippage too. Still slightly optimistic: a wick
+    through the target that reverses within the bot's polling interval would be
+    missed live but counts as a fill here;
   * fees are charged on both entry and exit.
 """
 from __future__ import annotations
@@ -118,7 +121,7 @@ def simulate_trade(
                 exit_idx, exit_price, reason = j, stop * (1 - slip), stop_reason
                 break
             if h[j] >= tp:
-                exit_idx, exit_price, reason = j, tp, "take_profit"
+                exit_idx, exit_price, reason = j, tp * (1 - slip), "take_profit"
                 break
         else:
             if j > e and o[j] >= stop:
@@ -128,7 +131,7 @@ def simulate_trade(
                 exit_idx, exit_price, reason = j, stop * (1 + slip), stop_reason
                 break
             if l[j] <= tp:
-                exit_idx, exit_price, reason = j, tp, "take_profit"
+                exit_idx, exit_price, reason = j, tp * (1 + slip), "take_profit"
                 break
         if exit_flags is not None and exit_flags[j]:
             exit_idx, exit_price, reason = j, c[j] * (1 - sign * slip), "exit_signal"

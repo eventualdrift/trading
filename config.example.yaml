@@ -72,8 +72,10 @@ learning:
 paper:
   starting_balance: 1000
 
-live:
-  native_stop_loss: true       # also keep a stop-loss order on the exchange
+live:                          # supported exchanges: binance, bybit, kraken, okx
+  native_stop_loss: true       # keep a stop-loss order on the exchange (protects you if the bot is down)
+  require_exchange_stop: true  # if that stop can't be placed AND verified, sell immediately
+  fill_timeout_seconds: 30     # cancel any unfilled part of a market order after this
 
 telegram:
   enabled: true
