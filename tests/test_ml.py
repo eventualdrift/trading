@@ -85,6 +85,18 @@ def test_current_model_kept_until_it_can_be_compared():
     assert model is None and "keeping the current model" in rep.reason
 
 
+def test_rarely_selecting_incumbent_is_not_replaced_without_evidence():
+    """Review: an incumbent that picked only a few unseen trades can't be out-voted by them."""
+    good = _fake_candidates(3000, informative=True)
+    current, _ = train_model(good.iloc[:2000], MLConfig())
+    current.threshold = 0.999  # selects (almost) nothing on new data
+    later = good.copy()
+    later["signal_time"] = later["signal_time"] + pd.Timedelta(days=200)
+    later["exit_time"] = later["exit_time"] + pd.Timedelta(days=200)
+    model, rep = train_model(later, MLConfig(), current=current)
+    assert model is None and "keeping the current model" in rep.reason
+
+
 def test_build_candidates_on_prices(cfg):
     df = generate_ohlcv(20000, "15m", seed=4)
     cands = build_candidates({"15m": {"A/USDT": df}}, cfg)

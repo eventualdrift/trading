@@ -72,7 +72,7 @@ learning:
 paper:
   starting_balance: 1000
 
-live:                          # supported exchanges: binance, bybit, kraken, okx
+live:                          # live trading: Binance spot only (any exchange works for paper/signals)
   native_stop_loss: true       # keep a stop-loss order on the exchange (protects you if the bot is down)
   require_exchange_stop: true  # if that stop can't be placed AND verified, sell immediately
   fill_timeout_seconds: 30     # cancel any unfilled part of a market order after this

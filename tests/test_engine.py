@@ -75,6 +75,18 @@ def test_breakeven_stop():
     assert run(rows, be=0.0).reason == "end_of_data"
 
 
+def test_target_wick_that_reverses_is_not_a_fill():
+    """Review: open 100, high 111, close 100 - a polling bot would likely never see 110."""
+    out = run(BASE + [(100, 111, 99.5, 100), (100, 100.5, 99.5, 100)], max_hold=10)
+    assert out.reason != "take_profit"
+
+
+def test_breakeven_bar_closing_below_entry_exits_at_close():
+    out = run(BASE + [(101, 106, 100, 99.5)], be=1.0)
+    assert out.reason == "breakeven_stop" and out.exit_idx == 2
+    assert out.exit_price == pytest.approx(99.5 * (1 - 0.0005))
+
+
 def test_short_take_profit():
     rows = BASE + [(100, 100.5, 89, 90)]
     out = run(rows, side="short", sl=105, tp=90)

@@ -197,7 +197,10 @@ def train_model(
             cur_exp, _, cur_n = _filtered_stats(r_u, current.predict_proba(unseen), current.threshold)
             rep.vs_current = {"unseen_trades": len(unseen), "new_expectancy_r": new_exp, "new_taken": new_n,
                               "current_expectancy_r": cur_exp, "current_taken": cur_n}
-            if cur_n >= 10 and new_exp < cur_exp:
+            if min(cur_n, new_n) < 10:
+                problems.append(f"too few unseen trades selected to compare with the current model "
+                                f"(new {new_n}, current {cur_n}; need 10 each) - keeping the current model")
+            elif new_exp < cur_exp:
                 problems.append(f"worse than current model on unseen data ({new_exp:+.3f}R vs {cur_exp:+.3f}R)")
         else:
             problems.append(f"only {len(unseen)} signals since the current model was trained "

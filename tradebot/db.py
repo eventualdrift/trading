@@ -128,6 +128,10 @@ class Database:
         return self._select(Position, f"SELECT * FROM positions WHERE mode=? AND status IN ({marks}) ORDER BY id",
                             (mode, *statuses))
 
+    def positions_since(self, mode: str, since_ms: int) -> list[Position]:
+        return self._select(Position, "SELECT * FROM positions WHERE mode=? AND (opened_at>=? OR status!='closed')",
+                            (mode, since_ms))
+
     def closed_positions(self, mode: str, since_ms: int = 0) -> list[Position]:
         return self._select(
             Position,

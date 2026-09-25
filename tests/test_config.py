@@ -32,6 +32,16 @@ def test_invalid_values_rejected(tmp_path):
     assert "risk_per_trade_pct" in str(e.value) and "7m" in str(e.value)
 
 
+def test_live_mode_limited_to_verified_exchanges(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    p = tmp_path / "c.yaml"
+    p.write_text("mode: live\nexchange:\n  id: okx\n")
+    with pytest.raises(ValueError, match="binance"):
+        load_config(p, env_file=None)
+    p.write_text("mode: paper\nexchange:\n  id: okx\n")
+    assert load_config(p, env_file=None).exchange.id == "okx"
+
+
 def test_secrets_from_env(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_CHAT_ID=42\n")

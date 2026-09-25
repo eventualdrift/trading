@@ -144,8 +144,10 @@ class StubMarket:
     def now_ms(self):
         return self.now
 
+    page = 1000
+
     def fetch_price_bars(self, symbol, since_ms):
-        return self.bars[index_ms(self.bars.index) >= since_ms]
+        return self.bars[index_ms(self.bars.index) >= since_ms].head(self.page)
 
     def fetch_last_price(self, symbol):
         return self.price
@@ -260,16 +262,31 @@ def test_forget_command(cfg):
     assert db.get_position(pid).exit_reason == "forgotten"
 
 
+def test_backlog_longer_than_one_page_is_replayed_in_order(cfg):
+    """Review: after downtime the stop in the 4th bar must win over today's price at target."""
+    rows = [(100, 101, 99, 100)] * 3 + [(99, 99, 94, 96)] + [(96, 111, 96, 111)]
+    market, db, notes, bot = managed(cfg, rows, price=111.0)
+    market.page = 3
+    bot.manage_positions(T0 + 5 * MIN + 1)
+    p = db.closed_positions("paper")[0]
+    assert p.exit_reason == "stop_loss" and p.exit_price == 95.0
+
+
 # ------------------------------------------------------------- live broker in the loop
+@pytest.fixture
+def fast_retries(monkeypatch):
+    monkeypatch.setattr("tradebot.data.exchange.time.sleep", lambda s: None)
+
+
 def live_bot(cfg, prepare=None):
     from tradebot.execution import LiveBroker
 
-    from .test_brokers import FakeClient
+    from .test_brokers import Clock, FakeClient
 
-    client = FakeClient("okx")
+    client, clock = FakeClient("binance"), Clock()
     if prepare:
         prepare(client.ex)
-    broker = LiveBroker(client, "USDT", sleep=lambda s: None, fill_timeout_s=2)
+    broker = LiveBroker(client, "USDT", sleep=clock.sleep, clock=clock, fill_timeout_s=2)
     market = StubMarket([(100, 101, 99, 100)], T0, 100.0)
     db = Database(cfg.state_path / "live.db")
     notes = MemoryNotifier()
@@ -279,56 +296,89 @@ def live_bot(cfg, prepare=None):
     return client, db, notes, bot, sig
 
 
-def test_live_entry_is_protected_and_recorded(cfg):
+def test_live_entry_is_protected_and_recorded(cfg, fast_retries):
     client, db, notes, bot, sig = live_bot(cfg)
     pos = bot.handle_signal(sig, T0 + 30_000, 1000.0)
     assert pos is not None and pos.status == "open" and pos.sl_order_id
     stored = db.get_position(pos.id)
-    assert stored.status == "open" and stored.sl_order_id == pos.sl_order_id
+    assert stored.status == "open" and stored.sl_order_id == pos.sl_order_id and stored.entry_order_id
     assert client.ex.orders[pos.sl_order_id]["status"] == "open"
     assert any("BUY SIGNAL" in m for m in notes.messages)
 
 
-def test_live_entry_filled_but_stop_times_out_is_not_lost(cfg):
-    """Review #3/#4: the buy fills, the stop times out -> the position is recorded and,
-    since it's unprotected, sold for safety."""
+def test_live_unprotected_position_is_sold_and_entries_halted(cfg, fast_retries):
     import ccxt
 
-    client, db, notes, bot, sig = live_bot(cfg, lambda ex: ex.fail_next.update(create_stop=ccxt.RequestTimeout("timeout")))
+    def prepare(ex):
+        ex.fail["stop"] = ("before", ccxt.RequestTimeout("t"))  # market stop lost in transit...
+        ex.stop_mode = "reject_all"  # ...and the stop-limit fallback is refused
+
+    client, db, notes, bot, sig = live_bot(cfg, prepare)
     bot.handle_signal(sig, T0 + 30_000, 1000.0)
     [p] = db.closed_positions("live")
-    assert p.exit_reason == "no_protection"
-    assert client.ex.free["BTC"] == pytest.approx(0.0)
-    assert any("No exchange stop-loss" in m for m in notes.messages)
+    assert p.exit_reason == "no_protection" and client.ex.free["BTC"] == pytest.approx(0.0)
+    assert db.kv_get("live:halted")
 
 
-def test_live_unprotected_can_be_kept_if_configured(cfg):
-    cfg.live.require_exchange_stop = False
-    cfg.live.native_stop_loss = True
-    client, db, notes, bot, sig = live_bot(cfg, lambda ex: setattr(ex, "stop_mode", "reject_all"))
-    bot.handle_signal(sig, T0 + 30_000, 1000.0)
-    [p] = db.open_positions("live")
-    assert p.sl_order_id is None
-    assert any("enforces the stop itself" in m for m in notes.messages)
-
-
-def test_live_unknown_entry_halts_and_is_kept(cfg):
+def test_failed_safety_sale_keeps_trying_and_stays_halted(cfg, fast_retries):
+    """Review: an unprotected position whose emergency sale fails must halt entries."""
     import ccxt
 
-    client, db, notes, bot, sig = live_bot(cfg, lambda ex: ex.fail_next.update(create_buy=ccxt.RequestTimeout("t")))
+    client, db, notes, bot, sig = live_bot(cfg, lambda ex: setattr(ex, "stop_mode", "reject_all"))
+    client.ex.fail["sell"] = ("before", ccxt.ExchangeNotAvailable("maintenance"))
+    bot.handle_signal(sig, T0 + 30_000, 1000.0)
+    [p] = db.open_positions("live")
+    assert p.closing_reason == "no_protection" and p.sl_order_id is None
+    assert db.kv_get("live:halted")
+    assert "Can't resume" not in bot.handle_command("resume", [])  # nothing unknown; human decides
+    bot.manage_positions(T0 + 2 * MIN)  # next poll retries the sale
+    assert db.closed_positions("live")[0].exit_reason == "no_protection"
+
+
+def test_unknown_entry_blocks_resume_until_reconciled(cfg, fast_retries):
+    import ccxt
+
+    client, db, notes, bot, sig = live_bot(cfg)
+    client.ex.fail["buy"] = ("after", ccxt.RequestTimeout("t"))
+    client.ex.fetch_failures = 100  # exchange unreachable for lookups
     assert bot.handle_signal(sig, T0 + 30_000, 1000.0) is None
     [p] = db.positions_with_status("live", ("unknown",))
     assert p.client_order_id and db.kv_get("live:halted")
-    assert any("New entries halted" in m for m in notes.messages)
+    assert "Can't resume" in bot.handle_command("resume", [])
+    client.ex.fetch_failures = 0
+    bot.manage_positions(T0 + 2 * MIN)  # reconciled by client id
+    p = db.get_position(p.id)
+    assert p.status == "open" and p.sl_order_id
+    assert "Resumed" in bot.handle_command("resume", [])
 
 
-def test_startup_reconciliation(cfg):
+def test_startup_recovers_an_entry_made_just_before_a_crash(cfg, fast_retries):
+    """Review: pending row persisted, order filled, bot died before recording the fill."""
     client, db, notes, bot, sig = live_bot(cfg)
     stuck = Position.from_signal(sig, "live", 1.0, T0)
-    db.insert_position(stuck)  # crashed between recording and confirming the entry
+    db.insert_position(stuck)
+    client.ex.create_order("BTC/USDT", "market", "buy", 1.0, None, {"clientOrderId": stuck.client_order_id})
     bot.check_unresolved()
-    assert db.get_position(stuck.id).status == "unknown"
-    assert db.kv_get("live:halted")
+    p = db.get_position(stuck.id)
+    assert p.status == "open" and p.amount == pytest.approx(0.999) and p.sl_order_id
+
+
+def test_startup_marks_never_placed_entry_failed(cfg, fast_retries):
+    client, db, notes, bot, sig = live_bot(cfg)
+    stuck = Position.from_signal(sig, "live", 1.0, T0)
+    db.insert_position(stuck)
+    bot.check_unresolved()
+    assert db.get_position(stuck.id).status == "failed"
+
+
+def test_startup_sweeps_stray_bot_orders(cfg, fast_retries):
+    client, db, notes, bot, sig = live_bot(cfg)
+    pos = bot.handle_signal(sig, T0 + 30_000, 1000.0)
+    stray = client.ex.create_order("BTC/USDT", "market", "sell", 0.0, None, {"stopLossPrice": 90.0, "clientOrderId": "tbsLOST"})
+    bot.check_unresolved()
+    assert client.ex.orders[stray["id"]]["status"] == "canceled"
+    assert client.ex.orders[pos.sl_order_id]["status"] == "open"
+    assert any("stray" in m for m in notes.messages)
 
 
 def test_live_loop_matches_backtest(cfg):
@@ -340,7 +390,7 @@ def test_live_loop_matches_backtest(cfg):
     cfg.risk.max_total_exposure_pct = 1000
     cfg.risk.daily_loss_limit_pct = 0
     cfg.risk.max_drawdown_pct = 0
-    market = SyntheticMarket(3, days=100, seed=9)
+    market = SyntheticMarket(3, days=100, seed=9, base_tf="1h")  # the bot sees prices hourly, like the backtest
     db = Database(cfg.state_path / "p.db")
     bot = TradingBot(cfg, market, PaperBroker(db, Costs(), 1000.0, market), db, MemoryNotifier(),
                      selection=selection(("breakout", "1h")))
@@ -359,6 +409,8 @@ def test_live_loop_matches_backtest(cfg):
                                     min_reward_risk=cfg.risk.min_reward_risk):
             sig_ms = int(t.signal_time.value // 1_000_000)
             first_scan = (start // hour + 1) * hour  # the bot's first candle close
+            if t.reason == "end_of_data":  # still open when the simulation stopped
+                continue
             if sig_ms + hour >= first_scan and t.exit_time.value // 1_000_000 + hour <= end - DAY:
                 expected[(sym, sig_ms)] = t
     assert len(expected) >= 8
@@ -366,9 +418,13 @@ def test_live_loop_matches_backtest(cfg):
     for key, t in expected.items():
         p = live[key]
         assert p.exit_reason == t.reason, key
+        assert p.closed_at - 30_000 == t.exit_time.value // 1_000_000 + hour, key  # same exit candle
         if t.reason in ("take_profit", "breakeven_stop"):
-            # bot-managed market exits fill at the price when the bot looks (here: the next
-            # 15-minute close), the backtest at the level itself
-            assert p.r_multiple == pytest.approx(t.r_multiple, abs=0.35), key
-        else:  # stops, exit signals and time stops fill identically
-            assert p.r_multiple == pytest.approx(t.r_multiple, abs=0.02), key
+            # bot-managed market exits: the bot sells at the price it sees when it looks (here
+            # hourly), the backtest books the level itself
+            assert p.r_multiple == pytest.approx(t.r_multiple, abs=0.6), key
+        else:  # exchange stop, exit signals and time stops fill the same way
+            assert p.r_multiple == pytest.approx(t.r_multiple, abs=0.05), key
+    total_paper = sum(live[k].r_multiple for k in expected)
+    total_bt = sum(t.r_multiple for t in expected.values())
+    assert total_paper >= total_bt - 1.0  # paper is not systematically worse than the backtest

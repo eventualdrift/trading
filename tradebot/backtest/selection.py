@@ -98,14 +98,17 @@ def run_combo(
             allow_short=cfg.allow_short, breakeven_at_r=cfg.risk.breakeven_at_r,
             min_reward_risk=cfg.risk.min_reward_risk,
         )
+        admitted = []
         for t in trades:
             if t.signal_idx >= split:
                 oos_trades.append(t)
             elif t.exit_time < split_time:
                 is_trades.append(t)
-            # else: straddles the split - purged from both periods
-        if len(trades) >= 3:
-            per_symbol[symbol] = sum(t.r_multiple for t in trades) / len(trades)
+            else:
+                continue  # straddles the split - purged from both periods and from the score
+            admitted.append(t)
+        if len(admitted) >= 3:
+            per_symbol[symbol] = sum(t.r_multiple for t in admitted) / len(admitted)
     return is_trades, oos_trades, per_symbol
 
 

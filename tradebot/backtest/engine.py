@@ -6,10 +6,13 @@ Execution model (kept deliberately conservative):
   * if bar i+1 already gaps past the stop or target, the trade is skipped;
   * if the stop and target are both inside the same bar, the STOP wins;
   * a stop that gaps is filled at the (worse) open price;
-  * the take-profit is a market sell once price reaches the target (that's what
-    the bot does live), so it pays slippage too. Still slightly optimistic: a wick
-    through the target that reverses within the bot's polling interval would be
-    missed live but counts as a fill here;
+  * the take-profit is a market sell the bot sends when it SEES the price at the
+    target. A bar's high may be a brief wick the bot never saw, so the target only
+    counts when the bar closes at or beyond it (filled at the target less slippage).
+    This is deliberately pessimistic: live, the bot also catches some wicks;
+  * breakeven: once a bar trades +1R the stop moves to entry for later bars, and if
+    that same bar closes back at/below entry the trade exits at the close (the close
+    is observed after the high);
   * fees are charged on both entry and exit.
 """
 from __future__ import annotations
@@ -120,7 +123,7 @@ def simulate_trade(
             if l[j] <= stop:
                 exit_idx, exit_price, reason = j, stop * (1 - slip), stop_reason
                 break
-            if h[j] >= tp:
+            if c[j] >= tp:
                 exit_idx, exit_price, reason = j, tp * (1 - slip), "take_profit"
                 break
         else:
@@ -130,7 +133,7 @@ def simulate_trade(
             if h[j] >= stop:
                 exit_idx, exit_price, reason = j, stop * (1 + slip), stop_reason
                 break
-            if l[j] <= tp:
+            if c[j] <= tp:
                 exit_idx, exit_price, reason = j, tp * (1 + slip), "take_profit"
                 break
         if exit_flags is not None and exit_flags[j]:
@@ -138,8 +141,11 @@ def simulate_trade(
             break
         if be_level is not None and not at_breakeven:
             if (long and h[j] >= be_level) or (not long and l[j] <= be_level):
-                stop = entry  # applies from the next bar on
+                stop = entry  # intrabar checks apply from the next bar on
                 at_breakeven = True
+                if (c[j] <= entry) if long else (c[j] >= entry):
+                    exit_idx, exit_price, reason = j, c[j] * (1 - sign * slip), "breakeven_stop"
+                    break
 
     complete = True
     if not reason:

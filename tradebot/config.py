@@ -176,6 +176,12 @@ class BotConfig:
             errors.append("allow_short cannot be used for live spot trading")
         if self.live.require_exchange_stop and not self.live.native_stop_loss:
             errors.append("live.require_exchange_stop needs live.native_stop_loss: true")
+        if self.mode == "live":
+            from .execution.live import VENUES
+
+            if self.exchange.id not in VENUES:
+                errors.append(f"live trading supports {', '.join(sorted(VENUES))} only (got {self.exchange.id!r}); "
+                              f"signals and paper trading work with any exchange")
         if not 0.3 <= self.selection.in_sample_fraction <= 0.9:
             errors.append("selection.in_sample_fraction must be in [0.3, 0.9]")
         if errors:

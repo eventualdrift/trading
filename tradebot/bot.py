@@ -66,7 +66,10 @@ class TradingBot:
         self._learn_thread: threading.Thread | None = None
         self._last_error_notice: dict[str, float] = {}
         self._last_equity_record = 0
+        self._last_orphan_sweep = 0
         self._stop = threading.Event()
+        if hasattr(broker, "persist"):  # live broker saves order ids BEFORE each order is sent
+            broker.persist = self.db.update_position
 
     # ----------------------------------------------------------------- state
     def _k(self, key: str) -> str:
@@ -304,6 +307,9 @@ class TradingBot:
             return
         sym = fmt.esc(pos.symbol)
         if self.cfg.live.require_exchange_stop:
+            # no new trades until a human has looked: protection failing once usually means
+            # it will fail for the next trade too
+            self._halt(f"#{pos.id} {pos.symbol} had no exchange stop-loss ({why})")
             self.notify(f"🚨 <b>No exchange stop-loss for {sym}</b> #{pos.id}: {fmt.esc(why)}\n"
                         f"Closing the position for safety.")
             self._close(pos, self._price(pos), "no_protection", now_ms)
@@ -318,25 +324,72 @@ class TradingBot:
             return pos.entry_price
 
     # ---------------------------------------------------- position management
+    def unresolved_entries(self) -> list[Position]:
+        return self.db.positions_with_status(self.mode, ("pending", "unknown"))
+
     def check_unresolved(self) -> None:
-        """At start-up: surface entries whose outcome was never confirmed and make
-        sure every live position is protected."""
-        for pos in self.db.positions_with_status(self.mode, ("pending", "unknown")):
+        """At start-up: entries the bot sent but never confirmed become 'unknown' (they
+        are reconciled every poll), stray bot orders are cancelled, and every live
+        position gets its exchange stop."""
+        for pos in self.unresolved_entries():
             if self.mode == "paper":
                 pos.status = "failed"
                 self.db.update_position(pos)
                 continue
             pos.status = "unknown"
             self.db.update_position(pos)
-            self._halt(f"entry #{pos.id} {pos.symbol} (client order id {pos.client_order_id}) was never "
-                       f"confirmed - check the exchange; /forget {pos.id} if nothing was bought")
+            self._halt(f"entry #{pos.id} {pos.symbol} (client order id {pos.client_order_id}) was never confirmed")
+        self._reconcile_unknown(self.market.now_ms())
+        self._sweep_orphans(self.market.now_ms(), force=True)
         if getattr(self.broker, "native_stop_loss", False):
             now = self.market.now_ms()
             for pos in self.db.open_positions(self.mode):
                 if not pos.sl_order_id and not pos.closing_reason:
                     self._protect(pos, now)
 
+    def _reconcile_unknown(self, now_ms: int) -> None:
+        reconcile = getattr(self.broker, "reconcile_entry", None)
+        if reconcile is None:
+            return
+        for pos in self.db.positions_with_status(self.mode, ("unknown",)):
+            try:
+                status = reconcile(pos, now_ms)
+            except Exception as exc:
+                self._notify_error(f"entry #{pos.id} {pos.symbol} still unresolved: {exc}", key=f"unknown:{pos.id}")
+                continue
+            self.db.update_position(pos)
+            if status == "open":
+                bar = self.market.price_bar_ms
+                pos.last_checked_ms = (now_ms // bar + 1) * bar
+                self.db.update_position(pos)
+                self.notify(f"✅ Entry #{pos.id} {fmt.esc(pos.symbol)} confirmed on the exchange "
+                            f"({pos.amount:g} @ {fmt.fmt_price(pos.entry_price)}); protecting and managing it.")
+                self._protect(pos, now_ms)
+            else:
+                self.notify(f"✅ Entry #{pos.id} {fmt.esc(pos.symbol)} confirmed as never filled.")
+
+    def _sweep_orphans(self, now_ms: int, force: bool = False) -> None:
+        """Cancel open orders the bot created that no position owns (e.g. a stop whose
+        placement timed out). Runs at start-up and hourly."""
+        sweep = getattr(self.broker, "cancel_orphans", None)
+        if sweep is None or (not force and now_ms - self._last_orphan_sweep < 3_600_000):
+            return
+        self._last_orphan_sweep = now_ms
+        recent = self.db.positions_since(self.mode, now_ms - 14 * 86_400_000)
+        active = [p for p in recent if p.status in ("open", "pending", "unknown")]
+        known = {str(v) for p in active for v in (p.entry_order_id, p.sl_order_id, p.exit_order_id,
+                                                   p.client_order_id, p.sl_client_id, p.exit_client_id) if v}
+        try:
+            cancelled = sweep({p.symbol for p in recent}, known)
+        except Exception as exc:
+            self._notify_error(f"stray-order check failed: {exc}", key="orphans")
+            return
+        if cancelled:
+            self.notify("🧹 Cancelled stray bot orders no position owns:\n" + fmt.esc("\n".join(cancelled)))
+
     def manage_positions(self, now_ms: int) -> None:
+        self._reconcile_unknown(now_ms)
+        self._sweep_orphans(now_ms)
         positions = self.db.open_positions(self.mode)
         if not positions:
             return
@@ -379,24 +432,42 @@ class TradingBot:
         """
         bar_ms = self.market.price_bar_ms
         long = pos.side == "long"
-        bars = self.market.fetch_price_bars(pos.symbol, pos.last_checked_ms)
-        if len(bars):
-            opens = index_ms(bars.index)
-            bars = bars[(opens >= pos.last_checked_ms) & (opens + bar_ms <= now_ms)]  # completed, unseen bars
         be_r = self.cfg.risk.breakeven_at_r
         reason, price = None, None
-        for o, h, l in zip(bars["open"].to_numpy(), bars["high"].to_numpy(), bars["low"].to_numpy()):
-            if (l <= pos.stop_loss) if long else (h >= pos.stop_loss):
-                if pos.breakeven_moved:
-                    reason = "breakeven_stop"  # bot-managed: sells at the current price below
-                else:
-                    gapped = o < pos.stop_loss if long else o > pos.stop_loss
-                    reason, price = "stop_loss", (o if gapped else pos.stop_loss)
+        # Replay every completed bar since the last check, in order, one page at a time -
+        # after downtime the backlog can exceed one page, and the stop must be found
+        # before the current price is looked at.
+        caught_up = False
+        for _ in range(200):
+            if reason is not None:
                 break
-            if be_r > 0 and not pos.breakeven_moved and pos.r_at(h if long else l) >= be_r:
-                self._move_to_breakeven(pos)
-        if len(bars):
-            pos.last_checked_ms = int(index_ms(bars.index)[-1]) + bar_ms
+            if pos.last_checked_ms + bar_ms > now_ms:
+                caught_up = True
+                break
+            bars = self.market.fetch_price_bars(pos.symbol, pos.last_checked_ms)
+            if len(bars):
+                opens = index_ms(bars.index)
+                bars = bars[(opens >= pos.last_checked_ms) & (opens + bar_ms <= now_ms)]  # completed, unseen
+            if not len(bars):  # nothing newer: history is fully replayed
+                caught_up = True
+                break
+            for ts, o, h, l in zip(index_ms(bars.index), bars["open"].to_numpy(), bars["high"].to_numpy(),
+                                   bars["low"].to_numpy()):
+                pos.last_checked_ms = int(ts) + bar_ms
+                if (l <= pos.stop_loss) if long else (h >= pos.stop_loss):
+                    if pos.breakeven_moved:
+                        reason = "breakeven_stop"  # bot-managed: sells at the current price below
+                    else:
+                        gapped = o < pos.stop_loss if long else o > pos.stop_loss
+                        reason, price = "stop_loss", (o if gapped else pos.stop_loss)
+                    break
+                if be_r > 0 and not pos.breakeven_moved and pos.r_at(h if long else l) >= be_r:
+                    self._move_to_breakeven(pos)
+        if reason is None and not caught_up:
+            # a very long backlog: keep replaying next poll before trusting the live price
+            log.warning("#%s %s: still replaying price history", pos.id, pos.symbol)
+            self.db.update_position(pos)
+            return
         if reason is None:
             current = self.market.fetch_last_price(pos.symbol)
             if (current <= pos.stop_loss) if long else (current >= pos.stop_loss):
@@ -503,6 +574,11 @@ class TradingBot:
                 self._set("paused", True)
                 return "⏸ Paused. No new trades; open positions are still managed."
             if cmd == "resume":
+                pending = self.unresolved_entries()
+                if pending:
+                    ids = ", ".join(f"#{p.id} {fmt.esc(p.symbol)}" for p in pending)
+                    return (f"Can't resume: entry outcome still unknown for {ids}. The bot keeps checking; "
+                            f"if you've confirmed on the exchange that nothing was bought, send /forget &lt;id&gt;.")
                 equity, _ = self.equity()
                 self._set("paused", False)
                 self._set("halted", None)
@@ -525,9 +601,13 @@ class TradingBot:
                 if not args or not args[0].lstrip("#").isdigit():
                     return "Usage: /forget &lt;id&gt;"
                 pos = self.db.get_position(int(args[0].lstrip("#")))
-                if not pos or pos.mode != self.mode or pos.status == "closed":
+                if not pos or pos.mode != self.mode or pos.status in ("closed", "failed"):
                     return "No such position."
-                price = self._price(pos) if pos.status == "open" else pos.entry_price
+                if pos.status in ("pending", "unknown"):
+                    pos.status, pos.exit_reason = "failed", "forgotten"
+                    self.db.update_position(pos)
+                    return f"Entry #{pos.id} {fmt.esc(pos.symbol)} marked as never filled."
+                price = self._price(pos)
                 finalize_close(pos, price, 0.0, "forgotten", self.market.now_ms())
                 self.db.update_position(pos)
                 return (f"#{pos.id} {fmt.esc(pos.symbol)} marked closed without trading "

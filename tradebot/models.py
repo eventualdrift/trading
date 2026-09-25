@@ -1,7 +1,29 @@
 """Core records: a Signal (what to do) and a Position (what was done)."""
 from __future__ import annotations
 
+import itertools
+import secrets
+import time
 from dataclasses import dataclass, field
+
+
+_ID_COUNTER = itertools.count()
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _b36(n: int, width: int = 0) -> str:
+    out = ""
+    while n:
+        n, r = divmod(n, 36)
+        out = _B36[r] + out
+    return out.rjust(width, "0")
+
+
+def new_client_id(kind: str) -> str:
+    """Unique client order id: 'tb' + kind + base36 ms + per-process counter + random.
+    Alphanumeric and 18 chars - valid on every major exchange."""
+    ms = int(time.time() * 1000)
+    return f"tb{kind}{_b36(ms, 9)}{_b36(next(_ID_COUNTER) % 1296, 2)}{secrets.token_hex(2)}"
 
 
 @dataclass
@@ -78,12 +100,18 @@ class Position:
     fees: float = 0.0
     entry_order_id: str | None = None
     sl_order_id: str | None = None
-    client_order_id: str | None = None
+    client_order_id: str | None = None  # entry order's client id - persisted before sending
+    sl_client_id: str | None = None  # stop order sent; kept until its outcome is known
+    sl_sent_ms: int = 0
+    exit_order_id: str | None = None  # a sell in progress - resolved before any new sell
+    exit_client_id: str | None = None
+    exit_sent_ms: int = 0
     breakeven_moved: bool = False
     last_checked_ms: int = 0
     exit_filled: float = 0.0  # amount already sold (partial exits)
     exit_value: float = 0.0  # quote proceeds of those sales
     closing_reason: str | None = None  # a close was started but not completed; retried
+    fills: dict = field(default_factory=dict, repr=False)  # live: order id -> recorded fill
     features: dict = field(default_factory=dict, repr=False)
     id: int | None = None
 
@@ -95,7 +123,7 @@ class Position:
             mode=mode, amount=amount, entry_price=sig.entry, stop_loss=sig.stop_loss,
             take_profit=sig.take_profit, initial_stop=sig.stop_loss, opened_at=now_ms,
             max_hold_until=sig.max_hold_until, signal_id=sig.id, confidence=sig.confidence,
-            status="pending", features=dict(sig.features),
+            status="pending", features=dict(sig.features), client_order_id=new_client_id("e"),
         )
 
     @property

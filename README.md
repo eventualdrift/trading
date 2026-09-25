@@ -84,7 +84,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 117 tests
+pytest -q              # 135 tests
 ```
 
 ### 1. Configure
@@ -134,8 +134,11 @@ Go-live readiness (paper track record):
 
 ### 5. Go live (only when ready)
 
-Live trading is supported on **Binance, Bybit, Kraken and OKX** (the exchanges whose stop-loss
-order handling has been checked against ccxt); other exchanges are refused.
+Live trading is supported on **Binance spot** only. Signals and paper trading work with any
+ccxt exchange, but automatic trading needs exchange-specific handling of stop orders, order
+lookups and fills that must be verified on a testnet first. OKX's trigger orders and Bybit's
+account modes, for example, behave differently. Other exchanges are refused until they get
+that treatment.
 
 1. Use a **dedicated account or sub-account** for the bot, and don't hold or trade the same
    coins there by hand - the bot reconciles positions against the account balance.
@@ -147,15 +150,18 @@ order handling has been checked against ccxt); other exchanges are refused.
    The bot refuses to start live if the paper checklist fails (`--force-live` overrides; don't).
 
 How live orders are handled:
-- Every entry is written to the database *before* the order is sent. If the outcome is unclear
-  (e.g. a network timeout), the bot checks the balance; if it still can't tell, it halts new
-  entries and tells you.
+- Every order gets a client ID that's saved to the database *before* the order is sent. If
+  the response is lost (e.g. a network timeout), the bot looks the order up by that ID once
+  Binance's 10-second request window has passed. It never guesses from balance changes. If it
+  still can't tell, it halts new entries, keeps checking, and `/resume` is refused until resolved.
 - After each buy it places a stop-loss **on the exchange**, reads it back and checks it's a real,
   open stop at the right price. If that fails, the position is sold immediately
   (`live.require_exchange_stop`). So your downside stays protected even if the bot goes offline.
 - To exit, it cancels the exchange stop, reads its final state and sells only what's still held,
-  so a stop that fills at the same moment never causes a second sale. Partial fills are tracked
-  and the rest is retried.
+  so a stop that fills at the same moment never causes a second sale. A sell whose outcome is
+  unclear is resolved before any new sell. Partial fills are tracked per order and the rest retried.
+- If a required stop can't be placed and verified, the position is sold and new entries halt.
+- At start-up and hourly it cancels stray bot orders that no position owns.
 - Take-profit, breakeven and time exits are market orders the bot sends at the current price.
   The exchange stop stays at the original level as a safety net.
 - If the coins disappear from the account (e.g. sold by hand), the bot halts new entries and
@@ -231,7 +237,7 @@ tradebot/
   bot.py          main loop, position management, commands
   learning.py     the self-learning cycle
   report.py       go-live readiness
-tests/            117 tests: look-ahead checks, live-vs-backtest parity, a fake exchange with
+tests/            135 tests: look-ahead checks, live-vs-backtest parity, a fake exchange with
                   trigger-order routing, partial fills, races and network timeouts
 ```
 
@@ -240,10 +246,9 @@ tests/            117 tests: look-ahead checks, live-vs-backtest parity, a fake 
 - Live trading is **spot, long-only**. Shorts only exist in paper/signal mode (`allow_short: true`).
 - Live execution is tested against a simulated exchange that mimics each venue's order routing,
   not against the real exchanges. **Run on the testnet before real money.**
-- Backtests: the stop wins when stop and target fall in the same candle, and take-profits pay
-  slippage. They're still slightly optimistic when price pokes through the target and reverses
-  within the bot's 30-second polling interval (live would miss that exit), and they can't model
-  order-book depth on small coins.
+- Backtests are deliberately pessimistic: the stop wins when stop and target share a candle, a
+  take-profit only counts when the candle closes beyond the target (wicks don't), and all exits
+  pay slippage. They can't model order-book depth on small coins.
 - Possible additions: futures/shorting, multiple take-profit levels, a web dashboard,
   news/sentiment features, more strategy families.
 

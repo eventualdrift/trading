@@ -1,3 +1,5 @@
+import pytest
+
 from tradebot.backtest.selection import Selection, run_selection
 from tradebot.cli import main
 from tradebot.data.synthetic import generate_ohlcv
@@ -31,6 +33,15 @@ def test_trades_straddling_the_split_are_purged(cfg):
     assert is_t and oos_t
     assert all(t.exit_time < df.index[split] for t in is_t)
     assert all(t.signal_idx >= split for t in oos_t)
+
+
+def test_symbol_score_uses_only_admitted_trades(cfg):
+    from tradebot.backtest.selection import run_combo
+
+    df = generate_ohlcv(4000, "1h", seed=2)
+    is_t, oos_t, per_symbol = run_combo({"A/USDT": df}, "breakout", {}, "1h", cfg)
+    admitted = is_t + oos_t
+    assert per_symbol["A/USDT"] == pytest.approx(sum(t.r_multiple for t in admitted) / len(admitted))
 
 
 def test_demo_runs_offline(tmp_path, monkeypatch, capsys):
