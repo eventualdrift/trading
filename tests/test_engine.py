@@ -164,3 +164,16 @@ def test_trailing_close_check_on_the_moving_bar():
     rows = BASE + [(101, 110, 100.5, 106)]  # trail -> 107, but the bar closes at 106
     out = run(rows, tp=150, be=1.0, trail=3.0)
     assert out.reason == "trailing_stop" and out.exit_price == pytest.approx(106 * (1 - 0.0005))
+
+
+def test_limit_entry_fills_only_when_price_trades_through():
+    costs = Costs(fee_rate=0.001, slippage_rate=0.0005, maker_fee_rate=0.00075, limit_entry=True)
+    df = bars([(100, 101, 99, 100), (100.5, 102, 99.9, 101), (101, 111, 100.5, 110)])
+    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    out = simulate_trade(o, h, l, c, None, 0, "long", 95.0, 110.0, 10, costs)
+    assert out.entry_price == 100.0  # the limit itself: no slippage
+    net = (110 * (1 - 0.0005) * (1 - 0.001) - 100 * (1 + 0.00075)) / 100  # maker in, taker out
+    assert out.return_pct == pytest.approx(net)
+    touch = bars([(100, 101, 99, 100), (100.5, 102, 100.0, 101)])  # only touches 100: no fill
+    o, h, l, c = (touch[k].to_numpy() for k in ("open", "high", "low", "close"))
+    assert simulate_trade(o, h, l, c, None, 0, "long", 95.0, 110.0, 10, costs) is None

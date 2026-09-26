@@ -104,6 +104,17 @@ class ExchangeClient:
             since = last + step
         return ohlcv_to_df(chunks) if chunks else ohlcv_to_df([])
 
+    def fetch_last_price_ts(self, symbol: str) -> tuple[float, int | None]:
+        """(last price, exchange timestamp in ms or None) - lets the bot spot a stale feed."""
+        t = with_retries(self.ex.fetch_ticker, symbol)
+        price = t.get("last") or t.get("close")
+        if not price and t.get("bid") and t.get("ask"):
+            price = (t["bid"] + t["ask"]) / 2
+        if not price:
+            raise RuntimeError(f"No price available for {symbol}")
+        ts = t.get("timestamp")
+        return float(price), int(ts) if ts else None
+
     def fetch_price_bars(self, symbol: str, since_ms: int) -> pd.DataFrame:
         return self.fetch_ohlcv_df(symbol, "1m", limit=1000, since=since_ms)
 

@@ -22,6 +22,7 @@ DIRECTIONAL = (
 MARKET_COLUMNS = DIRECTIONAL + [
     "vol_12", "vol_48", "vol_ratio", "atr_pct", "adx", "bb_width", "vol_z",
     "upper_wick", "lower_wick", "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+    "btc_uptrend", "btc_vol_ratio",  # market regime from BTC (NaN when no context)
 ]
 SIGNAL_COLUMNS = ["side", "tf_log_minutes", "stop_atr", "reward_risk"] + [
     f"strat_{name}" for name in sorted(STRATEGIES)
@@ -29,7 +30,7 @@ SIGNAL_COLUMNS = ["side", "tf_log_minutes", "stop_atr", "reward_risk"] + [
 FEATURE_COLUMNS = MARKET_COLUMNS + SIGNAL_COLUMNS
 
 
-def market_features(df: pd.DataFrame) -> pd.DataFrame:
+def market_features(df: pd.DataFrame, context=None, tf: str | None = None) -> pd.DataFrame:
     o, h, l, c, v = (df[k] for k in ("open", "high", "low", "close", "volume"))
     f = pd.DataFrame(index=df.index)
     logc = np.log(c)
@@ -67,6 +68,15 @@ def market_features(df: pd.DataFrame) -> pd.DataFrame:
     f["hour_cos"] = np.cos(2 * np.pi * hours / 24.0)
     f["dow_sin"] = np.sin(2 * np.pi * df.index.dayofweek / 7.0)
     f["dow_cos"] = np.cos(2 * np.pi * df.index.dayofweek / 7.0)
+    if context is not None and len(df):
+        from ..strategies.base import infer_tf
+
+        ctx = context.align(df.index, tf or infer_tf(df.index))
+        f["btc_uptrend"] = ctx["btc_uptrend"].to_numpy()
+        f["btc_vol_ratio"] = ctx["btc_vol_ratio"].to_numpy()
+    else:
+        f["btc_uptrend"] = np.nan
+        f["btc_vol_ratio"] = np.nan
     return f.replace([np.inf, -np.inf], np.nan)[MARKET_COLUMNS]
 
 

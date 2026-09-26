@@ -61,3 +61,11 @@ def test_secrets_from_env(tmp_path, monkeypatch):
     cfg = load_config(tmp_path / "missing.yaml", env_file=str(env))
     assert cfg.secrets.telegram_token == "abc" and cfg.secrets.telegram_chat_id == "42"
     assert "abc" not in repr(cfg)  # secrets never end up in logs
+
+
+def test_limit_entries_are_paper_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    p = tmp_path / "c.yaml"
+    p.write_text("mode: live\ncosts:\n  entry_order: limit\n")
+    with pytest.raises(ValueError, match="paper-only"):
+        load_config(p, env_file=None)

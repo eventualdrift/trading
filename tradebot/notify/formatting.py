@@ -51,12 +51,19 @@ def format_signal(sig: Signal, pos: Position | None, equity: float, mode: str, q
     entry = pos.entry_price if pos is not None else sig.entry
     risk = abs(entry - sig.stop_loss)
     rr = abs(sig.take_profit - entry) / risk if risk > 0 else 0.0
-    lines = [
-        f"{head} SIGNAL — {esc(sig.symbol)}</b> ({sig.timeframe})",
-        f"Strategy: {esc(sig.strategy)} · Win probability: {conf}",
-        "",
+    working = pos is not None and pos.status == "working"
+    entry_lines = [
+        f"Entry:        <code>{fmt_price(entry)}</code>  (limit {'buy' if buy else 'sell'} - fills only if price "
+        f"trades {'down' if buy else 'up'} through it before {fmt_time(pos.limit_until)})",
+    ] if working else [
         f"Entry:        <code>{fmt_price(entry)}</code>  (market, now)",
         f"Don't chase:  {'above' if buy else 'below'} <code>{fmt_price(sig.chase_limit(max_chase_r))}</code>",
+    ]
+    lines = [
+        f"{head}{' LIMIT' if working else ''} SIGNAL — {esc(sig.symbol)}</b> ({sig.timeframe})",
+        f"Strategy: {esc(sig.strategy)} · Win probability: {conf}",
+        "",
+        *entry_lines,
         f"Stop-loss:    <code>{fmt_price(sig.stop_loss)}</code>  ({(sig.stop_loss / entry - 1) * 100:+.2f}%)",
         f"Take-profit:  <code>{fmt_price(sig.take_profit)}</code>  ({(sig.take_profit / entry - 1) * 100:+.2f}%)"
         + ("  (far target - a trailing stop usually exits first)" if sig.trail_distance else ""),
@@ -109,6 +116,17 @@ def format_trail_move(pos: Position) -> str:
         f"📈 <b>Raise stop — {esc(pos.symbol)}</b> #{pos.id}\n"
         f"New trailing stop: <code>{fmt_price(pos.stop_loss)}</code> (locks in {locked:+.1f}R if hit)."
     )
+
+
+def format_core_rebalance(trades, weights: dict, core_equity: float, quote: str) -> str:
+    lines = [f"⚖️ <b>Core rebalance</b> (daily close) · core equity {core_equity:,.2f} {quote}"]
+    for t in trades:
+        base = t.symbol.split("/")[0]
+        lines.append(f"{'Bought' if t.side == 'buy' else 'Sold'} {t.qty:.6g} {esc(base)} @ {fmt_price(t.price)} "
+                     f"(~{t.qty * t.price:,.2f} {quote}) · weight {t.weight_from:.0%} → {t.weight_to:.0%}")
+    if weights:
+        lines.append("Targets: " + ", ".join(f"{esc(k.split('/')[0])} {v:.0%}" for k, v in weights.items()))
+    return "\n".join(lines)
 
 
 def format_positions(positions: list[Position], prices: dict[str, float], quote: str) -> str:

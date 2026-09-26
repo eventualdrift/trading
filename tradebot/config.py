@@ -39,8 +39,10 @@ class DataConfig:
 
 @dataclass
 class CostConfig:
-    fee_rate: float = 0.001  # per side (0.1% = typical taker fee)
+    fee_rate: float = 0.001  # taker fee per side (0.1%; 0.075% with Binance's BNB discount)
     slippage_rate: float = 0.0005  # adverse price move on market orders / stops
+    maker_fee_rate: float | None = None  # resting limit orders (None = same as fee_rate)
+    entry_order: str = "market"  # market | limit (limit: paper/backtest only in this version)
 
 
 @dataclass
@@ -58,7 +60,35 @@ class RiskConfig:
 
 
 @dataclass
+class CoreConfig:
+    fraction: float = 0.0  # share of the account in the core sleeve (0 = off, e.g. 0.65); paper only
+    symbols: list[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])  # equal slots
+    sma_days: list[int] = field(default_factory=lambda: [50, 100, 150, 200])
+    min_trade_usd: float = 10.0
+    drift_tolerance: float = 0.2  # trade a coin when off target by 20% of its slot (a 25% step always is)
+    rebalance_sleeves_days: float = 30  # reset the core/satellite split every N days (0 = never)
+
+
+@dataclass
+class ContextConfig:
+    uptrend_days: int = 200  # BTC above its N-day average = "BTC uptrend" (for the btc_filter option)
+    vol_short: int = 20  # BTC volatility ratio = sd(short) / sd(long) of hourly returns
+    vol_long: int = 100
+
+
+@dataclass
+class GuardConfig:
+    frozen_bars: int = 6  # skip a coin whose last N candles are identical with no volume (dead feed)
+    extreme_move_pct: float = 10.0  # a price this far from the last 1m close must repeat on the next poll
+    max_price_age_seconds: float = 300  # ignore a ticker older than this
+    vol_breaker: bool = False  # pause new satellite entries during BTC volatility bursts
+    vol_breaker_ratio: float = 2.5
+
+
+@dataclass
 class SelectionConfig:
+    btc_filter: str = "off"  # off | auto: also test each strategy with the BTC-uptrend filter and keep
+    # it only where it improves BOTH in-sample and out-of-sample expectancy
     in_sample_fraction: float = 0.7
     min_trades_in_sample: int = 30
     min_trades_out_of_sample: int = 15
@@ -73,6 +103,7 @@ class MLConfig:
     min_candidates: int = 400
     min_test_trades: int = 30
     min_improvement_r: float = 0.02  # filtered expectancy must beat unfiltered by this much
+    min_edge_t: float = 2.5  # ...and taken trades must beat rejected ones significantly (Welch t)
     threshold_grid: list[float] = field(
         default_factory=lambda: [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
     )
@@ -138,6 +169,9 @@ class BotConfig:
     data: DataConfig = field(default_factory=DataConfig)
     costs: CostConfig = field(default_factory=CostConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    core: CoreConfig = field(default_factory=CoreConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    guards: GuardConfig = field(default_factory=GuardConfig)
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     ml: MLConfig = field(default_factory=MLConfig)
     learning: LearningConfig = field(default_factory=LearningConfig)
@@ -151,6 +185,18 @@ class BotConfig:
         p = Path(self.state_dir)
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    def costs_model(self):
+        from .backtest.engine import Costs
+
+        c = self.costs
+        return Costs(c.fee_rate, c.slippage_rate, c.maker_fee_rate, c.entry_order == "limit")
+
+    def market_context(self, daily=None, hourly=None):
+        from .context import MarketContext
+
+        c = self.context
+        return MarketContext(daily, hourly, c.uptrend_days, c.vol_short, c.vol_long)
 
     def validate(self) -> None:
         from .strategies import STRATEGIES
@@ -185,6 +231,20 @@ class BotConfig:
             if self.exchange.id not in VENUES:
                 errors.append(f"live trading supports {', '.join(sorted(VENUES))} only (got {self.exchange.id!r}); "
                               f"signals and paper trading work with any exchange")
+        if not 0.0 <= self.core.fraction < 1.0:
+            errors.append("core.fraction must be in [0, 1)")
+        if self.core.fraction > 0 and self.mode == "live":
+            errors.append("the core sleeve (core.fraction > 0) is paper-only in this version")
+        if self.core.fraction > 0 and (not self.core.symbols or not self.core.sma_days):
+            errors.append("core.symbols and core.sma_days must not be empty")
+        if self.costs.entry_order not in ("market", "limit"):
+            errors.append("costs.entry_order must be 'market' or 'limit'")
+        if self.mode == "live" and self.costs.entry_order == "limit":
+            errors.append("costs.entry_order: limit is paper-only in this version (live uses market entries)")
+        if self.selection.btc_filter not in ("off", "auto"):
+            errors.append("selection.btc_filter must be 'off' or 'auto'")
+        if self.guards.vol_breaker_ratio <= 1.0:
+            errors.append("guards.vol_breaker_ratio must be > 1")
         if not 0.3 <= self.selection.in_sample_fraction <= 0.9:
             errors.append("selection.in_sample_fraction must be in [0.3, 0.9]")
         if errors:

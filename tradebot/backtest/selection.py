@@ -17,8 +17,9 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import BotConfig
+from ..context import apply_vol_breaker
 from ..strategies import make_strategy
-from .engine import Costs, Trade, backtest_populated, portfolio_simulation
+from .engine import Trade, backtest_populated, portfolio_simulation
 from .metrics import summarize, trade_metrics
 
 
@@ -33,6 +34,7 @@ class ComboResult:
     symbol_win_fraction: float
     selected: bool
     reasons: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -81,16 +83,19 @@ def run_combo(
     params: dict,
     timeframe: str,
     cfg: BotConfig,
+    context=None,
+    vol_breaker: float | None = None,
 ) -> tuple[list[Trade], list[Trade], dict[str, float]]:
-    """Backtest one combination on all symbols -> (in-sample, out-of-sample, per-symbol exp)."""
+    """Backtest one combination on all symbols -> (in-sample, out-of-sample, per-symbol exp).
+    ``vol_breaker``: block entries while BTC's volatility ratio is above this (research)."""
     strategy = make_strategy(strategy_name, params)
-    costs = Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate)
+    costs = cfg.costs_model()
     frac = cfg.selection.in_sample_fraction
     is_trades, oos_trades, per_symbol = [], [], {}
     for symbol, df in datasets.items():
         if len(df) < strategy.warmup + 100:
             continue
-        pop = strategy.populate(df)
+        pop = apply_vol_breaker(strategy.populate(df, context, timeframe), context, timeframe, vol_breaker)
         split = strategy.warmup + int((len(df) - strategy.warmup) * frac)
         split_time = pop.index[min(split, len(pop) - 1)]
         trades = backtest_populated(
@@ -112,8 +117,8 @@ def run_combo(
     return is_trades, oos_trades, per_symbol
 
 
-def evaluate_combo(datasets, strategy_name, params, timeframe, cfg: BotConfig) -> ComboResult:
-    is_trades, oos_trades, per_symbol = run_combo(datasets, strategy_name, params, timeframe, cfg)
+def evaluate_combo(datasets, strategy_name, params, timeframe, cfg: BotConfig, context=None) -> ComboResult:
+    is_trades, oos_trades, per_symbol = run_combo(datasets, strategy_name, params, timeframe, cfg, context)
     r = cfg.risk
     sims = {}
     for label, trades in (("is", is_trades), ("oos", oos_trades)):
@@ -157,19 +162,37 @@ def evaluate_combo(datasets, strategy_name, params, timeframe, cfg: BotConfig) -
     )
 
 
+def evaluate_with_btc_filter(datasets, name, params, tf, cfg: BotConfig, context) -> ComboResult:
+    """selection.btc_filter = auto: test the combo with and without the BTC-uptrend filter and
+    keep the filter only where it improves BOTH in-sample and out-of-sample expectancy."""
+    base = evaluate_combo(datasets, name, params, tf, cfg, context)
+    if cfg.selection.btc_filter != "auto" or context is None or "btc_filter" in params:
+        return base
+    filt = evaluate_combo(datasets, name, {**params, "btc_filter": True}, tf, cfg, context)
+    bi, bo = base.in_sample["expectancy_r"], base.out_of_sample["expectancy_r"]
+    fi, fo = filt.in_sample["expectancy_r"], filt.out_of_sample["expectancy_r"]
+    detail = f"IS {bi:+.3f}->{fi:+.3f}R, OOS {bo:+.3f}->{fo:+.3f}R"
+    if fi > bi and fo > bo and filt.selected:
+        filt.notes.append(f"BTC-uptrend filter kept ({detail})")
+        return filt
+    base.notes.append(f"BTC-uptrend filter not kept ({detail})")
+    return base
+
+
 def run_selection(
-    datasets_by_tf: dict[str, dict[str, pd.DataFrame]], cfg: BotConfig, log=print
+    datasets_by_tf: dict[str, dict[str, pd.DataFrame]], cfg: BotConfig, log=print, context=None
 ) -> Selection:
     combos = []
     for tf, datasets in datasets_by_tf.items():
         for name, params in cfg.strategies.items():
-            res = evaluate_combo(datasets, name, params, tf, cfg)
+            res = evaluate_with_btc_filter(datasets, name, params, tf, cfg, context)
             status = "SELECTED" if res.selected else "rejected"
             log(
                 f"  {res.key:<16} {status:<8} IS {res.in_sample['trades']:>4} trades "
                 f"{res.in_sample['expectancy_r']:+.3f}R | OOS {res.out_of_sample['trades']:>4} trades "
                 f"{res.out_of_sample['expectancy_r']:+.3f}R"
                 + ("" if res.selected else f"  ({res.reasons[0]})")
+                + "".join(f"\n      {n}" for n in res.notes)
             )
             combos.append(res)
     return Selection(created_at=time.time(), combos=combos)

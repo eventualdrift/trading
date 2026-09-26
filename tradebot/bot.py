@@ -11,6 +11,8 @@ import pandas as pd
 from .backtest.selection import Selection
 from .config import BotConfig
 from .db import Database
+from .backtest.engine import Costs
+from .core import CoreSleeve
 from .execution.base import Broker, NotFilled, finalize_close
 from .ml.model import SignalModel
 from .models import Position, Signal
@@ -67,9 +69,13 @@ class TradingBot:
         self._last_error_notice: dict[str, float] = {}
         self._last_equity_record = 0
         self._last_orphan_sweep = 0
+        self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
+        self._pending_extreme: dict[str, int] = {}
         self._stop = threading.Event()
         if hasattr(broker, "persist"):  # live broker saves order ids BEFORE each order is sent
             broker.persist = self.db.update_position
+        self.core = (CoreSleeve(db, cfg.core, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), self.mode, market)
+                     if cfg.core.fraction > 0 and self.mode == "paper" else None)
 
     # ----------------------------------------------------------------- state
     def _k(self, key: str) -> str:
@@ -158,6 +164,85 @@ class TradingBot:
         if now_ms - self._last_equity_record >= 15 * 60_000:
             self._last_equity_record = now_ms
             self.db.record_equity(now_ms, self.mode, equity)
+            try:
+                s = self.sleeves(now_ms)
+                self.db.record_snapshot(now_ms, self.mode, s["total"], s["core"], s["satellite"], s["btc_price"])
+            except Exception as exc:
+                log.warning("snapshot failed: %s", exc)
+
+    # ------------------------------------------------------------ core sleeve
+    def sleeves(self, now_ms: int) -> dict:
+        """Equity by sleeve. Without a core sleeve everything is 'satellite'."""
+        sat, _ = self.equity()
+        btc = f"BTC/{self.cfg.exchange.quote}"
+        syms = set(self.cfg.core.symbols if self.core is not None else []) | {btc}
+        prices = {}
+        for s in syms:
+            try:
+                prices[s] = self.market.fetch_last_price(s)
+            except Exception:
+                pass
+        core = self.core.equity(prices) if self.core is not None and self.core.initialized else 0.0
+        return {"total": sat + core, "core": core, "satellite": sat, "btc_price": prices.get(btc), "prices": prices}
+
+    def _shift_breakers(self, delta: float) -> None:
+        """Capital moved in/out of the satellite is not a gain or loss for its breakers."""
+        for key in ("peak_equity", "day_start_equity"):
+            v = self._get(key)
+            if v is not None:
+                self._set(key, float(v) + delta)
+
+    def _maybe_core_day(self, now_ms: int) -> None:
+        delay = int(self.cfg.candle_close_delay_seconds * 1000)
+        day = last_closed_open_ms(now_ms - delay, "1d")
+        if day <= self._get("core_last_day", 0):
+            return
+        self._set("core_last_day", day)
+        c = self.cfg.core
+        prices = {}
+        for s in c.symbols:
+            px = self._guarded_price(s, now_ms)
+            if px is not None:
+                prices[s] = px
+        quote = self.cfg.exchange.quote
+        if not self.core.initialized:
+            sat, _ = self.equity()
+            amount = sat * c.fraction
+            self.broker.transfer(-amount)
+            self.core.initialize(amount)
+            self._shift_breakers(-amount)
+            self._set("sleeves_last_ms", now_ms)
+            self.notify(f"🏛 <b>Core sleeve started</b>: {amount:,.2f} {quote} ({c.fraction:.0%}) moved into the "
+                        f"BTC/ETH trend allocation; {sat - amount:,.2f} {quote} stays with the signal strategies.")
+        elif c.rebalance_sleeves_days > 0 and now_ms - self._get("sleeves_last_ms", 0) >= c.rebalance_sleeves_days * 86_400_000:
+            self._rebalance_sleeves(now_ms, prices)
+        trades = self.core.rebalance(now_ms, prices)
+        if trades:
+            self.notify(fmt.format_core_rebalance(trades, self.core.weights, self.core.equity(prices), quote))
+
+    def _rebalance_sleeves(self, now_ms: int, prices: dict[str, float]) -> None:
+        c, quote = self.cfg.core, self.cfg.exchange.quote
+        sat, _ = self.equity()
+        core = self.core.equity(prices)
+        delta = (sat + core) * c.fraction - core  # > 0: the core is below its share
+        self._set("sleeves_last_ms", now_ms)
+        if abs(delta) < max(c.min_trade_usd, 0.01 * (sat + core)):
+            return
+        if delta > 0:
+            open_notional = sum(p.notional for p in self.db.open_positions(self.mode))
+            moved = max(min(delta, sat - open_notional), 0.0)  # never leave the satellite over-exposed
+            if moved <= 0:
+                return
+            self.broker.transfer(-moved)
+            self.core.deposit(moved)
+            self._shift_breakers(-moved)
+            text = f"{moved:,.2f} {quote} satellite → core"
+        else:
+            moved, _ = self.core.withdraw(-delta, prices, now_ms)
+            self.broker.transfer(moved)
+            self._shift_breakers(moved)
+            text = f"{moved:,.2f} {quote} core → satellite"
+        self.notify(f"⚖️ Sleeves reset to {c.fraction:.0%} core: moved {text}.")
 
     def _entry_block(self, sig: Signal, open_positions: list[Position], equity: float) -> str | None:
         if self._get("paused"):
@@ -166,7 +251,22 @@ class TradingBot:
             return f"halted ({self._get('halted')})"
         if self.risk.daily_limit_hit(equity, self._get("day_start_equity", equity)):
             return "daily loss limit reached"
+        burst = self.vol_burst(sig.created_at)
+        if burst is not None:
+            return burst
         return self.risk.entry_block_reason(sig, open_positions)
+
+    def vol_burst(self, now_ms: int) -> str | None:
+        """Volatility circuit breaker: no new entries while BTC's hourly volatility is a
+        multiple of its recent normal (off unless guards.vol_breaker is set)."""
+        g = self.cfg.guards
+        if not g.vol_breaker:
+            return None
+        ctx = self.scanner.context(now_ms)
+        ratio = ctx.vol_ratio_now() if ctx is not None else None
+        if ratio is not None and ratio > g.vol_breaker_ratio:
+            return f"BTC volatility burst ({ratio:.1f}x normal > {g.vol_breaker_ratio:g}x)"
+        return None
 
     # ------------------------------------------------------------ main loop
     def run_forever(self) -> None:
@@ -210,6 +310,11 @@ class TradingBot:
                 else:
                     log.info("skipping stale %s candle (bot started late)", tf)
                 self._set(f"last_scan:{tf}", candle)
+            if self.core is not None:
+                try:
+                    self._maybe_core_day(now_ms)
+                except Exception as exc:
+                    self._notify_error(f"core sleeve: {exc}", key="core")
             self._maybe_daily_summary(now_ms, equity)
         self._maybe_learn(now_ms)
 
@@ -234,11 +339,16 @@ class TradingBot:
                 tf, len(symbols), len(res.accepted), len(res.filtered), len(res.exits))
 
     def handle_signal(self, sig: Signal, now_ms: int, equity: float) -> Position | None:
-        open_positions = self.db.open_positions(self.mode)
+        # resting limit entries count toward the position limits and exposure
+        open_positions = self.db.open_positions(self.mode) + self.db.positions_with_status(self.mode, ("working",))
+        limit_entry = self.cfg.costs.entry_order == "limit"
         block = self._entry_block(sig, open_positions, equity)
         price, size = None, None
         if block is None:
-            price = self.market.fetch_last_price(sig.symbol)
+            price = self._guarded_price(sig.symbol, now_ms, ref=sig.entry)
+            if price is None:
+                block = "price not confirmed (stale or extreme) - bad-data guard"
+        if block is None:
             limit = sig.chase_limit(self.cfg.risk.max_chase_r)
             beyond = price >= limit if sig.side == "long" else price <= limit
             invalid = (price <= sig.stop_loss or price >= sig.take_profit) if sig.side == "long" \
@@ -247,7 +357,7 @@ class TradingBot:
                 block = f"price {fmt.fmt_price(price)} already outside the entry zone"
         if block is None:
             size = self.risk.size(
-                equity, price, sig.stop_loss,
+                equity, sig.entry if limit_entry else price, sig.stop_loss,
                 open_notional=sum(p.notional for p in open_positions),
                 available_cash=self.broker.available_cash(),
                 limits=self.broker.limits(sig.symbol),
@@ -268,6 +378,14 @@ class TradingBot:
         sig.status = "opened"
         self.db.insert_signal(sig)
         pos = Position.from_signal(sig, self.mode, size.amount, now_ms)
+        if limit_entry:  # paper only (config validation): rest a buy limit at the signal close
+            bar = self.market.price_bar_ms
+            pos.status, pos.limit_until = "working", sig.valid_until
+            pos.last_checked_ms = (now_ms // bar + 1) * bar
+            self.db.insert_position(pos)
+            self.notify(fmt.format_signal(sig, pos, equity, self.mode, self.cfg.exchange.quote,
+                                          self.cfg.risk.max_chase_r, self.ml_active))
+            return pos
         self.db.insert_position(pos)  # recorded BEFORE any order is sent
         try:
             self.broker.open_position(pos, price, now_ms)
@@ -388,9 +506,51 @@ class TradingBot:
         if cancelled:
             self.notify("🧹 Cancelled stray bot orders no position owns:\n" + fmt.esc("\n".join(cancelled)))
 
+    def _work_limit_orders(self, now_ms: int) -> None:
+        """Paper limit entries: fill when price trades THROUGH the limit, else expire."""
+        bar_ms = self.market.price_bar_ms
+        for pos in self.db.positions_with_status(self.mode, ("working",)):
+            long = pos.side == "long"
+            filled_bar = None
+            bars = self.market.fetch_price_bars(pos.symbol, pos.last_checked_ms)
+            if len(bars):
+                opens = index_ms(bars.index)
+                bars = bars[(opens >= pos.last_checked_ms) & (opens + bar_ms <= now_ms)
+                            & (opens < pos.limit_until)]
+                for ts, h, l in zip(index_ms(bars.index), bars["high"].to_numpy(), bars["low"].to_numpy()):
+                    if (l < pos.entry_price) if long else (h > pos.entry_price):
+                        filled_bar = int(ts)
+                        break
+                if filled_bar is None and len(bars):
+                    pos.last_checked_ms = int(index_ms(bars.index)[-1]) + bar_ms
+            if filled_bar is None and now_ms < pos.limit_until:
+                current = self._guarded_price(pos.symbol, now_ms, ref=pos.entry_price)
+                if current is not None and ((current < pos.entry_price) if long else (current > pos.entry_price)):
+                    filled_bar = (now_ms // bar_ms) * bar_ms
+            if filled_bar is not None:
+                self.broker.fill_limit(pos, now_ms)
+                pos.last_checked_ms = filled_bar  # replay the fill bar: a stop there still counts
+                self.db.update_position(pos)
+                self.notify(f"✅ Limit filled — {fmt.esc(pos.symbol)} #{pos.id} at "
+                            f"<code>{fmt.fmt_price(pos.entry_price)}</code>. Stop-loss "
+                            f"<code>{fmt.fmt_price(pos.stop_loss)}</code>, take-profit "
+                            f"<code>{fmt.fmt_price(pos.take_profit)}</code>.")
+            elif now_ms >= pos.limit_until:
+                pos.status, pos.exit_reason = "missed", "limit not filled"
+                self.db.update_position(pos)
+                self.notify(f"⌛ Limit order expired — {fmt.esc(pos.symbol)} #{pos.id} never traded through "
+                            f"<code>{fmt.fmt_price(pos.entry_price)}</code>. No trade.")
+            else:
+                self.db.update_position(pos)
+
     def manage_positions(self, now_ms: int) -> None:
         self._reconcile_unknown(now_ms)
         self._sweep_orphans(now_ms)
+        if hasattr(self.broker, "fill_limit"):
+            try:
+                self._work_limit_orders(now_ms)
+            except Exception as exc:
+                self._notify_error(f"limit orders: {exc}", key="limits")
         positions = self.db.open_positions(self.mode)
         if not positions:
             return
@@ -452,6 +612,7 @@ class TradingBot:
             if not len(bars):  # nothing newer: history is fully replayed
                 caught_up = True
                 break
+            self._ref_price[pos.symbol] = (float(bars["close"].iloc[-1]), int(index_ms(bars.index)[-1]) + bar_ms)
             for ts, o, h, l in zip(index_ms(bars.index), bars["open"].to_numpy(), bars["high"].to_numpy(),
                                    bars["low"].to_numpy()):
                 pos.last_checked_ms = int(ts) + bar_ms
@@ -472,7 +633,10 @@ class TradingBot:
             self.db.update_position(pos)
             return
         if reason is None:
-            current = self.market.fetch_last_price(pos.symbol)
+            current = self._guarded_price(pos.symbol, now_ms)
+            if current is None:  # stale or unconfirmed extreme price: decide next poll
+                self.db.update_position(pos)
+                return
             if (current <= pos.stop_loss) if long else (current >= pos.stop_loss):
                 reason = self._managed_stop_reason(pos) if pos.breakeven_moved else "stop_loss"
             elif (current >= pos.take_profit) if long else (current <= pos.take_profit):
@@ -484,12 +648,43 @@ class TradingBot:
                 # the new stop applies from here on: don't judge it against the part of
                 # the current bar that happened before (the live price covers the rest)
                 pos.last_checked_ms = max(pos.last_checked_ms, (now_ms // bar_ms + 1) * bar_ms)
-        elif price is None:
-            current = self.market.fetch_last_price(pos.symbol)
+        elif price is None:  # a completed bar hit the bot-managed stop: exit now
+            current = self._guarded_price(pos.symbol, now_ms)
+            if current is None:
+                current = pos.stop_loss  # price unconfirmed: book the stop level itself
         if reason is not None:
             self._close(pos, price if price is not None else current, reason, now_ms)
         else:
             self.db.update_position(pos)
+
+    def _guarded_price(self, symbol: str, now_ms: int, ref: float | None = None) -> float | None:
+        """Bad-data guard for the live price: None means "don't act on it this poll".
+
+        * stale: the exchange's ticker is older than guards.max_price_age_seconds;
+        * extreme: more than guards.extreme_move_pct away from the last completed 1m close
+          (or ``ref``) - acted on only if it is still there on the next poll. In live
+          trading the exchange-side stop keeps protecting the position meanwhile.
+        """
+        g = self.cfg.guards
+        fetch_ts = getattr(self.market, "fetch_last_price_ts", None)
+        price, ts = fetch_ts(symbol) if callable(fetch_ts) else (self.market.fetch_last_price(symbol), None)
+        if ts is not None and g.max_price_age_seconds > 0 and now_ms - ts > g.max_price_age_seconds * 1000:
+            self._notify_error(f"{symbol}: the exchange price is {(now_ms - ts) / 1000:.0f}s old - "
+                               f"not acting on it until it updates", key=f"stale:{symbol}")
+            return None
+        if ref is None:  # only trust a recent close (a remembered one goes stale after the trade)
+            close, at = self._ref_price.get(symbol, (None, 0))
+            ref = close if now_ms - at <= 15 * 60_000 else None
+        if ref and g.extreme_move_pct > 0 and abs(price / ref - 1) * 100 > g.extreme_move_pct:
+            direction = 1 if price > ref else -1
+            if self._pending_extreme.get(symbol) != direction:
+                self._pending_extreme[symbol] = direction
+                log.warning("%s: price %s is %.1f%% from the last close %s - confirming on the next poll",
+                            symbol, price, (price / ref - 1) * 100, ref)
+                return None
+            log.warning("%s: extreme price %s confirmed", symbol, price)
+        self._pending_extreme.pop(symbol, None)
+        return price
 
     def _move_to_breakeven(self, pos: Position) -> None:
         self.broker.move_stop(pos, pos.entry_price)
@@ -577,7 +772,15 @@ class TradingBot:
                 equity, _ = self.equity()
                 combos = ", ".join(c.key for c in (self.selection.selected if self.selection else [])) or "none"
                 state = "halted" if self._get("halted") else "paused" if self._get("paused") else "running"
-                return (f"<b>Status</b>: {state} · {self.mode} mode\nEquity: {equity:,.2f} {quote}\n"
+                if self.core is not None and self.core.initialized:
+                    s = self.sleeves(self.market.now_ms())
+                    w = ", ".join(f"{k.split('/')[0]} {v:.0%}" for k, v in self.core.weights.items()) or "no weights yet"
+                    money = (f"Total equity: {s['total']:,.2f} {quote}\n"
+                             f"• Core: {s['core']:,.2f} {quote} (P&amp;L {s['core'] - self.core.contributed:+,.2f}; {w})\n"
+                             f"• Satellite: {equity:,.2f} {quote}")
+                else:
+                    money = f"Equity: {equity:,.2f} {quote}"
+                return (f"<b>Status</b>: {state} · {self.mode} mode\n{money}\n"
                         f"Open positions: {len(self.db.open_positions(self.mode))}/{self.cfg.risk.max_open_positions}\n"
                         f"Strategies: {fmt.esc(combos)}\nML filter: {'active' if self.ml_active else 'not active'}")
             if cmd == "positions":

@@ -64,6 +64,7 @@ class ModelReport:
     filtered_win_rate: float = 0.0
     filtered_trades: int = 0
     vs_current: dict | None = None
+    edge_t: float | None = None  # taken vs rejected test trades, Welch t-statistic
     confidence_edge_r: float | None = None  # top-half vs bottom-half confidence, on the test set
     confidence_scaling: bool = False  # higher confidence really earned more -> allow bigger bets
     trained_until: str | None = None
@@ -79,6 +80,7 @@ class ModelReport:
             f"  test set: all signals {self.base_expectancy_r:+.3f}R ({self.base_win_rate:.0%} win, {self.n_test} trades) "
             f"-> filtered {self.filtered_expectancy_r:+.3f}R ({self.filtered_win_rate:.0%} win, {self.filtered_trades} trades), "
             f"threshold {self.threshold:.2f}, AUC {auc}"
+            + (f", taken-vs-rejected t={self.edge_t:.1f}" if self.edge_t is not None else "")
             + (f"\n  bigger bets on high-confidence setups: {'yes' if self.confidence_scaling else 'no'}"
                f" (their edge over the rest: {self.confidence_edge_r:+.2f}R)" if self.confidence_edge_r is not None else "")
         )
@@ -119,8 +121,12 @@ class SignalModel:
 
 
 def _fit(df: pd.DataFrame):
+    X = df[FEATURE_COLUMNS].to_numpy(dtype=float, copy=True)
+    # a feature with no values at all (e.g. BTC context unavailable) crashes the binner;
+    # make it a constant the model ignores
+    X[:, np.isnan(X).all(axis=0)] = 0.0
     clf = _make_classifier()
-    clf.fit(df[FEATURE_COLUMNS].to_numpy(dtype=float), df["label"].to_numpy(dtype=int))
+    clf.fit(X, df["label"].to_numpy(dtype=int))
     return clf
 
 
@@ -192,6 +198,15 @@ def train_model(
             rep.confidence_scaling = rep.confidence_edge_r >= 0.1 and float(rt[hi].mean()) > 0
 
     problems = []
+    rejected = r_test[p_test < thr]
+    taken_r = r_test[p_test >= thr]
+    if len(rejected) >= 10 and len(taken_r) >= 10:
+        se = np.sqrt(taken_r.var(ddof=1) / len(taken_r) + rejected.var(ddof=1) / len(rejected))
+        rep.edge_t = float((taken_r.mean() - rejected.mean()) / se) if se > 0 else 0.0
+        if rep.edge_t < cfg.min_edge_t:
+            problems.append(f"taken trades don't beat rejected ones convincingly (t={rep.edge_t:.1f} < {cfg.min_edge_t})")
+    else:
+        problems.append("the filter takes or rejects too few test trades to show an edge")
     if rep.filtered_trades < cfg.min_test_trades:
         problems.append(f"filter kept only {rep.filtered_trades} test trades (< {cfg.min_test_trades})")
     if rep.filtered_expectancy_r <= 0:

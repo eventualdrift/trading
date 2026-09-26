@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ..backtest.engine import Costs, reward_risk, simulate_trade
+from ..backtest.engine import reward_risk, simulate_trade
 from ..config import BotConfig
 from ..strategies import make_strategy
 from .features import FEATURE_COLUMNS, candidate_features, market_features
@@ -26,13 +26,14 @@ def candidates_for(
     params: dict,
     cfg: BotConfig,
     mkt: pd.DataFrame | None = None,
+    context=None,
 ) -> pd.DataFrame:
     strategy = make_strategy(strategy_name, params)
     if len(df) < strategy.warmup + 50:
         return pd.DataFrame(columns=FEATURE_COLUMNS + META_COLUMNS)
-    pop = strategy.populate(df)
-    mkt = market_features(df) if mkt is None else mkt
-    costs = Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate)
+    pop = strategy.populate(df, context, timeframe)
+    mkt = market_features(df, context, timeframe) if mkt is None else mkt
+    costs = cfg.costs_model()
     o, h, l, c = (pop[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
     rows = []
     sides = [("long", "enter_long", "exit_long", "long_sl", "long_tp")]
@@ -75,16 +76,20 @@ def candidates_for(
 
 
 def build_candidates(
-    datasets_by_tf: dict[str, dict[str, pd.DataFrame]], cfg: BotConfig
+    datasets_by_tf: dict[str, dict[str, pd.DataFrame]], cfg: BotConfig, context=None,
+    params_for: dict[tuple[str, str], dict] | None = None,
 ) -> pd.DataFrame:
+    """``params_for[(strategy, timeframe)]`` overrides the config params (e.g. with the
+    BTC filter that selection chose), so the model learns from the signals it will see."""
     frames = []
     for tf, datasets in datasets_by_tf.items():
         for symbol, df in datasets.items():
             if len(df) < 300:
                 continue
-            mkt = market_features(df)
+            mkt = market_features(df, context, tf)
             for name, params in cfg.strategies.items():
-                frames.append(candidates_for(df, symbol, tf, name, params, cfg, mkt))
+                p = (params_for or {}).get((name, tf), params)
+                frames.append(candidates_for(df, symbol, tf, name, p, cfg, mkt, context))
     frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame(columns=FEATURE_COLUMNS + META_COLUMNS)

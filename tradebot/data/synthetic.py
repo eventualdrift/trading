@@ -126,6 +126,9 @@ class SyntheticMarket:
     def fetch_last_price(self, symbol: str) -> float:
         return float(self._closed(symbol, self.base_tf)["close"].iloc[-1])
 
+    def fetch_last_price_ts(self, symbol: str) -> tuple[float, int]:
+        return self.fetch_last_price(symbol), self._now
+
     def top_symbols(self, quote: str, n: int, min_quote_volume: float = 0.0,
                     whitelist: list[str] | None = None, blacklist: list[str] | None = None) -> list[str]:
         syms = [s for s in (whitelist or self.symbols) if s in self.base]

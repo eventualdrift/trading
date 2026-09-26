@@ -448,3 +448,88 @@ def test_live_loop_matches_backtest(cfg):
     total_paper = sum(live[k].r_multiple for k in expected)
     total_bt = sum(t.r_multiple for t in expected.values())
     assert total_paper >= total_bt - 1.0  # paper is not systematically worse than the backtest
+
+
+def test_vol_breaker_blocks_new_entries(cfg, monkeypatch):
+    class Burst:
+        def vol_ratio_now(self):
+            return 3.4
+
+    cfg.guards.vol_breaker = True
+    market, db, notes, bot = managed(cfg, [(100, 101, 99, 100)])
+    monkeypatch.setattr(bot.scanner, "context", lambda now: Burst())
+    sig = Signal("ETH/USDT", "1h", "trend", "long", 100.0, 95.0, 110.0, 0, T0, T0, T0 + DAY)
+    assert bot.handle_signal(sig, T0 + 30_000, 1000.0) is None
+    assert "volatility burst" in db.recent_signals(1)[0].note
+    cfg.guards.vol_breaker = False  # off by default: same signal goes through
+    assert bot.handle_signal(Signal("ETH/USDT", "1h", "trend", "long", 100.0, 95.0, 110.0, 0, T0, T0, T0 + DAY),
+                             T0 + 30_000, 1000.0) is not None
+
+
+def test_extreme_price_needs_confirmation(cfg):
+    """Bad-data guard: a one-poll crash print below the stop doesn't trigger an exit."""
+    market, db, notes, bot = managed(cfg, [(100, 101, 99.5, 100)], price=80.0)
+    bot.manage_positions(T0 + MIN + 1)
+    assert len(db.open_positions("paper")) == 1  # 20% below the last 1m close: wait one poll
+    market.price = 100.2  # it was a bad print
+    bot.manage_positions(T0 + MIN + 30_000)
+    assert len(db.open_positions("paper")) == 1
+    market.price = 80.0
+    bot.manage_positions(T0 + MIN + 45_000)
+    market.price = 80.0  # still there on the next poll: real
+    bot.manage_positions(T0 + MIN + 59_000)
+    [p] = db.closed_positions("paper")
+    assert p.exit_reason == "stop_loss" and p.exit_price == pytest.approx(80.0)
+
+
+def test_stale_price_is_not_acted_on(cfg):
+    market, db, notes, bot = managed(cfg, [(100, 104, 99.5, 104)], price=111.0)  # 111 vs 104: not extreme
+    market.fetch_last_price_ts = lambda s: (111.0, T0 - 10 * MIN)  # 11 minutes old
+    bot.manage_positions(T0 + MIN + 1)
+    assert len(db.open_positions("paper")) == 1  # would have been a take-profit
+    assert any("old" in m for m in notes.messages)
+    market.fetch_last_price_ts = lambda s: (111.0, T0 + MIN)
+    bot.manage_positions(T0 + MIN + 2)
+    assert db.closed_positions("paper")[0].exit_reason == "take_profit"
+
+
+def limit_bot(cfg, rows, price):
+    cfg.costs.entry_order, cfg.costs.maker_fee_rate = "limit", 0.00075
+    market = StubMarket(rows, T0, price)
+    db = Database(cfg.state_path / "lim.db")
+    broker = PaperBroker(db, cfg.costs_model(), 1000.0)
+    notes = MemoryNotifier()
+    bot = TradingBot(cfg, market, broker, db, notes, selection=selection())
+    sig = Signal("BTC/USDT", "1h", "trend", "long", 100.0, 95.0, 110.0, 0, T0, T0 + 3 * MIN, T0 + DAY)
+    return market, db, notes, bot, broker, sig
+
+
+def test_paper_limit_entry_fills_when_traded_through(cfg):
+    market, db, notes, bot, broker, sig = limit_bot(cfg, [(100.3, 100.6, 100.1, 100.4), (100.4, 100.5, 99.8, 100.2)], 100.4)
+    pos = bot.handle_signal(sig, T0, 1000.0)
+    assert pos.status == "working" and "LIMIT SIGNAL" in notes.messages[-1]
+    bot.manage_positions(T0 + MIN + 1)  # first bar never went below 100
+    assert db.get_position(pos.id).status == "working"
+    bot.manage_positions(T0 + 2 * MIN + 1)  # second bar traded down through it
+    p = db.get_position(pos.id)
+    assert p.status == "open" and p.entry_price == 100.0
+    assert p.fees == pytest.approx(100.0 * p.amount * 0.00075)  # maker fee
+    assert any("Limit filled" in m for m in notes.messages)
+
+
+def test_paper_limit_entry_expires_unfilled(cfg):
+    market, db, notes, bot, broker, sig = limit_bot(cfg, [(100.3, 101, 100.2, 100.8)] * 4, 101.0)
+    pos = bot.handle_signal(sig, T0, 1000.0)
+    bot.manage_positions(T0 + 4 * MIN)
+    p = db.get_position(pos.id)
+    assert p.status == "missed" and broker.cash == pytest.approx(1000.0)  # nothing paid
+    assert any("expired" in m for m in notes.messages)
+
+
+def test_working_limit_orders_count_toward_limits(cfg):
+    cfg.risk.max_open_positions = 1
+    market, db, notes, bot, broker, sig = limit_bot(cfg, [(100.3, 100.6, 100.1, 100.4)], 100.4)
+    assert bot.handle_signal(sig, T0, 1000.0) is not None
+    other = Signal("ETH/USDT", "1h", "trend", "long", 100.0, 95.0, 110.0, 0, T0, T0 + 3 * MIN, T0 + DAY)
+    assert bot.handle_signal(other, T0, 1000.0) is None
+    assert "max open positions" in db.recent_signals(1)[0].note

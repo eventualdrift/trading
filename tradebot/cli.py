@@ -80,7 +80,7 @@ def cmd_backtest(args, cfg):
 
     from .backtest import format_metrics, portfolio_simulation, summarize
     from .backtest.selection import run_combo
-    from .learning import load_datasets
+    from .learning import load_context, load_datasets
 
     market = _market(cfg, args.synthetic)
     u = cfg.universe
@@ -89,11 +89,12 @@ def cmd_backtest(args, cfg):
     strategies = [args.strategy] if args.strategy else list(cfg.strategies)
     cfg.timeframes = tfs
     datasets = load_datasets(market, cfg, symbols, _store(cfg, market))
+    context = load_context(market, cfg, _store(cfg, market))
     r = cfg.risk
     all_trades = []
     for tf in tfs:
         for name in strategies:
-            is_t, oos_t, _ = run_combo(datasets[tf], name, cfg.strategies.get(name, {}), tf, cfg)
+            is_t, oos_t, _ = run_combo(datasets[tf], name, cfg.strategies.get(name, {}), tf, cfg, context)
             trades = is_t + oos_t
             all_trades += trades
             curve, taken = portfolio_simulation(trades, risk_per_trade_pct=r.risk_per_trade_pct,
@@ -135,7 +136,6 @@ def cmd_scan(args, cfg):
 
 
 def cmd_run(args, cfg):
-    from .backtest.engine import Costs
     from .bot import TradingBot
     from .db import Database
     from .execution import LiveBroker, PaperBroker
@@ -158,7 +158,7 @@ def cmd_run(args, cfg):
     try:
         broker = (LiveBroker(market, cfg.exchange.quote, cfg.live.native_stop_loss, cfg.live.fill_timeout_seconds)
                   if live else
-                  PaperBroker(db, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), cfg.paper.starting_balance, market))
+                  PaperBroker(db, cfg.costs_model(), cfg.paper.starting_balance, market))
     except ValueError as exc:
         sys.exit(str(exc))
 
@@ -189,9 +189,12 @@ def cmd_report(args, cfg):
     from .db import Database
     from .learning import MODEL_REPORT_FILE, load_brain
     from .notify import formatting as fmt
-    from .report import format_readiness, readiness
+    from .report import format_readiness, readiness, sleeve_summary
 
     db = Database(cfg.state_path / "tradebot.db")
+    summary = sleeve_summary(db, cfg, cfg.mode)
+    if summary:
+        print(summary + "\n")
     for mode in ("paper", "live"):
         closed = db.closed_positions(mode)
         if closed or mode == "paper":
@@ -207,7 +210,7 @@ def cmd_report(args, cfg):
 
 
 def cmd_project(args, cfg):
-    from .learning import load_brain, load_datasets
+    from .learning import load_brain, load_context, load_datasets
     from .projection import format_projection, out_of_sample_trades, project
 
     selection, _ = load_brain(cfg)
@@ -220,11 +223,63 @@ def cmd_project(args, cfg):
     bench_symbol = f"BTC/{cfg.exchange.quote}"
     datasets = load_datasets(market, cfg, sorted(set(symbols) | {bench_symbol}), _store(cfg, market),
                              log_fn=lambda *_: None)
+    context = load_context(market, cfg, _store(cfg, market), log_fn=lambda *_: None)
     trades = out_of_sample_trades(selection, {tf: {s: d for s, d in ds.items() if s in symbols}
-                                              for tf, ds in datasets.items()}, cfg)
+                                              for tf, ds in datasets.items()}, cfg, context)
     bench = next((ds[bench_symbol] for ds in datasets.values() if bench_symbol in ds), None)
     p = project(trades, cfg, capital=args.capital, runs=args.runs, benchmark=bench, benchmark_symbol=bench_symbol)
     print(format_projection(p, cfg.exchange.quote))
+
+
+def cmd_research(args, cfg):
+    from .learning import load_brain, load_context, load_datasets
+    from .research import breaker_study, format_breaker_study
+
+    selection, _ = load_brain(cfg)
+    if not selection or not selection.selected:
+        sys.exit("No validated strategies yet - run `tradebot learn` first.")
+    market = _market(cfg, args.synthetic)
+    u = cfg.universe
+    symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    cfg.timeframes = selection.timeframes()
+    store = _store(cfg, market)
+    datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None)
+    context = load_context(market, cfg, store, log_fn=print)
+    if context is None:
+        sys.exit("BTC history unavailable - cannot evaluate the breaker.")
+    print("Volatility circuit breaker: selected strategies with and without it "
+          f"(ratio = BTC's last {cfg.context.vol_short}h volatility / the {cfg.context.vol_long}h before)\n")
+    print(format_breaker_study(breaker_study(selection, datasets, cfg, context, tuple(args.ratios))))
+
+
+def cmd_portfolio_backtest(args, cfg):
+    from .learning import load_brain, load_context, load_datasets
+    from .portfolio import format_portfolio_backtest, portfolio_backtest
+    from .backtest.selection import run_combo
+
+    selection, _ = load_brain(cfg)
+    market = _market(cfg, args.synthetic)
+    store = _store(cfg, market)
+    now = market.now_ms()
+    core_closes = {}
+    for sym in cfg.core.symbols:
+        df = (store.update(market, sym, "1d", args.days, now) if store is not None
+              else market.history(sym, "1d", now - args.days * 86_400_000, now))
+        core_closes[sym] = df["close"]
+    trades = []
+    if selection and selection.selected:
+        u = cfg.universe
+        symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+        cfg.timeframes = selection.timeframes()
+        datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None)
+        context = load_context(market, cfg, store, log_fn=lambda *_: None)
+        for c in selection.selected:
+            is_t, oos_t, _ = run_combo(datasets.get(c.timeframe, {}), c.strategy, c.params, c.timeframe, cfg, context)
+            trades += is_t + oos_t
+    fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
+    res = portfolio_backtest(core_closes, trades, cfg, capital=args.capital, fraction=fraction,
+                             since=args.since or None)
+    print(format_portfolio_backtest(res, cfg.exchange.quote))
 
 
 def cmd_telegram_test(args, cfg):
@@ -276,6 +331,16 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("run", help="run the bot 24/7 (paper or live per config)")
     sp.add_argument("--force-live", action="store_true", help="go live even if the paper record is not ready")
     sub.add_parser("report", help="track record and go-live readiness")
+    sp = sub.add_parser("portfolio-backtest", help="core + satellite account vs holding BTC")
+    sp.add_argument("--capital", type=float, default=1000.0)
+    sp.add_argument("--core-fraction", type=float, default=None, help="default: core.fraction, or 0.65 if unset")
+    sp.add_argument("--days", type=int, default=3200, help="daily history for the core (default ~8.8 years)")
+    sp.add_argument("--since", default="2022-01-01", help="also report from this date (the test period)")
+    sp.add_argument("--synthetic", action="store_true")
+    sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
+    sp.add_argument("topic", choices=["breaker"], help="breaker: the BTC volatility circuit breaker")
+    sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])
+    sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("project", help="what could the account become? (Monte Carlo from out-of-sample trades)")
     sp.add_argument("--capital", type=float, default=1000.0)
     sp.add_argument("--runs", type=int, default=5000)
@@ -295,7 +360,9 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config, args.env) if args.command != "demo" else BotConfig()
     handler = {
         "init": cmd_init, "learn": cmd_learn, "backtest": cmd_backtest, "scan": cmd_scan,
-        "run": cmd_run, "report": cmd_report, "project": cmd_project, "telegram-test": cmd_telegram_test,
+        "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
+        "portfolio-backtest": cmd_portfolio_backtest,
+        "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]
     handler(args, cfg)

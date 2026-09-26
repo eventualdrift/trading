@@ -122,3 +122,10 @@ def test_build_candidates_on_prices(cfg):
     assert (cands["label"] == (cands["r_multiple"] > 0)).all()
     assert cands["signal_time"].is_monotonic_increasing
     assert (cands["exit_time"] > cands["signal_time"]).all()
+
+
+def test_training_survives_a_feature_with_no_values():
+    cands = _fake_candidates(3000, informative=True)
+    cands["btc_uptrend"] = np.nan  # e.g. BTC context unavailable
+    model, rep = train_model(cands, MLConfig())
+    assert model is not None and np.isfinite(model.predict_proba(cands.iloc[:5])).all()

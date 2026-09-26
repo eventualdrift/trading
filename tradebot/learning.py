@@ -55,6 +55,26 @@ def load_datasets(market, cfg: BotConfig, symbols: list[str], store=None, now_ms
     return out
 
 
+def load_context(market, cfg: BotConfig, store=None, now_ms: int | None = None, log_fn=print):
+    """BTC daily + hourly history for the market context (uptrend filter, vol breaker, ML)."""
+    from .context import context_symbol
+
+    now = now_ms or market.now_ms()
+    sym = context_symbol(cfg.exchange.quote)
+    frames = {}
+    for tf in ("1d", "1h"):
+        days = max(cfg.data.history_days.values(), default=365) + (cfg.context.uptrend_days if tf == "1d" else 30)
+        try:
+            frames[tf] = (store.update(market, sym, tf, days, now) if store is not None
+                          else market.history(sym, tf, now - days * 86_400_000, now))
+        except Exception as exc:
+            log_fn(f"  ! market context ({sym} {tf}) unavailable: {exc}")
+            frames[tf] = None
+    if frames["1d"] is None and frames["1h"] is None:
+        return None
+    return cfg.market_context(frames["1d"], frames["1h"])
+
+
 def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model: SignalModel | None = None,
                    now_ms: int | None = None, log_fn=print) -> LearningResult:
     u = cfg.universe
@@ -62,15 +82,17 @@ def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model
     log_fn(f"Universe: {len(symbols)} symbols: {', '.join(symbols)}")
     log_fn("Loading history...")
     datasets = load_datasets(market, cfg, symbols, store, now_ms, log_fn)
+    context = load_context(market, cfg, store, now_ms, log_fn)
 
     log_fn("Selecting strategies (in-sample vs out-of-sample backtests)...")
-    selection = run_selection(datasets, cfg, log=log_fn)
+    selection = run_selection(datasets, cfg, log=log_fn, context=context)
     selection.save(cfg.state_path / SELECTION_FILE)
 
     model, report = None, None
     if cfg.ml.enabled:
         log_fn("Training ML trade filter (walk-forward)...")
-        cands = build_candidates(datasets, cfg)
+        chosen = {(c.strategy, c.timeframe): c.params for c in selection.combos}
+        cands = build_candidates(datasets, cfg, context, params_for=chosen)
         if db is not None:
             own = db.trade_samples()
             if not own.empty:
@@ -84,7 +106,9 @@ def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model
             model.save(cfg.state_path / MODEL_FILE)
 
     sel = selection.selected
-    lines = [f"Strategies selected: {len(sel)} of {len(selection.combos)} tested"]
+    variants = len(selection.combos) * (2 if cfg.selection.btc_filter == "auto" else 1)
+    lines = [f"Strategies selected: {len(sel)} of {len(selection.combos)} combinations "
+             f"({variants} variants tested - the more tried, the more likely a winner is luck)"]
     for c in sel:
         o = c.out_of_sample
         lines.append(f"  • {c.key}: out-of-sample {o['trades']} trades, {o['expectancy_r']:+.2f}R/trade, "

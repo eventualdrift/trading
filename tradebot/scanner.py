@@ -12,6 +12,7 @@ from .backtest.selection import Selection
 from .config import BotConfig
 from .ml.features import candidate_features, market_features
 from .ml.model import SignalModel
+from .context import context_symbol
 from .models import Position, Signal
 from .strategies import Strategy, make_strategy
 from .timeframes import drop_unclosed, index_ms, tf_ms
@@ -32,6 +33,8 @@ class Scanner:
         self.market = market
         self.cfg = cfg
         self.model = model if cfg.ml.enabled else None
+        self._ctx_key = None
+        self._ctx = None
         self.combos: dict[str, list[Strategy]] = {}
         for c in (selection.selected if selection else []):
             self.combos.setdefault(c.timeframe, []).append(make_strategy(c.strategy, c.params))
@@ -52,6 +55,22 @@ class Scanner:
         frac = min(max((prob - thr) / max(1.0 - thr, 1e-9), 0.0), 1.0)
         return 1.0 + frac * (top - 1.0)
 
+    def context(self, now_ms: int):
+        """BTC market context as of now (refreshed hourly); None if unavailable."""
+        key = now_ms // 3_600_000
+        if key != self._ctx_key:
+            self._ctx_key = key
+            try:
+                c = self.cfg.context
+                sym = context_symbol(self.cfg.exchange.quote)
+                daily = drop_unclosed(self.market.fetch_ohlcv_df(sym, "1d", limit=c.uptrend_days + 60), "1d", now_ms)
+                hourly = drop_unclosed(self.market.fetch_ohlcv_df(sym, "1h", limit=c.vol_long + 60), "1h", now_ms)
+                self._ctx = self.cfg.market_context(daily, hourly)
+            except Exception as exc:
+                log.warning("BTC market context unavailable: %s", exc)
+                self._ctx = None
+        return self._ctx
+
     def _strategy_for(self, pos: Position) -> Strategy:
         for s in self.combos.get(pos.timeframe, []):
             if s.name == pos.strategy:
@@ -69,6 +88,7 @@ class Scanner:
         # EMAs need several multiples of their length to converge to the values the
         # backtest saw on full history; 1000 is the max most exchanges return at once.
         need = min(1000, 4 * max([s.warmup for s in strategies] + [250]))
+        ctx = self.context(now_ms)
         for symbol in dict.fromkeys([*symbols, *by_symbol]):
             try:
                 df = drop_unclosed(self.market.fetch_ohlcv_df(symbol, tf, limit=need), tf, now_ms)
@@ -78,15 +98,19 @@ class Scanner:
             if df.empty or int(index_ms(df.index)[-1]) != candle_open_ms:
                 res.errors.append(f"{symbol} {tf}: latest candle missing/stale")
                 continue
+            if is_frozen(df, self.cfg.guards.frozen_bars):
+                res.errors.append(f"{symbol} {tf}: price feed frozen (last {self.cfg.guards.frozen_bars} candles "
+                                  f"identical with no volume) - skipped")
+                continue
             for pos in by_symbol.get(symbol, []):
-                pop = self._strategy_for(pos).populate(df)
+                pop = self._strategy_for(pos).populate(df, ctx, tf)
                 if bool(pop[f"exit_{pos.side}"].iloc[-1]):
                     res.exits[pos.id] = "exit_signal"
             mkt = None
             for strat in strategies:
                 if len(df) < strat.warmup:
                     continue
-                pop = strat.populate(df)
+                pop = strat.populate(df, ctx, tf)
                 row = pop.iloc[-1]
                 for side in ("long", "short"):
                     if side == "short" and not self.cfg.allow_short:
@@ -99,7 +123,7 @@ class Scanner:
                     if rr < self.cfg.risk.min_reward_risk:
                         continue
                     if mkt is None:
-                        mkt = market_features(df)
+                        mkt = market_features(df, ctx, tf)
                     X = candidate_features(mkt.iloc[[-1]], np.array([side]), np.array([strat.name]),
                                            tf, np.array([close]), np.array([sl]), np.array([tp]))
                     prob = float(self.model.predict_proba(X)[0]) if self.model is not None else None
@@ -131,3 +155,12 @@ def _positive(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return v if v > 0 else None
+
+
+def is_frozen(df, n: int) -> bool:
+    """Bad-data guard: the last ``n`` candles are identical and traded nothing (dead feed)."""
+    if n <= 1 or len(df) < n:
+        return False
+    tail = df.iloc[-n:]
+    same = (tail[["open", "high", "low", "close"]].nunique() == 1).all()
+    return bool(same and float(tail["volume"].sum()) == 0.0)

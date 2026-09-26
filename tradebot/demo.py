@@ -16,7 +16,6 @@ import shutil
 import time
 from pathlib import Path
 
-from .backtest.engine import Costs
 from .bot import TradingBot
 from .config import BotConfig
 from .db import Database
@@ -56,11 +55,12 @@ def run_demo(days: int = 540, sim_days: int = 45, symbols: int = 6, seed: int = 
     res = learning_cycle(cfg, market, now_ms=learn_until, log_fn=out)
     out(f"\n{res.summary}\n  ({time.time() - t0:.0f}s)")
     if res.selection.selected:
-        from .learning import load_datasets
+        from .learning import load_context, load_datasets
         from .projection import format_projection, out_of_sample_trades, project
 
         datasets = load_datasets(market, cfg, market.symbols, None, learn_until, log_fn=lambda *_: None)
-        trades = out_of_sample_trades(res.selection, datasets, cfg)
+        context = load_context(market, cfg, None, learn_until, log_fn=lambda *_: None)
+        trades = out_of_sample_trades(res.selection, datasets, cfg, context)
         if trades:
             proj = project(trades, cfg, capital=1000.0, benchmark=datasets["1h"].get("BTC/USDT"),
                            benchmark_symbol="BTC/USDT")
@@ -71,7 +71,7 @@ def run_demo(days: int = 540, sim_days: int = 45, symbols: int = 6, seed: int = 
 
     out(f"\n[2/3] Paper trading the next {sim_days} days candle-by-candle with the live bot loop...\n")
     db = Database(state / "tradebot.db")
-    broker = PaperBroker(db, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), 1000.0, market)
+    broker = PaperBroker(db, cfg.costs_model(), 1000.0, market)
     notifier = MemoryNotifier()
     bot = TradingBot(cfg, market, broker, db, notifier, selection=res.selection, model=res.model)
     logging.getLogger("tradebot").setLevel(logging.WARNING)  # keep the demo output readable

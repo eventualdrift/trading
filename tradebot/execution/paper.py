@@ -45,6 +45,19 @@ class PaperBroker(Broker):
         pos.status = "open"
         return pos
 
+    def transfer(self, delta: float) -> None:
+        """Move cash in (+) or out (-) of the satellite sleeve (core/satellite rebalancing)."""
+        self._add_cash(delta)
+
+    def fill_limit(self, pos: Position, now_ms: int) -> Position:
+        """A resting limit entry got filled at its price: maker fee, no slippage."""
+        fee = pos.entry_price * pos.amount * self.costs.entry_fee
+        self._add_cash(-fee)
+        pos.fees = fee
+        pos.opened_at = now_ms
+        pos.status = "open"
+        return pos
+
     def close_position(self, pos: Position, price: float, reason: str, now_ms: int) -> Position:
         fill = price * (1 - pos.sign * self.costs.slippage_rate)
         fee = fill * pos.amount * self.costs.fee_rate

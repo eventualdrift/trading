@@ -35,6 +35,13 @@ class Database:
             self._ensure_table("positions", Position)
             self._conn.execute("CREATE TABLE IF NOT EXISTS equity (ts INTEGER, mode TEXT, equity REAL)")
             self._conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS core_trades (ts INTEGER, mode TEXT, symbol TEXT, side TEXT, qty REAL, "
+                "price REAL, fee REAL, weight_from REAL, weight_to REAL, reason TEXT)")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS snapshots (ts INTEGER, mode TEXT, total REAL, core REAL, "
+                "satellite REAL, btc_price REAL)")
+            self._conn.execute("CREATE TABLE IF NOT EXISTS events (ts INTEGER, mode TEXT, text TEXT)")
 
     # ------------------------------------------------------------- plumbing
     def _ensure_table(self, table: str, cls) -> None:
@@ -166,6 +173,42 @@ class Database:
         if not rows:
             return pd.Series(dtype=float)
         return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows], unit="ms", utc=True))
+
+    # ------------------------------------------------------ core, snapshots, events
+    def insert_core_trade(self, ts: int, mode: str, t, reason: str) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO core_trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               (ts, mode, t.symbol, t.side, t.qty, t.price, t.fee, t.weight_from, t.weight_to, reason))
+
+    def core_trades(self, mode: str, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM core_trades WHERE mode=? ORDER BY ts DESC LIMIT ?",
+                                      (mode, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_snapshot(self, ts: int, mode: str, total: float, core: float, satellite: float,
+                        btc_price: float | None) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO snapshots VALUES (?,?,?,?,?,?)", (ts, mode, total, core, satellite, btc_price))
+
+    def snapshots(self, mode: str) -> pd.DataFrame:
+        with self._lock:
+            rows = self._conn.execute("SELECT ts, total, core, satellite, btc_price FROM snapshots WHERE mode=? "
+                                      "ORDER BY ts", (mode,)).fetchall()
+        df = pd.DataFrame([dict(r) for r in rows], columns=["ts", "total", "core", "satellite", "btc_price"])
+        if len(df):
+            df.index = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
+        return df
+
+    def log_event(self, ts: int, mode: str, text: str) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO events VALUES (?,?,?)", (ts, mode, text))
+
+    def events(self, mode: str, limit: int = 30) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT ts, text FROM events WHERE mode=? ORDER BY ts DESC LIMIT ?",
+                                      (mode, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------- kv
     def kv_get(self, key: str, default: Any = None) -> Any:

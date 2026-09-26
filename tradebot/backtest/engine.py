@@ -2,7 +2,9 @@
 
 Execution model (kept deliberately conservative):
   * a signal is generated on the close of bar i; the order fills at the open of
-    bar i+1 plus slippage;
+    bar i+1 plus slippage - or, with limit entries, a buy limit rests at bar i's close
+    for one bar and fills (at that price, maker fee, no slippage) only if bar i+1
+    trades THROUGH it; otherwise the trade is missed;
   * if bar i+1 already gaps past the stop or target, the trade is skipped;
   * if the stop and target are both inside the same bar, the STOP wins;
   * a stop that gaps is filled at the (worse) open price;
@@ -29,8 +31,16 @@ from ..strategies.base import Strategy
 
 @dataclass(frozen=True)
 class Costs:
-    fee_rate: float = 0.001
+    fee_rate: float = 0.001  # taker: market orders, stops, take-profit sells
     slippage_rate: float = 0.0005
+    maker_fee_rate: float | None = None  # resting limit orders (None = same as taker)
+    limit_entry: bool = False  # enter with a limit order at the signal close instead of at market
+
+    @property
+    def entry_fee(self) -> float:
+        if self.limit_entry and self.maker_fee_rate is not None:
+            return self.maker_fee_rate
+        return self.fee_rate
 
 
 @dataclass
@@ -72,10 +82,11 @@ class Trade:
         return d
 
 
-def net_return(side: str, entry: float, exit_: float, fee: float) -> float:
+def net_return(side: str, entry: float, exit_: float, fee: float, entry_fee: float | None = None) -> float:
+    fin = fee if entry_fee is None else entry_fee
     if side == "long":
-        return (exit_ * (1 - fee) - entry * (1 + fee)) / entry
-    return (entry * (1 - fee) - exit_ * (1 + fee)) / entry
+        return (exit_ * (1 - fee) - entry * (1 + fin)) / entry
+    return (entry * (1 - fee) - exit_ * (1 + fin)) / entry
 
 
 def simulate_trade(
@@ -101,12 +112,18 @@ def simulate_trade(
     sign = 1.0 if long else -1.0
     slip, fee = costs.slippage_rate, costs.fee_rate
 
-    raw = o[e]
-    if long and not (sl < raw < tp):
-        return None
-    if not long and not (tp < raw < sl):
-        return None
-    entry = raw * (1 + sign * slip)
+    if costs.limit_entry:
+        limit = c[signal_idx]
+        if not ((l[e] < limit) if long else (h[e] > limit)):
+            return None  # the price never traded through the limit: no fill
+        entry = limit
+    else:
+        raw = o[e]
+        if long and not (sl < raw < tp):
+            return None
+        if not long and not (tp < raw < sl):
+            return None
+        entry = raw * (1 + sign * slip)
     risk = abs(entry - sl)
     if risk <= 0 or (long and entry <= sl) or (not long and entry >= sl):
         return None
@@ -167,7 +184,7 @@ def simulate_trade(
             reason, complete = "end_of_data", False
             exit_price = c[last]
 
-    ret = net_return(side, entry, exit_price, fee)
+    ret = net_return(side, entry, exit_price, fee, costs.entry_fee)
     return TradeOutcome(
         entry_idx=e,
         exit_idx=exit_idx,
@@ -261,9 +278,9 @@ def backtest_populated(
 
 
 def backtest(
-    df: pd.DataFrame, strategy: Strategy, costs: Costs, **kwargs
+    df: pd.DataFrame, strategy: Strategy, costs: Costs, context=None, **kwargs
 ) -> tuple[list[Trade], pd.DataFrame]:
-    pop = strategy.populate(df)
+    pop = strategy.populate(df, context, kwargs.get("timeframe") or None)
     return backtest_populated(pop, strategy, costs, **kwargs), pop
 
 

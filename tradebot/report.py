@@ -38,3 +38,27 @@ def format_readiness(checks: list[Check]) -> str:
     verdict = "READY for live trading (start small!)" if all(c.passed for c in checks) \
         else "NOT ready for live trading - keep paper trading"
     return "\n".join(lines + ["", f"  => {verdict}"])
+
+
+def sleeve_summary(db: Database, cfg: BotConfig, mode: str = "paper") -> str | None:
+    """P&L by sleeve from the latest equity snapshot (None before the bot has recorded one)."""
+    snaps = db.snapshots(mode)
+    if snaps.empty:
+        return None
+    last = snaps.iloc[-1]
+    start = float(db.kv_get("paper_starting_balance", cfg.paper.starting_balance) if mode == "paper"
+                  else snaps["total"].iloc[0])
+    core_in = float(db.kv_get(f"{mode}:core:contributed", 0.0) or 0.0)
+    q = cfg.exchange.quote
+    lines = [f"Sleeves ({mode}, as of {last.name:%Y-%m-%d %H:%M} UTC):",
+             f"  Total      {last['total']:>12,.2f} {q}   P&L {last['total'] - start:+,.2f} "
+             f"({(last['total'] / start - 1) * 100:+.1f}%)"]
+    if core_in or last["core"]:
+        sat_in = start - core_in
+        lines.append(f"  Core       {last['core']:>12,.2f} {q}   P&L {last['core'] - core_in:+,.2f}")
+        lines.append(f"  Satellite  {last['satellite']:>12,.2f} {q}   P&L {last['satellite'] - sat_in:+,.2f}")
+    first_btc = snaps["btc_price"].dropna()
+    if len(first_btc) > 1:
+        btc = (first_btc.iloc[-1] / first_btc.iloc[0] - 1) * 100
+        lines.append(f"  Holding BTC over the same period: {btc:+.1f}%")
+    return "\n".join(lines)
