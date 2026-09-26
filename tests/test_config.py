@@ -13,7 +13,7 @@ def test_example_config_loads(monkeypatch):
     assert cfg.mode == "paper"
     assert cfg.exchange.id == "binance"
     assert cfg.risk.risk_per_trade_pct == 1.0
-    assert set(cfg.strategies) == {"trend", "breakout", "meanrev"}
+    assert set(cfg.strategies) == {"trend", "breakout", "meanrev", "momentum"}
     assert cfg.ml.min_probability is None
 
 
