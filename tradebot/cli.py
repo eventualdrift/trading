@@ -282,6 +282,27 @@ def cmd_portfolio_backtest(args, cfg):
     print(format_portfolio_backtest(res, cfg.exchange.quote))
 
 
+def cmd_dashboard(args, cfg):
+    from .dashboard import serve_dashboard, write_dashboard
+    from .db import Database
+
+    db = Database(cfg.state_path / "tradebot.db")
+    if not args.serve:
+        path = write_dashboard(db, cfg, args.out)
+        print(f"dashboard written to {path.resolve()} - open it in a browser")
+        return
+    port = args.port or cfg.dashboard.port
+    try:
+        server = serve_dashboard(db, cfg, port)
+    except OSError as exc:
+        sys.exit(f"cannot use port {port}: {exc} (another instance? pass --port or set dashboard.port)")
+    print(f"dashboard at http://127.0.0.1:{port} (this computer only). Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("stopped")
+
+
 def cmd_telegram_test(args, cfg):
     import requests
 
@@ -345,6 +366,10 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--capital", type=float, default=1000.0)
     sp.add_argument("--runs", type=int, default=5000)
     sp.add_argument("--synthetic", action="store_true")
+    sp = sub.add_parser("dashboard", help="equity vs holding BTC, open trades, signals, alerts (HTML)")
+    sp.add_argument("--serve", action="store_true", help="serve a live page on 127.0.0.1 instead of writing a file")
+    sp.add_argument("--port", type=int, default=None, help="default: dashboard.port (8765)")
+    sp.add_argument("--out", default=None, help="file to write (default: <state_dir>/dashboard.html)")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -361,7 +386,7 @@ def main(argv: list[str] | None = None) -> None:
     handler = {
         "init": cmd_init, "learn": cmd_learn, "backtest": cmd_backtest, "scan": cmd_scan,
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
-        "portfolio-backtest": cmd_portfolio_backtest,
+        "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

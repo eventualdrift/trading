@@ -132,6 +132,15 @@ class LiveConfig:
 class TelegramConfig:
     enabled: bool = True
     daily_summary_hour_utc: int = 0
+    commands: bool = True  # answer /commands; only ONE instance per Telegram bot token may poll
+
+
+@dataclass
+class DashboardConfig:
+    enabled: bool = True  # write <state_dir>/dashboard.html every few minutes
+    every_minutes: float = 5
+    serve: bool = False  # also serve it at http://127.0.0.1:<port> while `tradebot run` runs
+    port: int = 8765  # give each side-by-side instance its own port
 
 
 @dataclass
@@ -155,6 +164,7 @@ class Secrets:
 
 @dataclass
 class BotConfig:
+    name: str = ""  # instance label for messages and the dashboard (side-by-side paper configs)
     mode: str = "paper"  # paper | live
     timeframes: list[str] = field(default_factory=lambda: ["15m", "1h", "4h", "1d"])
     strategies: dict[str, dict] = field(
@@ -178,6 +188,7 @@ class BotConfig:
     paper: PaperConfig = field(default_factory=PaperConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     secrets: Secrets = field(default_factory=Secrets, repr=False)
 
     @property
@@ -245,6 +256,10 @@ class BotConfig:
             errors.append("selection.btc_filter must be 'off' or 'auto'")
         if self.guards.vol_breaker_ratio <= 1.0:
             errors.append("guards.vol_breaker_ratio must be > 1")
+        if not 1 <= int(self.dashboard.port) <= 65535:
+            errors.append("dashboard.port must be in 1..65535")
+        if self.dashboard.every_minutes <= 0:
+            errors.append("dashboard.every_minutes must be > 0")
         if not 0.3 <= self.selection.in_sample_fraction <= 0.9:
             errors.append("selection.in_sample_fraction must be in [0.3, 0.9]")
         if errors:

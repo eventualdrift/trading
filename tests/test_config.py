@@ -15,6 +15,7 @@ def test_example_config_loads(monkeypatch):
     assert cfg.risk.risk_per_trade_pct == 1.0
     assert set(cfg.strategies) == {"trend", "breakout", "meanrev", "momentum"}
     assert cfg.ml.min_probability is None
+    assert cfg.selection.btc_filter == "auto" and cfg.core.fraction == 0 and cfg.dashboard.port == 8765
 
 
 def test_unknown_key_rejected(tmp_path):

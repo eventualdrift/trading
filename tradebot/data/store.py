@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -29,9 +31,16 @@ class OHLCVStore:
         return df.astype(float)
 
     def save(self, symbol: str, tf: str, df: pd.DataFrame) -> None:
+        """Write via a temp file + rename, so side-by-side instances sharing ``data.dir``
+        never read a half-written file."""
         p = self.path(symbol, tf)
         p.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(p, compression="gzip")
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            df.to_csv(tmp, compression="gzip")
+            os.replace(tmp, p)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def update(self, client, symbol: str, tf: str, days: int, now_ms: int | None = None) -> pd.DataFrame:
         """Bring the cached history up to date and return the last ``days`` of it."""

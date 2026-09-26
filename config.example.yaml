@@ -4,6 +4,7 @@
 # paper = simulated trades on real market data (signals are still sent to you)
 # live  = real orders on your exchange account. Only after a good paper record!
 mode: paper
+name: ""                 # label for side-by-side instances, e.g. "A" -> messages start with [A]
 
 exchange:
   id: binance            # any ccxt exchange id: binance, bybit, okx, kraken, kucoin, luno, ...
@@ -37,8 +38,11 @@ data:
   history_days: {15m: 180, 1h: 540, 4h: 1095, 1d: 1825}
 
 costs:                   # used by backtests and paper trading - be pessimistic
-  fee_rate: 0.001        # 0.1% per side
+  fee_rate: 0.001        # taker fee per side: 0.1% (0.00075 with Binance's BNB fee discount)
   slippage_rate: 0.0005  # 0.05% on market orders and stops
+  maker_fee_rate: null   # fee on resting limit orders (null = same as fee_rate)
+  entry_order: market    # market | limit. limit = buy at the signal price, filled only if the next
+                         # candle trades through it (paper/backtest only in this version)
 
 risk:
   risk_per_trade_pct: 1.0      # lose at most 1% of the account per trade
@@ -54,6 +58,8 @@ risk:
   max_chase_r: 0.3             # skip if price already ran 0.3R past the signal
 
 selection:                     # how strict strategy validation is
+  btc_filter: auto             # off | auto: also test each strategy trading only while BTC is above
+                               # its 200-day average; keep that where it improves BOTH periods
   in_sample_fraction: 0.7
   min_trades_in_sample: 30
   min_trades_out_of_sample: 15
@@ -66,11 +72,36 @@ ml:                            # self-learning trade filter
   min_candidates: 400
   min_test_trades: 30
   min_improvement_r: 0.02
+  min_edge_t: 2.5              # taken trades must beat rejected ones significantly (not luck)
   min_probability: null        # null = use the threshold learned from data
 
 learning:
   retrain_every_hours: 168     # re-select strategies and retrain the model weekly
   learn_on_start: true
+
+# Core + satellite (paper only for now). The core holds BTC and ETH by trend: each coin's
+# weight is the share of its 50/100/150/200-day averages the daily close is above (0-100%
+# in 25% steps). The satellite (the rest) runs the signal strategies above, sized from its
+# own equity. Check the split first: `tradebot portfolio-backtest`.
+core:
+  fraction: 0                  # share of the account in the core, e.g. 0.65 (0 = off)
+  symbols: [BTC/USDT, ETH/USDT]
+  sma_days: [50, 100, 150, 200]
+  min_trade_usd: 10
+  drift_tolerance: 0.2         # also rebalance when a coin is off target by 20% of its slot
+  rebalance_sleeves_days: 30   # reset the core/satellite split every 30 days (0 = never)
+
+context:                       # BTC market context used by the filter and the breaker
+  uptrend_days: 200
+  vol_short: 20                # volatility ratio = BTC's last 20h volatility / the 100h before
+  vol_long: 100
+
+guards:                        # bad-data protection and an optional circuit breaker
+  frozen_bars: 6               # skip a coin whose feed has stopped moving
+  extreme_move_pct: 10         # a price >10% from the last minute must be seen twice before acting
+  max_price_age_seconds: 300   # ignore stale prices
+  vol_breaker: false           # pause new entries during BTC volatility bursts - enable only if
+  vol_breaker_ratio: 2.5       # `tradebot research breaker` shows it helps on real data
 
 paper:
   starting_balance: 1000
@@ -83,6 +114,14 @@ live:                          # live trading: Binance spot only (any exchange w
 telegram:
   enabled: true
   daily_summary_hour_utc: 0
+  commands: true               # answer /commands. With two instances on ONE Telegram bot, set
+                               # this to false on the second (only one may poll for commands)
+
+dashboard:                     # equity vs holding BTC, open trades, signals, alerts
+  enabled: true                # writes <state_dir>/dashboard.html every few minutes
+  every_minutes: 5
+  serve: false                 # true = also serve it at http://127.0.0.1:<port> (this computer only)
+  port: 8765                   # use a different port for each side-by-side instance
 
 poll_seconds: 30
 candle_close_delay_seconds: 15

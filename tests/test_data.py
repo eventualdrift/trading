@@ -45,3 +45,14 @@ def test_spot_client_only_loads_spot_markets():
 def test_universe_filters():
     assert "USDC" in STABLECOINS
     assert LEVERAGED.search("BTCUP") and LEVERAGED.search("ETH3L") and not LEVERAGED.search("SOL")
+
+
+def test_store_save_is_atomic_and_leaves_no_temp_files(tmp_path):
+    m = SyntheticMarket(["AAA/USDT"], days=5, base_tf="1h", seed=3)
+    store = OHLCVStore(tmp_path, m.id)
+    df = m.fetch_ohlcv_df("AAA/USDT", "1h", limit=50)
+    store.save("AAA/USDT", "1h", df)
+    store.save("AAA/USDT", "1h", df)  # overwrite in place
+    folder = store.path("AAA/USDT", "1h").parent
+    assert [f.name for f in folder.iterdir()] == ["AAA_USDT.csv.gz"]
+    assert len(store.load("AAA/USDT", "1h")) == len(df)

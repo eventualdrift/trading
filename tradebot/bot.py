@@ -13,6 +13,7 @@ from .config import BotConfig
 from .db import Database
 from .backtest.engine import Costs
 from .core import CoreSleeve
+from .dashboard import serve_dashboard, strip_html, write_dashboard
 from .execution.base import Broker, NotFilled, finalize_close
 from .ml.model import SignalModel
 from .models import Position, Signal
@@ -68,6 +69,8 @@ class TradingBot:
         self._learn_thread: threading.Thread | None = None
         self._last_error_notice: dict[str, float] = {}
         self._last_equity_record = 0
+        self._last_dashboard = 0
+        self._dashboard_server = None
         self._last_orphan_sweep = 0
         self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
         self._pending_extreme: dict[str, int] = {}
@@ -114,7 +117,20 @@ class TradingBot:
                 log.warning("universe refresh failed: %s", exc)
         return self._symbols
 
-    def notify(self, text: str) -> None:
+    def _now_ms(self) -> int:
+        try:
+            return int(self.market.now_ms())
+        except Exception:
+            return int(time.time() * 1000)
+
+    def notify(self, text: str, event: bool = True) -> None:
+        if self.cfg.name:
+            text = f"[{fmt.esc(self.cfg.name)}] {text}"
+        try:
+            if event:  # the dashboard's alert list
+                self.db.log_event(self._now_ms(), self.mode, strip_html(text)[:2000])
+        except Exception as exc:
+            log.warning("event log failed: %s", exc)
         try:
             self.notifier.send(text)
         except Exception as exc:
@@ -277,8 +293,15 @@ class TradingBot:
             f"ML filter: {'active' if self.ml_active else 'not active'}\nSend /help for commands."
         )
         listener = getattr(self.notifier, "start_listener", None)
-        if callable(listener):
+        if callable(listener) and self.cfg.telegram.commands:
             listener(self.handle_command)
+        d = self.cfg.dashboard
+        if d.serve:
+            try:
+                self._dashboard_server = serve_dashboard(self.db, self.cfg, d.port, background=True)
+                log.info("dashboard at http://127.0.0.1:%s", d.port)
+            except OSError as exc:
+                self._notify_error(f"dashboard could not use port {d.port}: {exc}", key="dashboard")
         try:
             self.check_unresolved()
         except Exception as exc:
@@ -293,12 +316,15 @@ class TradingBot:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._dashboard_server is not None:
+            self._dashboard_server.shutdown()
 
     def tick(self, now_ms: int) -> None:
         with self._lock:
             self.manage_positions(now_ms)
-            equity, _ = self.equity()
+            equity, prices = self.equity()
             self._update_breakers(now_ms, equity)
+            self._maybe_write_dashboard(now_ms, prices)
             delay = int(self.cfg.candle_close_delay_seconds * 1000)
             for tf in self.active_timeframes():
                 candle = last_closed_open_ms(now_ms - delay, tf)
@@ -728,6 +754,17 @@ class TradingBot:
         return pos
 
     # ------------------------------------------------------------- periodic
+    def _maybe_write_dashboard(self, now_ms: int, prices: dict[str, float]) -> None:
+        d = self.cfg.dashboard
+        if not d.enabled or now_ms - self._last_dashboard < d.every_minutes * 60_000:
+            return
+        self._last_dashboard = now_ms
+        try:
+            self._set("last_prices", prices)  # lets `tradebot dashboard` show open P&L without the exchange
+            write_dashboard(self.db, self.cfg, prices=prices, now_ms=now_ms)
+        except Exception as exc:
+            log.warning("dashboard update failed: %s", exc)
+
     def _maybe_daily_summary(self, now_ms: int, equity: float) -> None:
         ts = pd.Timestamp(now_ms, unit="ms", tz="UTC")
         day = ts.date().isoformat()
@@ -736,9 +773,16 @@ class TradingBot:
         self._set("last_summary", day)
         closed = self.db.closed_positions(self.mode, now_ms - 86_400_000)
         open_n = len(self.db.open_positions(self.mode))
+        q = self.cfg.exchange.quote
+        line = f"Equity: {equity:,.2f} {q}"
+        if self.core is not None and self.core.initialized:
+            s = self.sleeves(now_ms)
+            line = (f"Total equity: {s['total']:,.2f} {q} (core {s['core']:,.2f} · "
+                    f"satellite {s['satellite']:,.2f})")
         self.notify(
-            f"📊 <b>Daily summary</b> ({self.mode})\nEquity: {equity:,.2f} {self.cfg.exchange.quote} · "
-            f"open positions: {open_n}\n" + fmt.format_performance(closed, self.cfg.exchange.quote, "Last 24h")
+            f"📊 <b>Daily summary</b> ({self.mode})\n{line} · open positions: {open_n}\n"
+            + fmt.format_performance(closed, q, "Last 24h"),
+            event=False,  # routine, and the dashboard shows the same numbers
         )
 
     def _maybe_learn(self, now_ms: int, force: bool = False) -> bool:

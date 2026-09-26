@@ -111,8 +111,8 @@ class Position:
     breakeven_moved: bool = False
     last_checked_ms: int = 0
     trail_distance: float | None = None
-    trail_notified: float = 0.0
-    limit_until: int = 0  # paper limit entries: status "working" until filled or this time (ms)  # last trailing-stop level announced to the user
+    trail_notified: float = 0.0  # last trailing-stop level announced to the user
+    limit_until: int = 0  # paper limit entries: status "working" until filled or this time (ms)
     exit_filled: float = 0.0  # amount already sold (partial exits)
     exit_value: float = 0.0  # quote proceeds of those sales
     closing_reason: str | None = None  # a close was started but not completed; retried

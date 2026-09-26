@@ -10,9 +10,13 @@ dist/
 # Secrets and runtime state - never commit these.
 # Leading "/" anchors to the repo root, so the tradebot/data/ source package is NOT ignored.
 .env
+.env-*
 /config.yaml
+/config-*.yaml
 /data/
 /state/
+/state-*/
+*.tmp
 *.db
 *.sqlite
 *.log
