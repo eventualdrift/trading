@@ -64,6 +64,12 @@ class ExchangeClient:
         if password:
             params["password"] = password
         self.ex = getattr(ccxt, exchange_id)(params)
+        if market_type == "spot":  # don't load futures/options markets (other hosts, slower start-up)
+            fm = self.ex.options.get("fetchMarkets")
+            if isinstance(fm, dict) and "types" in fm:
+                self.ex.options["fetchMarkets"] = {**fm, "types": ["spot"]}
+            elif isinstance(fm, list):
+                self.ex.options["fetchMarkets"] = ["spot"]
         if sandbox:
             self.ex.set_sandbox_mode(True)
         self.id = exchange_id

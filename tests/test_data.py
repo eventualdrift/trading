@@ -35,6 +35,13 @@ def test_drop_unclosed():
     assert len(drop_unclosed(df, "1h", 2 * tf_ms("1h"))) == 2
 
 
+def test_spot_client_only_loads_spot_markets():
+    from tradebot.data import ExchangeClient
+
+    ex = ExchangeClient("binance", market_type="spot").ex  # no network needed to construct
+    assert ex.options["fetchMarkets"]["types"] == ["spot"]  # so only api.binance.com is contacted
+
+
 def test_universe_filters():
     assert "USDC" in STABLECOINS
     assert LEVERAGED.search("BTCUP") and LEVERAGED.search("ETH3L") and not LEVERAGED.search("SOL")
