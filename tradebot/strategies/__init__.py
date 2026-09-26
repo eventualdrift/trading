@@ -1,10 +1,11 @@
 from .base import SIGNAL_COLUMNS, Strategy
 from .breakout import DonchianBreakout
 from .meanrev import MeanReversion
+from .momentum import MomentumTrend
 from .trend import TrendPullback
 
 STRATEGIES: dict[str, type[Strategy]] = {
-    cls.name: cls for cls in (TrendPullback, DonchianBreakout, MeanReversion)
+    cls.name: cls for cls in (TrendPullback, DonchianBreakout, MeanReversion, MomentumTrend)
 }
 
 

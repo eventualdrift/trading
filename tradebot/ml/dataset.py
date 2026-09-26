@@ -42,6 +42,7 @@ def candidates_for(
         flags = pop[enter].to_numpy()
         exits = pop[exit_col].to_numpy()
         sls, tps = pop[sl_col].to_numpy(dtype=float), pop[tp_col].to_numpy(dtype=float)
+        trails = pop["trail_dist"].to_numpy(dtype=float)
         for i in np.flatnonzero(flags):
             if i < strategy.warmup:
                 continue
@@ -49,7 +50,7 @@ def candidates_for(
                 continue
             out = simulate_trade(
                 o, h, l, c, exits, i, side, sls[i], tps[i], strategy.max_hold_bars,
-                costs, cfg.risk.breakeven_at_r,
+                costs, cfg.risk.breakeven_at_r, trails[i],
             )
             if out is None or not out.complete:
                 continue

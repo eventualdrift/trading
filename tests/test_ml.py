@@ -55,6 +55,23 @@ def test_model_promoted_when_it_has_edge(tmp_path):
     assert np.allclose(loaded.predict_proba(cands.iloc[:10]), model.predict_proba(cands.iloc[:10]))
 
 
+def test_confidence_scaling_only_when_confidence_pays():
+    from tradebot.config import BotConfig
+    from tradebot.scanner import Scanner
+
+    model, rep = train_model(_fake_candidates(4000, informative=True), MLConfig())
+    assert rep.confidence_edge_r is not None
+    cfg = BotConfig()
+    scanner = Scanner(None, cfg, None, model)
+    thr = scanner.threshold
+    model.report.confidence_scaling = True
+    assert scanner.risk_multiplier(thr) == pytest.approx(1.0)
+    assert scanner.risk_multiplier(1.0) == pytest.approx(cfg.risk.max_risk_multiplier)
+    assert 1.0 < scanner.risk_multiplier((thr + 1) / 2) < cfg.risk.max_risk_multiplier
+    model.report.confidence_scaling = False  # not proven on unseen data -> no bigger bets
+    assert scanner.risk_multiplier(1.0) == 1.0
+
+
 def test_model_rejected_on_noise():
     model, rep = train_model(_fake_candidates(3000, informative=False, seed=3), MLConfig())
     assert model is None and not rep.promoted

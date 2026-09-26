@@ -10,7 +10,7 @@ def test_selection_runs_and_roundtrips(cfg, tmp_path):
     cfg.selection.min_trades_out_of_sample = 2
     datasets = {"1h": {f"S{i}/USDT": generate_ohlcv(4000, "1h", seed=i) for i in range(3)}}
     sel = run_selection(datasets, cfg, log=lambda *_: None)
-    assert len(sel.combos) == 3
+    assert len(sel.combos) == len(cfg.strategies) == 4
     for c in sel.combos:
         assert c.selected == (not c.reasons)
         assert c.in_sample["trades"] + c.out_of_sample["trades"] > 0

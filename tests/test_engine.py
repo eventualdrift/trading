@@ -11,11 +11,11 @@ from .conftest import bars
 COSTS = Costs(fee_rate=0.001, slippage_rate=0.0005)
 
 
-def run(rows, side="long", sl=95.0, tp=110.0, max_hold=10, exits=None, be=0.0):
+def run(rows, side="long", sl=95.0, tp=110.0, max_hold=10, exits=None, be=0.0, trail=0.0):
     df = bars(rows)
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     ex = None if exits is None else np.asarray(exits, dtype=bool)
-    return simulate_trade(o, h, l, c, ex, 0, side, sl, tp, max_hold, COSTS, be)
+    return simulate_trade(o, h, l, c, ex, 0, side, sl, tp, max_hold, COSTS, be, trail)
 
 
 BASE = [(100, 101, 99, 100), (100, 102, 99, 101)]
@@ -149,3 +149,18 @@ def test_max_drawdown():
     import pandas as pd
     assert max_drawdown_pct(pd.Series([100, 120, 90, 130])) == pytest.approx(25.0)
     assert max_drawdown_pct(pd.Series([100.0, 110.0])) == 0.0
+
+
+def test_trailing_stop_locks_in_gains():
+    # entry 100.05, stop 95 (risk 5.05): +1R at 105.1 activates, then the stop trails 3 below the high
+    rows = BASE + [(101, 106, 100.5, 105), (105, 110, 104, 109), (109, 109, 106, 106.5)]
+    out = run(rows, tp=150, be=1.0, trail=3.0)
+    assert out.reason == "trailing_stop" and out.exit_idx == 4
+    assert out.exit_price == pytest.approx(107 * (1 - 0.0005))  # 110 high - 3
+    assert out.r_multiple > 1.0
+
+
+def test_trailing_close_check_on_the_moving_bar():
+    rows = BASE + [(101, 110, 100.5, 106)]  # trail -> 107, but the bar closes at 106
+    out = run(rows, tp=150, be=1.0, trail=3.0)
+    assert out.reason == "trailing_stop" and out.exit_price == pytest.approx(106 * (1 - 0.0005))

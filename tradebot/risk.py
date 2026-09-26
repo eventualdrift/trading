@@ -37,12 +37,14 @@ class RiskManager:
         available_cash: float | None = None,
         limits: dict | None = None,
         to_precision: Callable[[float], float] | None = None,
+        risk_multiplier: float = 1.0,
     ) -> SizeDecision:
         c = self.cfg
         per_unit = abs(entry - stop)
         if equity <= 0 or entry <= 0 or per_unit <= 0:
             return SizeDecision(0, 0, 0, "invalid equity/entry/stop")
-        risk_budget = equity * c.risk_per_trade_pct / 100.0
+        mult = min(max(risk_multiplier, 1.0), c.max_risk_multiplier)
+        risk_budget = equity * c.risk_per_trade_pct * mult / 100.0
         notional = risk_budget / per_unit * entry
         caps = {
             "max position size": equity * c.max_position_pct / 100.0,

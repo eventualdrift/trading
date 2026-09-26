@@ -13,7 +13,7 @@ exchange:
   data_exchange_id: null # optionally read market data from a different exchange
 
 universe:                # which markets the scanner watches
-  top_n: 20              # the N most liquid pairs by 24h volume
+  top_n: 30              # the N most liquid pairs by 24h volume (more coins = more opportunities)
   min_quote_volume: 5000000
   whitelist: []          # e.g. [BTC/USDT, ETH/USDT, SOL/USDT] to scan only these
   blacklist: []
@@ -28,6 +28,7 @@ strategies:
   trend: {}              # buy pullbacks in an established trend
   breakout: {}           # buy breakouts of the recent range on high volume
   meanrev: {}            # buy oversold dips in ranging markets
+  momentum: {}           # trend following: buy 55-bar highs, no fixed target, trailing stop
 
 allow_short: false       # short signals (paper/signals only; live spot cannot short)
 
@@ -48,6 +49,8 @@ risk:
   max_drawdown_pct: 15         # halt (until /resume) after -15% from the peak
   min_reward_risk: 1.5         # only take trades that aim for >= 1.5x the risk
   breakeven_at_r: 1.0          # move the stop to entry once the trade is +1R (0 = off)
+  max_risk_multiplier: 1.5     # risk up to 1.5x on the strongest setups - only if the ML proved
+                               # its confident picks really do better (1 = always the same size)
   max_chase_r: 0.3             # skip if price already ran 0.3R past the signal
 
 selection:                     # how strict strategy validation is

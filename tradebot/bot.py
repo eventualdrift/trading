@@ -252,6 +252,7 @@ class TradingBot:
                 available_cash=self.broker.available_cash(),
                 limits=self.broker.limits(sig.symbol),
                 to_precision=self.broker.to_precision(sig.symbol),
+                risk_multiplier=sig.risk_multiplier,
             )
             if not size.ok:
                 block = size.reason
@@ -432,7 +433,7 @@ class TradingBot:
         """
         bar_ms = self.market.price_bar_ms
         long = pos.side == "long"
-        be_r = self.cfg.risk.breakeven_at_r
+        be_r = self.cfg.risk.breakeven_at_r or (1.0 if pos.trail_distance else 0.0)
         reason, price = None, None
         # Replay every completed bar since the last check, in order, one page at a time -
         # after downtime the backlog can exceed one page, and the stop must be found
@@ -456,13 +457,15 @@ class TradingBot:
                 pos.last_checked_ms = int(ts) + bar_ms
                 if (l <= pos.stop_loss) if long else (h >= pos.stop_loss):
                     if pos.breakeven_moved:
-                        reason = "breakeven_stop"  # bot-managed: sells at the current price below
+                        reason = self._managed_stop_reason(pos)  # bot-managed: sells at the current price
                     else:
                         gapped = o < pos.stop_loss if long else o > pos.stop_loss
                         reason, price = "stop_loss", (o if gapped else pos.stop_loss)
                     break
                 if be_r > 0 and not pos.breakeven_moved and pos.r_at(h if long else l) >= be_r:
                     self._move_to_breakeven(pos)
+                if pos.breakeven_moved and pos.trail_distance:
+                    self._trail(pos, h if long else l)
         if reason is None and not caught_up:
             # a very long backlog: keep replaying next poll before trusting the live price
             log.warning("#%s %s: still replaying price history", pos.id, pos.symbol)
@@ -471,7 +474,7 @@ class TradingBot:
         if reason is None:
             current = self.market.fetch_last_price(pos.symbol)
             if (current <= pos.stop_loss) if long else (current >= pos.stop_loss):
-                reason = "breakeven_stop" if pos.breakeven_moved else "stop_loss"
+                reason = self._managed_stop_reason(pos) if pos.breakeven_moved else "stop_loss"
             elif (current >= pos.take_profit) if long else (current <= pos.take_profit):
                 reason = "take_profit"
             elif now_ms >= pos.max_hold_until:
@@ -491,8 +494,30 @@ class TradingBot:
     def _move_to_breakeven(self, pos: Position) -> None:
         self.broker.move_stop(pos, pos.entry_price)
         pos.breakeven_moved = True
+        pos.trail_notified = pos.entry_price
         self.db.update_position(pos)
         self.notify(fmt.format_stop_move(pos))
+
+    def _trail(self, pos: Position, extreme: float) -> None:
+        """Ratchet the (bot-managed) stop behind the best price; never loosen it."""
+        if pos.side == "long":
+            new = max(pos.stop_loss, extreme - pos.trail_distance)
+        else:
+            new = min(pos.stop_loss, extreme + pos.trail_distance)
+        if new == pos.stop_loss:
+            return
+        self.broker.move_stop(pos, new)
+        per_unit = abs(pos.entry_price - pos.initial_stop)
+        # tell signal followers when it has moved by at least half the original risk
+        if per_unit > 0 and abs(new - (pos.trail_notified or pos.entry_price)) >= 0.5 * per_unit:
+            pos.trail_notified = new
+            self.notify(fmt.format_trail_move(pos))
+        self.db.update_position(pos)
+
+    @staticmethod
+    def _managed_stop_reason(pos: Position) -> str:
+        beyond = pos.stop_loss > pos.entry_price if pos.side == "long" else pos.stop_loss < pos.entry_price
+        return "trailing_stop" if beyond else "breakeven_stop"
 
     def _close(self, pos: Position, price: float, reason: str, now_ms: int) -> Position:
         try:

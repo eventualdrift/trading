@@ -12,6 +12,7 @@ REASONS = {
     "take_profit": "Take-profit hit",
     "stop_loss": "Stop-loss hit",
     "breakeven_stop": "Stopped out at breakeven",
+    "trailing_stop": "Trailing stop hit - gains locked in",
     "exit_signal": "Exit signal (setup invalidated)",
     "time_stop": "Time limit reached",
     "manual": "Closed manually",
@@ -57,15 +58,19 @@ def format_signal(sig: Signal, pos: Position | None, equity: float, mode: str, q
         f"Entry:        <code>{fmt_price(entry)}</code>  (market, now)",
         f"Don't chase:  {'above' if buy else 'below'} <code>{fmt_price(sig.chase_limit(max_chase_r))}</code>",
         f"Stop-loss:    <code>{fmt_price(sig.stop_loss)}</code>  ({(sig.stop_loss / entry - 1) * 100:+.2f}%)",
-        f"Take-profit:  <code>{fmt_price(sig.take_profit)}</code>  ({(sig.take_profit / entry - 1) * 100:+.2f}%)",
+        f"Take-profit:  <code>{fmt_price(sig.take_profit)}</code>  ({(sig.take_profit / entry - 1) * 100:+.2f}%)"
+        + ("  (far target - a trailing stop usually exits first)" if sig.trail_distance else ""),
         f"Reward:risk:  1:{rr:.1f}",
     ]
+    if sig.trail_distance:
+        lines.append(f"Trailing:     once +1R, stop follows {fmt_price(sig.trail_distance)} behind the best price")
     if pos is not None:
         risk_pct = pos.initial_risk / equity * 100 if equity > 0 else 0.0
         base = sig.symbol.split("/")[0]
         lines.append(
             f"Size:         {pos.amount:.6g} {esc(base)} (~{pos.notional:,.2f} {quote}), "
             f"risking {pos.initial_risk:,.2f} {quote} ({risk_pct:.1f}%)"
+            + (f" - high-confidence setup, {sig.risk_multiplier:.1f}x normal risk" if sig.risk_multiplier > 1.05 else "")
         )
     lines += [
         f"Time limit:   close by {fmt_time(sig.max_hold_until)} if neither level is hit",
@@ -95,6 +100,14 @@ def format_stop_move(pos: Position) -> str:
         f"🔒 <b>Move stop to breakeven — {esc(pos.symbol)}</b> #{pos.id}\n"
         f"Price reached +1R. New stop-loss: <code>{fmt_price(pos.stop_loss)}</code> (your entry). "
         f"This trade can no longer lose money (except fees/slippage)."
+    )
+
+
+def format_trail_move(pos: Position) -> str:
+    locked = pos.r_at(pos.stop_loss)
+    return (
+        f"📈 <b>Raise stop — {esc(pos.symbol)}</b> #{pos.id}\n"
+        f"New trailing stop: <code>{fmt_price(pos.stop_loss)}</code> (locks in {locked:+.1f}R if hit)."
     )
 
 

@@ -55,6 +55,19 @@ def run_demo(days: int = 540, sim_days: int = 45, symbols: int = 6, seed: int = 
     t0 = time.time()
     res = learning_cycle(cfg, market, now_ms=learn_until, log_fn=out)
     out(f"\n{res.summary}\n  ({time.time() - t0:.0f}s)")
+    if res.selection.selected:
+        from .learning import load_datasets
+        from .projection import format_projection, out_of_sample_trades, project
+
+        datasets = load_datasets(market, cfg, market.symbols, None, learn_until, log_fn=lambda *_: None)
+        trades = out_of_sample_trades(res.selection, datasets, cfg)
+        if trades:
+            proj = project(trades, cfg, capital=1000.0, benchmark=datasets["1h"].get("BTC/USDT"),
+                           benchmark_symbol="BTC/USDT")
+            out("\n" + "!" * 72 + "\n SYNTHETIC PRICES - the synthetic market trends far more cleanly than real crypto,\n"
+                " so these numbers are NOT a forecast. Run `tradebot learn` + `tradebot project` on\n"
+                " real data for a meaningful projection.\n" + "!" * 72)
+            out(format_projection(proj))
 
     out(f"\n[2/3] Paper trading the next {sim_days} days candle-by-candle with the live bot loop...\n")
     db = Database(state / "tradebot.db")

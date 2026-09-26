@@ -42,6 +42,15 @@ def test_live_mode_limited_to_verified_exchanges(tmp_path, monkeypatch):
     assert load_config(p, env_file=None).exchange.id == "okx"
 
 
+def test_defaults_include_trend_following_and_safe_multiplier(tmp_path):
+    cfg = load_config(tmp_path / "none.yaml", env_file=None)
+    assert "momentum" in cfg.strategies and cfg.universe.top_n == 30
+    p = tmp_path / "c.yaml"
+    p.write_text("risk:\n  risk_per_trade_pct: 3\n  max_risk_multiplier: 2\n")
+    with pytest.raises(ValueError, match="max_risk_multiplier"):
+        load_config(p, env_file=None)  # 3% x 2 = 6% on one trade: refused
+
+
 def test_secrets_from_env(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("TELEGRAM_BOT_TOKEN=abc\nTELEGRAM_CHAT_ID=42\n")

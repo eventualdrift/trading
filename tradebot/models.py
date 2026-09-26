@@ -42,6 +42,8 @@ class Signal:
     reason: str = ""
     confidence: float | None = None  # ML probability of a winning trade
     expected_r: float | None = None
+    trail_distance: float | None = None  # trailing stop distance once +1R (None = fixed target only)
+    risk_multiplier: float = 1.0  # >1 for high-confidence setups (validated by the ML report)
     status: str = "new"  # new | opened | skipped | filtered
     note: str = ""
     features: dict = field(default_factory=dict, repr=False)
@@ -108,6 +110,8 @@ class Position:
     exit_sent_ms: int = 0
     breakeven_moved: bool = False
     last_checked_ms: int = 0
+    trail_distance: float | None = None
+    trail_notified: float = 0.0  # last trailing-stop level announced to the user
     exit_filled: float = 0.0  # amount already sold (partial exits)
     exit_value: float = 0.0  # quote proceeds of those sales
     closing_reason: str | None = None  # a close was started but not completed; retried
@@ -124,6 +128,7 @@ class Position:
             take_profit=sig.take_profit, initial_stop=sig.stop_loss, opened_at=now_ms,
             max_hold_until=sig.max_hold_until, signal_id=sig.id, confidence=sig.confidence,
             status="pending", features=dict(sig.features), client_order_id=new_client_id("e"),
+            trail_distance=sig.trail_distance,
         )
 
     @property

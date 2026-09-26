@@ -206,6 +206,27 @@ def cmd_report(args, cfg):
     print(format_readiness(readiness(db, cfg, int(time.time() * 1000))))
 
 
+def cmd_project(args, cfg):
+    from .learning import load_brain, load_datasets
+    from .projection import format_projection, out_of_sample_trades, project
+
+    selection, _ = load_brain(cfg)
+    if not selection or not selection.selected:
+        sys.exit("No validated strategies yet - run `tradebot learn` first (nothing to project).")
+    market = _market(cfg, args.synthetic)
+    u = cfg.universe
+    symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    cfg.timeframes = selection.timeframes()
+    bench_symbol = f"BTC/{cfg.exchange.quote}"
+    datasets = load_datasets(market, cfg, sorted(set(symbols) | {bench_symbol}), _store(cfg, market),
+                             log_fn=lambda *_: None)
+    trades = out_of_sample_trades(selection, {tf: {s: d for s, d in ds.items() if s in symbols}
+                                              for tf, ds in datasets.items()}, cfg)
+    bench = next((ds[bench_symbol] for ds in datasets.values() if bench_symbol in ds), None)
+    p = project(trades, cfg, capital=args.capital, runs=args.runs, benchmark=bench, benchmark_symbol=bench_symbol)
+    print(format_projection(p, cfg.exchange.quote))
+
+
 def cmd_telegram_test(args, cfg):
     import requests
 
@@ -255,6 +276,10 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("run", help="run the bot 24/7 (paper or live per config)")
     sp.add_argument("--force-live", action="store_true", help="go live even if the paper record is not ready")
     sub.add_parser("report", help="track record and go-live readiness")
+    sp = sub.add_parser("project", help="what could the account become? (Monte Carlo from out-of-sample trades)")
+    sp.add_argument("--capital", type=float, default=1000.0)
+    sp.add_argument("--runs", type=int, default=5000)
+    sp.add_argument("--synthetic", action="store_true")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -270,7 +295,8 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config, args.env) if args.command != "demo" else BotConfig()
     handler = {
         "init": cmd_init, "learn": cmd_learn, "backtest": cmd_backtest, "scan": cmd_scan,
-        "run": cmd_run, "report": cmd_report, "telegram-test": cmd_telegram_test, "demo": cmd_demo,
+        "run": cmd_run, "report": cmd_report, "project": cmd_project, "telegram-test": cmd_telegram_test,
+        "demo": cmd_demo,
     }[args.command]
     handler(args, cfg)
 

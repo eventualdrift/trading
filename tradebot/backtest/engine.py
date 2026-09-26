@@ -13,6 +13,8 @@ Execution model (kept deliberately conservative):
   * breakeven: once a bar trades +1R the stop moves to entry for later bars, and if
     that same bar closes back at/below entry the trade exits at the close (the close
     is observed after the high);
+  * trailing stop (strategies that "let winners run"): after that +1R, the stop also
+    follows the highest high minus a fixed distance, with the same close check;
   * fees are charged on both entry and exit.
 """
 from __future__ import annotations
@@ -89,6 +91,7 @@ def simulate_trade(
     max_hold: int,
     costs: Costs,
     breakeven_at_r: float = 0.0,
+    trail: float = 0.0,
 ) -> TradeOutcome | None:
     n = len(c)
     e = signal_idx + 1
@@ -109,13 +112,15 @@ def simulate_trade(
         return None
 
     stop = sl
-    be_level = entry + sign * breakeven_at_r * risk if breakeven_at_r > 0 else None
+    trail = trail if trail and trail > 0 and not np.isnan(trail) else 0.0
+    activate_r = breakeven_at_r if breakeven_at_r > 0 else (1.0 if trail else 0.0)
+    be_level = entry + sign * activate_r * risk if activate_r > 0 else None
     at_breakeven = False
     last = min(n - 1, e + max_hold - 1)
 
     exit_idx, exit_price, reason = last, c[last], ""
     for j in range(e, last + 1):
-        stop_reason = "breakeven_stop" if at_breakeven else "stop_loss"
+        stop_reason = _stop_reason(at_breakeven, long, stop, entry)
         if long:
             if j > e and o[j] <= stop:
                 exit_idx, exit_price, reason = j, o[j] * (1 - slip), stop_reason
@@ -139,13 +144,19 @@ def simulate_trade(
         if exit_flags is not None and exit_flags[j]:
             exit_idx, exit_price, reason = j, c[j] * (1 - sign * slip), "exit_signal"
             break
+        moved = False
         if be_level is not None and not at_breakeven:
             if (long and h[j] >= be_level) or (not long and l[j] <= be_level):
                 stop = entry  # intrabar checks apply from the next bar on
-                at_breakeven = True
-                if (c[j] <= entry) if long else (c[j] >= entry):
-                    exit_idx, exit_price, reason = j, c[j] * (1 - sign * slip), "breakeven_stop"
-                    break
+                at_breakeven = moved = True
+        if at_breakeven and trail:
+            new = max(stop, h[j] - trail) if long else min(stop, l[j] + trail)
+            moved = moved or new != stop
+            stop = new
+        if moved and ((c[j] <= stop) if long else (c[j] >= stop)):  # the close comes after the high
+            exit_idx, exit_price = j, c[j] * (1 - sign * slip)
+            reason = _stop_reason(True, long, stop, entry)
+            break
 
     complete = True
     if not reason:
@@ -167,6 +178,12 @@ def simulate_trade(
         return_pct=float(ret),
         complete=complete,
     )
+
+
+def _stop_reason(protected: bool, long: bool, stop: float, entry: float) -> str:
+    if not protected:
+        return "stop_loss"
+    return "trailing_stop" if ((stop > entry) if long else (stop < entry)) else "breakeven_stop"
 
 
 def reward_risk(side: str, close: float, sl: float, tp: float) -> float:
@@ -194,6 +211,7 @@ def backtest_populated(
     xl, xs = pop["exit_long"].to_numpy(), pop["exit_short"].to_numpy()
     lsl, ltp = pop["long_sl"].to_numpy(dtype=float), pop["long_tp"].to_numpy(dtype=float)
     ssl, stp = pop["short_sl"].to_numpy(dtype=float), pop["short_tp"].to_numpy(dtype=float)
+    trail = pop["trail_dist"].to_numpy(dtype=float) if "trail_dist" in pop else np.zeros(len(pop))
     idx = pop.index
     n = len(pop)
     i = strategy.warmup if start_idx is None else max(start_idx, strategy.warmup)
@@ -212,7 +230,7 @@ def backtest_populated(
             continue
         out = simulate_trade(
             o, h, l, c, xl if go_long else xs, i, side, sl, tp,
-            strategy.max_hold_bars, costs, breakeven_at_r,
+            strategy.max_hold_bars, costs, breakeven_at_r, trail[i],
         )
         if out is None:
             i += 1

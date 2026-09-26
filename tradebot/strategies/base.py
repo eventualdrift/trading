@@ -57,7 +57,7 @@ class Strategy(ABC):
             if col not in out:
                 out[col] = False
             out[col] = out[col].fillna(False).astype(bool)
-        for col in ("long_sl", "long_tp", "short_sl", "short_tp"):
+        for col in ("long_sl", "long_tp", "short_sl", "short_tp", "trail_dist"):
             if col not in out:
                 out[col] = np.nan
         # An entry is only valid if its levels make sense.

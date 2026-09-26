@@ -42,6 +42,16 @@ class Scanner:
             return None
         return self.cfg.ml.min_probability if self.cfg.ml.min_probability is not None else self.model.threshold
 
+    def risk_multiplier(self, prob: float | None) -> float:
+        """Bet more on the strongest setups - only if the model proved on unseen data that
+        its higher-confidence trades really earned more."""
+        top = self.cfg.risk.max_risk_multiplier
+        if prob is None or self.model is None or top <= 1.0 or not self.model.report.confidence_scaling:
+            return 1.0
+        thr = self.threshold
+        frac = min(max((prob - thr) / max(1.0 - thr, 1e-9), 0.0), 1.0)
+        return 1.0 + frac * (top - 1.0)
+
     def _strategy_for(self, pos: Position) -> Strategy:
         for s in self.combos.get(pos.timeframe, []):
             if s.name == pos.strategy:
@@ -100,7 +110,10 @@ class Scanner:
                         created_at=now_ms, valid_until=close_ms + tf_ms(tf),
                         max_hold_until=close_ms + strat.max_hold_bars * tf_ms(tf),
                         reason=strat.explain(row, side), confidence=prob,
-                        expected_r=(prob * rr - (1 - prob)) if prob is not None else None,
+                        # rank on a capped reward:risk - far "let it run" targets are rarely hit
+                        expected_r=(prob * min(rr, 3.0) - (1 - prob)) if prob is not None else None,
+                        trail_distance=_positive(row.get("trail_dist")),
+                        risk_multiplier=self.risk_multiplier(prob),
                         features={k: (None if v != v else float(v)) for k, v in X.iloc[0].items()},
                     )
                     if prob is not None and prob < self.threshold:
@@ -110,3 +123,11 @@ class Scanner:
                         res.accepted.append(sig)
         res.accepted.sort(key=lambda s: (s.expected_r if s.expected_r is not None else s.reward_risk - 1), reverse=True)
         return res
+
+
+def _positive(value) -> float | None:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None

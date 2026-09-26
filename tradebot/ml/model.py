@@ -64,6 +64,8 @@ class ModelReport:
     filtered_win_rate: float = 0.0
     filtered_trades: int = 0
     vs_current: dict | None = None
+    confidence_edge_r: float | None = None  # top-half vs bottom-half confidence, on the test set
+    confidence_scaling: bool = False  # higher confidence really earned more -> allow bigger bets
     trained_until: str | None = None
     notes: list[str] = field(default_factory=list)
 
@@ -77,6 +79,8 @@ class ModelReport:
             f"  test set: all signals {self.base_expectancy_r:+.3f}R ({self.base_win_rate:.0%} win, {self.n_test} trades) "
             f"-> filtered {self.filtered_expectancy_r:+.3f}R ({self.filtered_win_rate:.0%} win, {self.filtered_trades} trades), "
             f"threshold {self.threshold:.2f}, AUC {auc}"
+            + (f"\n  bigger bets on high-confidence setups: {'yes' if self.confidence_scaling else 'no'}"
+               f" (their edge over the rest: {self.confidence_edge_r:+.2f}R)" if self.confidence_edge_r is not None else "")
         )
 
 
@@ -179,6 +183,13 @@ def train_model(
     rep.filtered_expectancy_r, rep.filtered_win_rate, rep.filtered_trades = _filtered_stats(r_test, p_test, thr)
     if len(np.unique(y_test)) == 2:
         rep.auc_test = float(roc_auc_score(y_test, p_test))
+    taken = p_test >= thr
+    if taken.sum() >= 30:  # did the more confident half of the taken trades do better?
+        pt, rt = p_test[taken], r_test[taken]
+        hi = pt >= np.median(pt)
+        if hi.sum() >= 15 and (~hi).sum() >= 15:
+            rep.confidence_edge_r = float(rt[hi].mean() - rt[~hi].mean())
+            rep.confidence_scaling = rep.confidence_edge_r >= 0.1 and float(rt[hi].mean()) > 0
 
     problems = []
     if rep.filtered_trades < cfg.min_test_trades:

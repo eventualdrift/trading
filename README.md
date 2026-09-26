@@ -63,6 +63,7 @@ Why: uptrend (EMA50 > EMA200, ADX 27); pullback over, RSI turned up at 46
 | `trend`    | buy the end of a pullback inside a confirmed trend (EMA50/200, ADX, RSI) |
 | `breakout` | buy a close above the 20-bar range on 1.5× volume, with the EMA200 trend |
 | `meanrev`  | in ranging markets (low ADX) buy an oversold dip back inside Bollinger |
+| `momentum` | trend following: buy a new 55-bar high in a trending market, no near target - the stop trails 3 ATR behind the best price once +1R, so the occasional big trend pays for the small losers |
 
 Every trade has an ATR-based stop-loss, a fixed reward:risk take-profit, a breakeven move at
 +1R, a time limit and a strategy-specific early exit.
@@ -84,7 +85,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 135 tests
+pytest -q              # 151 tests
 ```
 
 ### 1. Configure
@@ -117,7 +118,20 @@ tradebot run           # 24/7: signals to Telegram + paper trading with fake mon
 Follow the signals by hand if you like. The paper account tracks exactly what following
 every signal would have done.
 
-### 4. Check the track record
+### 4. What could it make? `tradebot project`
+
+```bash
+tradebot project --capital 1000
+```
+
+This simulates 5,000 possible futures for your account. It samples the selected strategies'
+out-of-sample trades, which were never used to choose them, at their historical rate, using
+the live risk rules and fees. It prints a bad / typical / good range and the chance of being
+down at 1, 2, 3, 6 and 12 months, plus the worst dip to expect. It also compares against
+**simply holding Bitcoin** over the same period, because a bot that makes less than buying
+Bitcoin and waiting isn't worth running. It's a range based on the past, not a promise.
+
+### 5. Check the track record
 
 ```bash
 tradebot report          # example output below
@@ -132,7 +146,7 @@ Go-live readiness (paper track record):
   => READY for live trading (start small!)
 ```
 
-### 5. Go live (only when ready)
+### 6. Go live (only when ready)
 
 Live trading is supported on **Binance spot** only. Signals and paper trading work with any
 ccxt exchange, but automatic trading needs exchange-specific handling of stop orders, order
@@ -190,6 +204,8 @@ How live orders are handled:
 | max single position | 30% of equity |
 | max total exposure | 100% of equity (no leverage) |
 | minimum reward:risk | 1.5 |
+| bigger bets on the strongest setups | up to 1.5x risk, only if the ML proved on unseen data that its most confident picks really earn more |
+| trailing stop (momentum strategy) | once +1R, stop follows 3 ATR behind the best price; never loosened |
 | daily loss limit → no new trades until 00:00 UTC | 3% |
 | drawdown from peak → halt until `/resume` | 15% |
 | don't chase: skip if price already moved past the signal | 0.3R |
@@ -205,6 +221,7 @@ How live orders are handled:
 | `tradebot scan` | current opportunities, no trading |
 | `tradebot run` | run the bot (paper or live per config) |
 | `tradebot report` | track record + go-live checklist |
+| `tradebot project [--capital 1000]` | range of outcomes for your account at 1-12 months, vs holding BTC |
 | `tradebot telegram-test` | Telegram setup helper |
 | `tradebot demo` | offline demo on synthetic data |
 
@@ -237,7 +254,7 @@ tradebot/
   bot.py          main loop, position management, commands
   learning.py     the self-learning cycle
   report.py       go-live readiness
-tests/            135 tests: look-ahead checks, live-vs-backtest parity, a fake exchange with
+tests/            151 tests: look-ahead checks, live-vs-backtest parity, a fake exchange with
                   trigger-order routing, partial fills, races and network timeouts
 ```
 

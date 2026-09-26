@@ -22,7 +22,7 @@ class ExchangeConfig:
 
 @dataclass
 class UniverseConfig:
-    top_n: int = 20
+    top_n: int = 30
     min_quote_volume: float = 5_000_000
     whitelist: list[str] = field(default_factory=list)
     blacklist: list[str] = field(default_factory=list)
@@ -53,6 +53,7 @@ class RiskConfig:
     max_drawdown_pct: float = 15.0  # halt new entries until /resume
     min_reward_risk: float = 1.5
     breakeven_at_r: float = 1.0  # move stop to entry once price is +1R (0 = off)
+    max_risk_multiplier: float = 1.5  # up to 1.5x risk on the ML's strongest setups (1 = off)
     max_chase_r: float = 0.3  # skip entries if price already ran this many R past the signal
 
 
@@ -126,7 +127,7 @@ class BotConfig:
     mode: str = "paper"  # paper | live
     timeframes: list[str] = field(default_factory=lambda: ["15m", "1h", "4h", "1d"])
     strategies: dict[str, dict] = field(
-        default_factory=lambda: {"trend": {}, "breakout": {}, "meanrev": {}}
+        default_factory=lambda: {"trend": {}, "breakout": {}, "meanrev": {}, "momentum": {}}
     )
     allow_short: bool = False
     poll_seconds: float = 30
@@ -166,6 +167,8 @@ class BotConfig:
         r = self.risk
         if not 0 < r.risk_per_trade_pct <= 5:
             errors.append("risk.risk_per_trade_pct must be in (0, 5]")
+        if not 1.0 <= r.max_risk_multiplier <= 3.0 or r.risk_per_trade_pct * r.max_risk_multiplier > 5:
+            errors.append("risk.max_risk_multiplier must be in [1, 3] and keep any trade's risk <= 5%")
         if r.max_open_positions < 1:
             errors.append("risk.max_open_positions must be >= 1")
         if not 0 < r.max_position_pct <= 100:

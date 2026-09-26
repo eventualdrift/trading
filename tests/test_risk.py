@@ -40,6 +40,13 @@ def test_size_respects_exposure_and_minimums():
     assert d.amount == 2.0
 
 
+def test_risk_multiplier_scales_and_is_capped():
+    rm = RiskManager(RiskConfig(risk_per_trade_pct=1.0, max_position_pct=100, max_risk_multiplier=1.5))
+    assert rm.size(1000, 100, 95, risk_multiplier=1.5).risk_amount == pytest.approx(15.0)
+    assert rm.size(1000, 100, 95, risk_multiplier=3.0).risk_amount == pytest.approx(15.0)  # capped
+    assert rm.size(1000, 100, 95, risk_multiplier=0.2).risk_amount == pytest.approx(10.0)  # never below base
+
+
 def test_entry_blocks():
     rm = RiskManager(RiskConfig(max_open_positions=2, min_reward_risk=1.5))
     assert rm.entry_block_reason(sig(), []) is None

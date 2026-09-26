@@ -160,13 +160,14 @@ T0 = 1_700_000_000_000 // 60_000 * 60_000
 MIN = 60_000
 
 
-def managed(cfg, rows, price=100.0, max_hold=T0 + DAY, broker=None):
+def managed(cfg, rows, price=100.0, max_hold=T0 + DAY, broker=None, trail=None):
     market = StubMarket(rows, T0, price)
     db = Database(cfg.state_path / "m.db")
     broker = broker or PaperBroker(db, Costs(0.0, 0.0), 1000.0)
     notes = MemoryNotifier()
     bot = TradingBot(cfg, market, broker, db, notes, selection=selection())
-    sig = Signal("BTC/USDT", "1h", "trend", "long", 100.0, 95.0, 110.0, 0, T0, T0, max_hold)
+    sig = Signal("BTC/USDT", "1h", "trend", "long", 100.0, 95.0, 150.0 if trail else 110.0, 0, T0, T0, max_hold,
+                 trail_distance=trail)
     sig.id = 1
     pos = Position.from_signal(sig, broker.mode, 1.0, T0)
     db.insert_position(pos)
@@ -253,6 +254,25 @@ def test_open_position_untouched_between_levels(cfg):
     bot.manage_positions(T0 + 2 * MIN + 30_000)  # third bar still forming
     [p] = db.open_positions("paper")
     assert p.last_checked_ms == T0 + 2 * MIN
+
+
+def test_trailing_stop_follows_price_and_locks_gains(cfg):
+    rows = [(100, 106, 99.5, 105), (105, 110, 104, 109), (109, 109, 106, 106.5)]
+    market, db, notes, bot = managed(cfg, rows, price=106.5, trail=3.0)
+    bot.manage_positions(T0 + 3 * MIN + 1)
+    p = db.closed_positions("paper")[0]
+    assert p.exit_reason == "trailing_stop" and p.stop_loss == pytest.approx(107.0)
+    assert p.pnl > 0  # sold at 106.5 after the stop trailed up to 107
+    assert any("Raise stop" in m for m in notes.messages)  # followers told to move their stop
+    assert any("Trailing stop hit" in m for m in notes.messages)
+
+
+def test_trailing_stop_never_loosens(cfg):
+    rows = [(100, 110, 99.5, 109), (109, 109.5, 107.5, 108)]  # 2nd bar alone would imply 106.5
+    market, db, notes, bot = managed(cfg, rows, price=108.0, trail=3.0)
+    bot.manage_positions(T0 + 2 * MIN + 1)
+    [p] = db.open_positions("paper")
+    assert p.stop_loss == pytest.approx(107.0)  # 110 - 3, not lowered by the weaker second bar
 
 
 def test_forget_command(cfg):
