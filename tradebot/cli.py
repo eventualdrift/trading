@@ -68,6 +68,9 @@ def cmd_learn(args, cfg):
     from .db import Database
     from .learning import learning_cycle, load_brain
 
+    if cfg.learning.follow_state_dir:
+        sys.exit(f"This instance uses the strategies in {cfg.learning.follow_state_dir} "
+                 f"(learning.follow_state_dir) - run `tradebot learn` with that instance's config.")
     market = _market(cfg, args.synthetic)
     _, current = load_brain(cfg)
     db = Database(cfg.state_path / "tradebot.db")
@@ -92,6 +95,7 @@ def cmd_backtest(args, cfg):
     context = load_context(market, cfg, _store(cfg, market))
     r = cfg.risk
     all_trades = []
+    print(cfg.costs_description())
     for tf in tfs:
         for name in strategies:
             is_t, oos_t, _ = run_combo(datasets[tf], name, cfg.strategies.get(name, {}), tf, cfg, context)
@@ -166,8 +170,13 @@ def cmd_run(args, cfg):
         res = learning_cycle(cfg, learn_market, store=store, db=db, current_model=current, log_fn=log.info)
         return res.selection, res.model, res.summary
 
+    follow = cfg.learning.follow_state_dir
     selection, model = load_brain(cfg)
-    if selection is None and cfg.learning.learn_on_start:
+    if follow:
+        learner = None  # never learns: uses (and reloads) the leader's selection and model
+        print(f"Using the strategies in {follow} (learning.follow_state_dir)"
+              + ("" if selection else " - none there yet; they'll be picked up once that instance learns"))
+    elif selection is None and cfg.learning.learn_on_start:
         print("No strategy selection found - running the first learning cycle (this can take a while)...")
         selection, model_new, summary = learner(model)
         model = model_new or model
@@ -203,7 +212,7 @@ def cmd_report(args, cfg):
     selection, model = load_brain(cfg)
     if selection:
         print("Selected strategies:", ", ".join(c.key for c in selection.selected) or "none")
-    rep = cfg.state_path / MODEL_REPORT_FILE
+    rep = cfg.brain_path / MODEL_REPORT_FILE
     print("ML filter:", "active" if model else "not active", f"(last training report: {rep})" if rep.exists() else "")
     print("\nGo-live readiness (paper track record):")
     print(format_readiness(readiness(db, cfg, int(time.time() * 1000))))
@@ -254,7 +263,7 @@ def cmd_research(args, cfg):
 
 def cmd_portfolio_backtest(args, cfg):
     from .learning import load_brain, load_context, load_datasets
-    from .portfolio import format_portfolio_backtest, portfolio_backtest
+    from .portfolio import combo_split_stats, format_portfolio_backtest, portfolio_backtest
     from .backtest.selection import run_combo
 
     selection, _ = load_brain(cfg)
@@ -266,7 +275,7 @@ def cmd_portfolio_backtest(args, cfg):
         df = (store.update(market, sym, "1d", args.days, now) if store is not None
               else market.history(sym, "1d", now - args.days * 86_400_000, now))
         core_closes[sym] = df["close"]
-    trades = []
+    trades, combos, sat_closes, universe = [], [], {}, None
     if selection and selection.selected:
         u = cfg.universe
         symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
@@ -276,9 +285,19 @@ def cmd_portfolio_backtest(args, cfg):
         for c in selection.selected:
             is_t, oos_t, _ = run_combo(datasets.get(c.timeframe, {}), c.strategy, c.params, c.timeframe, cfg, context)
             trades += is_t + oos_t
+            combos.append(combo_split_stats(c.key, is_t, oos_t))
+        first = {}
+        for tf, ds in sorted(datasets.items(), key=lambda kv: kv[0] != "1d"):  # daily data first
+            for sym, df in ds.items():
+                if sym not in sat_closes:  # daily closes to value open trades each day
+                    sat_closes[sym] = df["close"] if tf == "1d" else df["close"].resample("1D").last().dropna()
+                first[sym] = min(first.get(sym, df.index[0]), df.index[0])
+        source = ("your universe.whitelist" if u.whitelist else
+                  f"today's top {u.top_n} {cfg.exchange.quote} pairs by 24h volume ({time.strftime('%Y-%m-%d')})")
+        universe = {"source": source, "symbols": symbols, "first": first}
     fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
     res = portfolio_backtest(core_closes, trades, cfg, capital=args.capital, fraction=fraction,
-                             since=args.since or None)
+                             since=args.since or None, sat_closes=sat_closes, combos=combos, universe=universe)
     print(format_portfolio_backtest(res, cfg.exchange.quote))
 
 
@@ -301,6 +320,26 @@ def cmd_dashboard(args, cfg):
         server.serve_forever()
     except KeyboardInterrupt:
         print("stopped")
+
+
+def cmd_compare_entries(args, cfg):
+    import pandas as pd
+
+    from .compare import compare_entries, config_differences, format_comparison, write_csv
+    from .db import Database
+
+    other = load_config(args.other, args.other_env)
+    if Path(other.state_dir).resolve() == Path(cfg.state_dir).resolve():
+        sys.exit("--other must be the limit-entry instance's config (a different state_dir)")
+    db_b_path = Path(other.state_dir) / "tradebot.db"
+    if not db_b_path.exists():
+        sys.exit(f"no database at {db_b_path} - has the second instance run yet?")
+    since = int(pd.Timestamp(args.since, tz="UTC").value // 1_000_000) if args.since else None
+    rows = compare_entries(Database(cfg.state_path / "tradebot.db"), Database(db_b_path), cfg.mode, since)
+    print(format_comparison(rows, cfg, other, config_differences(cfg, other)))
+    if args.csv:
+        write_csv(rows, args.csv)
+        print(f"\nper-signal rows written to {args.csv}")
 
 
 def cmd_telegram_test(args, cfg):
@@ -370,6 +409,11 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--serve", action="store_true", help="serve a live page on 127.0.0.1 instead of writing a file")
     sp.add_argument("--port", type=int, default=None, help="default: dashboard.port (8765)")
     sp.add_argument("--out", default=None, help="file to write (default: <state_dir>/dashboard.html)")
+    sp = sub.add_parser("compare-entries", help="market (this config) vs limit entries (--other), per signal")
+    sp.add_argument("--other", required=True, help="config of the limit-entry instance, e.g. config-b.yaml")
+    sp.add_argument("--other-env", default=None, help="its .env file (not needed for the comparison)")
+    sp.add_argument("--since", default=None, help="only signals from this date (default: B's first signal)")
+    sp.add_argument("--csv", default=None, help="also write every signal's row to this CSV file")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -387,6 +431,7 @@ def main(argv: list[str] | None = None) -> None:
         "init": cmd_init, "learn": cmd_learn, "backtest": cmd_backtest, "scan": cmd_scan,
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
+        "compare-entries": cmd_compare_entries,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

@@ -107,8 +107,24 @@ tradebot portfolio-backtest --capital 1000 --core-fraction 0.65
 
 This backtests the combined account, the core alone and the satellite alone against holding
 BTC and holding BTC+ETH. It covers the full history and the period since 2022, and gives the
-return, return per year, worst dip, Sharpe ratio and a year-by-year table, all after fees and
-slippage.
+return, return per year, worst dip, Sharpe ratio, average exposure and a year-by-year table, all
+after fees and slippage. It first prints the entry and cost assumptions it used, so paper
+trading can be set up to match them.
+
+It also compares against the core alone held at the **same average exposure** as the combined
+account, with the rest in cash. Holding cash lowers drawdowns by itself, so the satellite only
+adds something if 65/35 beats that line.
+
+The satellite's open trades are valued at every daily close (marked to market), so its dips
+and its correlation with the core count losses that were never realised. The satellite
+section then shows:
+- candidate trades taken vs skipped, and why each was skipped;
+- average position size and exposure;
+- the number of trades behind each strategy's in-sample and out-of-sample R;
+- the correlation of the core's and the satellite's daily and weekly returns;
+- which coins were tested. The list is **today's** most traded coins, not the coins listed at
+  the time, so coins that collapsed or were delisted are missing and the satellite's results
+  are flattered.
 
 The core sleeve is **paper-only** in this version: `mode: live` refuses `core.fraction > 0`.
 
@@ -122,7 +138,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 192 tests
+pytest -q              # 198 tests
 ```
 
 ### 1. Configure
@@ -251,33 +267,52 @@ listens on this computer only. To see it from another device, use an SSH tunnel
 Under Docker the server isn't reachable from outside the container, so open the file
 `./state/dashboard.html` instead.
 
-## Side-by-side paper configs
+## Side-by-side paper configs: market vs limit entries
 
-To compare two setups over the same paper period (say, with and without the core sleeve), run
-two instances. Each needs its own config file, `state_dir` and dashboard port. They can share
-the price cache (`data.dir`), whose writes are atomic.
+The backtests assume **market** entries (next candle's open + slippage), so the main
+instance (A) uses `costs.entry_order: market`. A second instance (B) can run the *same
+signals* with limit orders at the signal price, to measure what limit entries would change.
+Compare them **signal by signal, not on P&L**:
+- the fill rate;
+- the limit price against A's market fill;
+- what each signal B missed did in A.
 
 ```yaml
-# config-b.yaml - a copy of config.yaml with:
-name: B                  # messages start with [B]; the dashboard title says B
-state_dir: state-b       # its own database, strategy selection and ML model
-core:
-  fraction: 0            # the setting being compared
+# config-b.yaml - everything comes from config.yaml except these lines
+extends: config.yaml
+name: B                     # messages start with [B]; the dashboard title says B
+state_dir: state-b          # its own database and paper account
+costs:
+  entry_order: limit        # the one real difference
+learning:
+  follow_state_dir: state   # use A's strategies and ML model (reloaded when A retrains); B never learns
 telegram:
-  commands: false        # both can SEND to the same Telegram bot, but only one may answer /commands
+  enabled: false            # no duplicate signals on your phone; B's alerts are on its dashboard
 dashboard:
   port: 8766
 ```
 
 ```bash
-tradebot --config config-b.yaml learn
-tradebot --config config-b.yaml run       # in a second terminal / service
-tradebot --config config-b.yaml report
+tradebot --config config-b.yaml run                        # second service, same folder as A
+tradebot compare-entries --other config-b.yaml [--csv entries.csv]
 ```
 
-Telegram commands only reach the instance with `telegram.commands: true`. To control B from
-Telegram too, give it its own bot token: create a second bot with @BotFather and point B at a
-separate env file with `--env .env-b`.
+`compare-entries` matches each signal across the two databases. It reports:
+- the fill rate;
+- the price improvement in basis points and in R;
+- for every signal B's limit missed, A's result on it (in R);
+- a warning if the two configs differ in anything other than the entry order and instance
+  settings.
+
+While A is a paper account, its "market fill" is the last price plus the modelled slippage, so
+the price improvement mostly measures that assumption. The fill rate and the outcomes of
+missed signals come from real prices. The two accounts can also drift apart: when one has
+more open trades, it may skip a signal the other takes. Such signals are listed as not
+comparable.
+
+Each instance needs its own `state_dir` and dashboard port. They can share the price cache
+(`data.dir`), whose writes are atomic. Telegram commands only reach an instance with
+`telegram.commands: true`, and only one instance per Telegram bot may have it.
 
 ## Telegram commands
 
@@ -325,6 +360,7 @@ separate env file with `--env .env-b`.
 | `tradebot portfolio-backtest [--capital 1000] [--core-fraction 0.65] [--since 2022-01-01]` | core + satellite account vs holding BTC |
 | `tradebot research breaker [--ratios 2 2.5 3]` | evaluate the volatility breaker on real data |
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
+| `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
 | `tradebot telegram-test` | Telegram setup helper |
 | `tradebot demo` | offline demo on synthetic data |
 
@@ -364,7 +400,8 @@ tradebot/
   portfolio.py    whole-account backtest vs holding BTC
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
-tests/            192 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+  compare.py      market vs limit entries across two instances, per signal
+tests/            198 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

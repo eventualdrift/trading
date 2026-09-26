@@ -28,9 +28,18 @@ class LearningResult:
 
 def load_brain(cfg: BotConfig) -> tuple[Selection | None, SignalModel | None]:
     return (
-        Selection.load(cfg.state_path / SELECTION_FILE),
-        SignalModel.load(cfg.state_path / MODEL_FILE) if cfg.ml.enabled else None,
+        Selection.load(cfg.brain_path / SELECTION_FILE),
+        SignalModel.load(cfg.brain_path / MODEL_FILE) if cfg.ml.enabled else None,
     )
+
+
+def brain_stamp(cfg: BotConfig) -> tuple:
+    """Changes whenever the selection or model files are rewritten."""
+    out = []
+    for name in (SELECTION_FILE, MODEL_FILE):
+        f = cfg.brain_path / name
+        out.append(f.stat().st_mtime_ns if f.exists() else 0)
+    return tuple(out)
 
 
 def load_datasets(market, cfg: BotConfig, symbols: list[str], store=None, now_ms: int | None = None,
@@ -77,6 +86,8 @@ def load_context(market, cfg: BotConfig, store=None, now_ms: int | None = None, 
 
 def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model: SignalModel | None = None,
                    now_ms: int | None = None, log_fn=print) -> LearningResult:
+    if cfg.learning.follow_state_dir:
+        raise RuntimeError(f"this instance follows {cfg.learning.follow_state_dir} - run `learn` on that instance")
     u = cfg.universe
     symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
     log_fn(f"Universe: {len(symbols)} symbols: {', '.join(symbols)}")
@@ -108,7 +119,8 @@ def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model
     sel = selection.selected
     variants = len(selection.combos) * (2 if cfg.selection.btc_filter == "auto" else 1)
     lines = [f"Strategies selected: {len(sel)} of {len(selection.combos)} combinations "
-             f"({variants} variants tested - the more tried, the more likely a winner is luck)"]
+             f"({variants} variants tested - the more tried, the more likely a winner is luck)",
+             f"Backtest assumptions: {cfg.costs_description()}"]
     for c in sel:
         o = c.out_of_sample
         lines.append(f"  • {c.key}: out-of-sample {o['trades']} trades, {o['expectancy_r']:+.2f}R/trade, "

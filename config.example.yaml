@@ -5,6 +5,7 @@
 # live  = real orders on your exchange account. Only after a good paper record!
 mode: paper
 name: ""                 # label for side-by-side instances, e.g. "A" -> messages start with [A]
+# extends: config.yaml   # (second instance) start from another config and override only what differs
 
 exchange:
   id: binance            # any ccxt exchange id: binance, bybit, okx, kraken, kucoin, luno, ...
@@ -78,6 +79,7 @@ ml:                            # self-learning trade filter
 learning:
   retrain_every_hours: 168     # re-select strategies and retrain the model weekly
   learn_on_start: true
+  follow_state_dir: null       # side-by-side instance: use another instance's strategies (e.g. state)
 
 # Core + satellite (paper only for now). The core holds BTC and ETH by trend: each coin's
 # weight is the share of its 50/100/150/200-day averages the daily close is above (0-100%

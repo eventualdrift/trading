@@ -20,3 +20,4 @@ dist/
 *.db
 *.sqlite
 *.log
+.DS_Store

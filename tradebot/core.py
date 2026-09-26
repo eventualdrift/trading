@@ -181,11 +181,17 @@ class CoreSleeve:
 def simulate_core(daily_closes: dict[str, pd.Series], cfg: CoreConfig, costs: Costs,
                   start_equity: float = 1000.0) -> pd.Series:
     """Backtest the core sleeve day by day with exactly the live rules -> daily equity."""
+    return simulate_core_detail(daily_closes, cfg, costs, start_equity)["equity"]
+
+
+def simulate_core_detail(daily_closes: dict[str, pd.Series], cfg: CoreConfig, costs: Costs,
+                         start_equity: float = 1000.0) -> pd.DataFrame:
+    """simulate_core, plus the value held in coins each day (column ``invested``)."""
     frame = pd.DataFrame(daily_closes).dropna(how="all").sort_index()
     weights = {s: trend_weights_series(frame[s].dropna(), cfg.sma_days).reindex(frame.index) for s in frame}
     n = max(len(frame.columns), 1)
     cash, qty = float(start_equity), {s: 0.0 for s in frame}
-    out = []
+    out, invested = [], []
     buy_cost = (1 + costs.fee_rate) * (1 + costs.slippage_rate)
     for day, row in frame.iterrows():
         prices = {s: float(p) for s, p in row.items() if p == p}
@@ -213,5 +219,8 @@ def simulate_core(daily_closes: dict[str, pd.Series], cfg: CoreConfig, costs: Co
                 q = spend / px
                 cash -= fill * q * (1 + costs.fee_rate)
                 qty[s] += q
-        out.append(cash + sum(qty[s] * prices.get(s, 0.0) for s in qty))
-    return pd.Series(np.array(out), index=frame.index, dtype=float)
+        held = sum(qty[s] * prices.get(s, 0.0) for s in qty)
+        out.append(cash + held)
+        invested.append(held)
+    return pd.DataFrame({"equity": np.array(out, dtype=float), "invested": np.array(invested, dtype=float)},
+                        index=frame.index)

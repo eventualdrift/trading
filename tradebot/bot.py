@@ -71,6 +71,12 @@ class TradingBot:
         self._last_equity_record = 0
         self._last_dashboard = 0
         self._dashboard_server = None
+        self._brain_stamp = None
+        self._last_brain_check = 0
+        if cfg.learning.follow_state_dir:
+            from .learning import brain_stamp
+
+            self._brain_stamp = brain_stamp(cfg)  # the files the caller loaded the brain from
         self._last_orphan_sweep = 0
         self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
         self._pending_extreme: dict[str, int] = {}
@@ -342,7 +348,10 @@ class TradingBot:
                 except Exception as exc:
                     self._notify_error(f"core sleeve: {exc}", key="core")
             self._maybe_daily_summary(now_ms, equity)
-        self._maybe_learn(now_ms)
+        if self.cfg.learning.follow_state_dir:
+            self._maybe_follow_brain(now_ms)
+        else:
+            self._maybe_learn(now_ms)
 
     def on_candle_close(self, tf: str, now_ms: int, candle_open_ms: int) -> None:
         symbols = self.universe(now_ms)
@@ -785,6 +794,27 @@ class TradingBot:
             event=False,  # routine, and the dashboard shows the same numbers
         )
 
+    def _maybe_follow_brain(self, now_ms: int) -> None:
+        """Side-by-side instance: pick up the leader's selection/model whenever it retrains."""
+        if now_ms - self._last_brain_check < 5 * 60_000:
+            return
+        self._last_brain_check = now_ms
+        from .learning import brain_stamp, load_brain
+
+        try:
+            stamp = brain_stamp(self.cfg)
+            if stamp == self._brain_stamp:
+                return
+            selection, model = load_brain(self.cfg)
+            self._brain_stamp = stamp
+            self.set_brain(selection, model)
+            combos = ", ".join(c.key for c in (selection.selected if selection else [])) or "none"
+            self.notify(f"🧠 Strategies reloaded from {fmt.esc(self.cfg.learning.follow_state_dir)}: "
+                        f"{fmt.esc(combos)}")
+        except Exception as exc:
+            self._notify_error(f"could not reload strategies from {self.cfg.learning.follow_state_dir}: {exc}",
+                               key="brain")
+
     def _maybe_learn(self, now_ms: int, force: bool = False) -> bool:
         if self.learner is None or (self._learn_thread and self._learn_thread.is_alive()):
             return False
@@ -884,6 +914,9 @@ class TradingBot:
                 self.db.update_position(pos)
                 return (f"#{pos.id} {fmt.esc(pos.symbol)} marked closed without trading "
                         f"(P&amp;L estimated at {fmt.fmt_price(price)}). Make sure the exchange account matches.")
+            if cmd == "learn" and self.cfg.learning.follow_state_dir:
+                return (f"This instance uses the strategies of {fmt.esc(self.cfg.learning.follow_state_dir)} - "
+                        f"run /learn there.")
             if cmd == "learn":
                 started = self._maybe_learn(self.market.now_ms(), force=True)
                 return "🧠 Learning cycle started - I'll report back when done." if started \

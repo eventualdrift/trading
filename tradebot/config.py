@@ -114,6 +114,9 @@ class MLConfig:
 class LearningConfig:
     retrain_every_hours: float = 168  # weekly self-learning cycle
     learn_on_start: bool = True  # run a cycle at start-up if no model/selection exists
+    # Use another instance's strategy selection and ML model (its state_dir) instead of learning:
+    # a side-by-side instance then gets exactly the same signals. Reloaded when that instance retrains.
+    follow_state_dir: str | None = None
 
 
 @dataclass
@@ -197,11 +200,27 @@ class BotConfig:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    @property
+    def brain_path(self) -> Path:
+        """Where the strategy selection and ML model are read from."""
+        follow = self.learning.follow_state_dir
+        return Path(follow) if follow else self.state_path
+
     def costs_model(self):
         from .backtest.engine import Costs
 
         c = self.costs
         return Costs(c.fee_rate, c.slippage_rate, c.maker_fee_rate, c.entry_order == "limit")
+
+    def costs_description(self) -> str:
+        """The execution assumptions every backtest uses - match paper/live to these."""
+        c = self.costs
+        maker = c.fee_rate if c.maker_fee_rate is None else c.maker_fee_rate
+        entry = (f"limit at the signal close, filled only if the next candle trades through it, "
+                 f"maker fee {maker:.3%}" if c.entry_order == "limit" else
+                 f"market at the next candle's open + {c.slippage_rate:.3%} slippage, taker fee {c.fee_rate:.3%}")
+        return (f"Entries: {entry}. Exits: taker fee {c.fee_rate:.3%} + {c.slippage_rate:.3%} slippage "
+                f"(costs.entry_order: {c.entry_order}).")
 
     def market_context(self, daily=None, hourly=None):
         from .context import MarketContext
@@ -260,6 +279,9 @@ class BotConfig:
             errors.append("dashboard.port must be in 1..65535")
         if self.dashboard.every_minutes <= 0:
             errors.append("dashboard.every_minutes must be > 0")
+        follow = self.learning.follow_state_dir
+        if follow and Path(follow).resolve() == Path(self.state_dir).resolve():
+            errors.append("learning.follow_state_dir must be another instance's state_dir, not this one's")
         if not 0.3 <= self.selection.in_sample_fraction <= 0.9:
             errors.append("selection.in_sample_fraction must be in [0.3, 0.9]")
         if errors:
@@ -283,6 +305,33 @@ def _build(cls, data: dict[str, Any], path: str):
     return cls(**kwargs)
 
 
+def _merge(base: dict, override: dict) -> dict:
+    """Mappings merge key by key; any other value (lists included) is replaced."""
+    out = dict(base)
+    for k, v in override.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def _read_yaml(path: Path, seen: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Read a config file; ``extends: other.yaml`` (relative to this file) loads that file first
+    and applies this one on top - so a side-by-side config lists only what differs."""
+    path = path.resolve()
+    if path in seen:
+        raise ValueError(f"config 'extends' loop: {' -> '.join(str(p) for p in (*seen, path))}")
+    with open(path) as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must be a mapping of settings")
+    parent = data.pop("extends", None)
+    if parent:
+        base_path = (path.parent / parent)
+        if not base_path.exists():
+            raise ValueError(f"{path}: extends {parent!r}, which does not exist")
+        data = _merge(_read_yaml(base_path, (*seen, path)), data)
+    return data
+
+
 def load_config(path: str | Path | None = "config.yaml", env_file: str | None = ".env") -> BotConfig:
     """Load YAML settings (optional) and secrets from the environment / .env file."""
     if env_file and Path(env_file).exists():
@@ -291,8 +340,7 @@ def load_config(path: str | Path | None = "config.yaml", env_file: str | None = 
         load_dotenv(env_file)
     data: dict[str, Any] = {}
     if path and Path(path).exists():
-        with open(path) as fh:
-            data = yaml.safe_load(fh) or {}
+        data = _read_yaml(Path(path))
     cfg = _build(BotConfig, data, "")
     cfg.strategies = {k: (v or {}) for k, v in (cfg.strategies or {}).items()}
     cfg.secrets = Secrets.from_env()

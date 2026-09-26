@@ -116,7 +116,15 @@ class Database:
             return self._select(Signal, "SELECT * FROM signals WHERE status=? ORDER BY id DESC LIMIT ?", (status, limit))
         return self._select(Signal, "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
 
+    def signals_since(self, since_ms: int = 0) -> list[Signal]:
+        return self._select(Signal, "SELECT * FROM signals WHERE created_at>=? ORDER BY id", (since_ms,))
+
     # ------------------------------------------------------------ positions
+    def positions_by_signal(self, mode: str) -> dict[int, Position]:
+        rows = self._select(Position, "SELECT * FROM positions WHERE mode=? AND signal_id IS NOT NULL ORDER BY id",
+                            (mode,))
+        return {p.signal_id: p for p in rows}
+
     def insert_position(self, p: Position) -> int:
         return self._insert("positions", p)
 
