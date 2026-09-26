@@ -342,6 +342,18 @@ def cmd_compare_entries(args, cfg):
         print(f"\nper-signal rows written to {args.csv}")
 
 
+def cmd_config_set(args, cfg):
+    from .config_edit import config_set
+
+    try:
+        report = config_set(args.config, args.assignments)
+    except (ValueError, OSError) as exc:
+        sys.exit(f"{args.config} NOT changed: {exc}")
+    print(f"{args.config} updated:")
+    for line in report:
+        print(f"  {line}")
+
+
 def cmd_telegram_test(args, cfg):
     import requests
 
@@ -414,6 +426,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--other-env", default=None, help="its .env file (not needed for the comparison)")
     sp.add_argument("--since", default=None, help="only signals from this date (default: B's first signal)")
     sp.add_argument("--csv", default=None, help="also write every signal's row to this CSV file")
+    sp = sub.add_parser("config-set", help="change settings in the config file (keeps comments, makes a backup)")
+    sp.add_argument("assignments", nargs="+", metavar="key=value", help="e.g. costs.fee_rate=0.00075 core.fraction=0.65")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -431,7 +445,7 @@ def main(argv: list[str] | None = None) -> None:
         "init": cmd_init, "learn": cmd_learn, "backtest": cmd_backtest, "scan": cmd_scan,
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
-        "compare-entries": cmd_compare_entries,
+        "compare-entries": cmd_compare_entries, "config-set": cmd_config_set,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

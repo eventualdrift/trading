@@ -138,7 +138,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 198 tests
+pytest -q              # 204 tests
 ```
 
 ### 1. Configure
@@ -351,6 +351,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | | |
 |---|---|
 | `tradebot init` | create `config.yaml` and `.env` |
+| `tradebot config-set costs.fee_rate=0.00075 core.fraction=0.65 ...` | change settings in `config.yaml`: edits only those lines, keeps comments, backs up, refuses invalid values |
 | `tradebot learn` | self-learning cycle (data → selection → ML) |
 | `tradebot backtest [--strategy trend] [--timeframe 4h] [--symbols BTC/USDT] [--trades-csv out.csv]` | portfolio backtest |
 | `tradebot scan` | current opportunities, no trading |
@@ -401,7 +402,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            198 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            204 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 
