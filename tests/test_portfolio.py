@@ -105,3 +105,22 @@ def test_portfolio_backtest_reports_the_satellite_measurement():
                    "OOS   36 trades", "Correlation, core vs satellite", "NOT the coins listed at the time",
                    "Core at same exposure", "Satellite entries: market", "marked to market"):
         assert needle in text, needle
+
+
+def test_full_slots_are_filled_in_the_live_bots_order():
+    """Same-day candidates compete for slots by reward:risk (the live scanner's rank), not by name."""
+    from tradebot.backtest.engine import portfolio_simulation
+    from tradebot.portfolio import simulate_satellite
+
+    idx = pd.date_range("2022-01-01", periods=30, freq="D", tz="UTC")
+    same_day = []
+    for sym, rr in (("AAA/USDT", 1.5), ("BBB/USDT", 8.0), ("CCC/USDT", 2.0), ("DDD/USDT", 8.0)):
+        t = trade(sym, 5, 10, 100.0, 105.0)
+        t.signal_rr = rr
+        same_day.append(t)
+    cfg = BotConfig()
+    run = simulate_satellite(same_day, cfg, idx)
+    _, taken = portfolio_simulation(same_day, risk_per_trade_pct=1.0, max_position_pct=30.0,
+                                    max_open_positions=3, start_equity=1.0)
+    expected = {"BBB/USDT", "DDD/USDT", "CCC/USDT"}  # the two 8R setups, then 2R; AAA (1.5R) waits
+    assert {t.symbol for t in run.taken} == expected == {t.symbol for t in taken}

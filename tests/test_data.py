@@ -56,3 +56,20 @@ def test_store_save_is_atomic_and_leaves_no_temp_files(tmp_path):
     folder = store.path("AAA/USDT", "1h").parent
     assert [f.name for f in folder.iterdir()] == ["AAA_USDT.csv.gz"]
     assert len(store.load("AAA/USDT", "1h")) == len(df)
+
+
+def test_universe_skips_stablecoins_including_unlisted_pegged_ones():
+    from tradebot.data import ExchangeClient
+
+    client = ExchangeClient("binance", market_type="spot")
+    mk = lambda base: {"base": base, "quote": "USDT", "spot": True, "active": True}  # noqa: E731
+    client._markets = {f"{b}/USDT": mk(b) for b in ("BTC", "RLUSD", "NEWUSD", "SOL", "ETH3L")}
+    tickers = {
+        "BTC/USDT": {"quoteVolume": 9e9, "high": 101_000, "low": 99_000, "last": 100_000},
+        "RLUSD/USDT": {"quoteVolume": 8e9, "high": 1.0004, "low": 0.9998, "last": 1.0001},  # known stablecoin
+        "NEWUSD/USDT": {"quoteVolume": 7e9, "high": 1.001, "low": 0.999, "last": 1.0},  # unknown, but pegged
+        "SOL/USDT": {"quoteVolume": 6e9, "high": 210, "low": 196, "last": 205},
+        "ETH3L/USDT": {"quoteVolume": 5e9, "high": 2, "low": 1, "last": 1.5},  # leveraged token
+    }
+    client.ex.fetch_tickers = lambda *a, **k: tickers
+    assert client.top_symbols("USDT", 10) == ["BTC/USDT", "SOL/USDT"]

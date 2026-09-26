@@ -74,6 +74,7 @@ class Trade:
     r_multiple: float
     return_pct: float
     stop_pct: float  # initial risk as a fraction of entry price
+    signal_rr: float = 0.0  # reward:risk at the signal close - how the live bot ranks same-time signals
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -271,6 +272,7 @@ def backtest_populated(
                 r_multiple=out.r_multiple,
                 return_pct=out.return_pct,
                 stop_pct=abs(out.entry_price - sl) / out.entry_price,
+                signal_rr=reward_risk(side, c[i], sl, tp),
             )
         )
         i = max(out.exit_idx, i + 1)
@@ -282,6 +284,12 @@ def backtest(
 ) -> tuple[list[Trade], pd.DataFrame]:
     pop = strategy.populate(df, context, kwargs.get("timeframe") or None)
     return backtest_populated(pop, strategy, costs, **kwargs), pop
+
+
+def live_order(t: "Trade") -> tuple:
+    """Order candidates like the live bot: by time, then the scanner's rank (reward:risk without
+    the ML filter), so when slots run out the same trades are taken as live would take."""
+    return (t.entry_time, -t.signal_rr, t.symbol)
 
 
 def portfolio_simulation(
@@ -301,7 +309,7 @@ def portfolio_simulation(
     curve = {}
     open_: list[tuple[Trade, float]] = []  # (trade, pnl)
     taken: list[Trade] = []
-    for t in sorted(trades, key=lambda t: (t.entry_time, t.symbol)):
+    for t in sorted(trades, key=live_order):
         still_open = []
         for ot, pnl in sorted(open_, key=lambda x: x[0].exit_time):
             if ot.exit_time <= t.entry_time:

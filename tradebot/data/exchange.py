@@ -14,10 +14,18 @@ from ..timeframes import tf_ms
 log = logging.getLogger(__name__)
 
 STABLECOINS = {
-    "USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDP", "USDD", "PYUSD", "USDE", "USD1",
+    "USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDP", "USDD", "PYUSD", "USDE", "USD1", "RLUSD",
+    "USDS", "FRAX", "LUSD", "GUSD", "EURC", "USDG", "BFUSD", "XUSD", "USD0", "SUSD", "EURT",
     "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "ZAR", "UST", "USTC", "PAXG", "XAUT", "WBTC", "WBETH",
 }
 LEVERAGED = re.compile(r"(UP|DOWN|BULL|BEAR|\d+[LS])$")
+PEGGED_RANGE = 0.003  # a 24h high-low range under 0.3% of the price: a pegged coin, not a trading candidate
+
+
+def looks_pegged(ticker: dict) -> bool:
+    """Catches stablecoins missing from the list: real coins never trade in a 0.3% daily range."""
+    hi, lo, last = ticker.get("high"), ticker.get("low"), ticker.get("last")
+    return bool(hi and lo and last) and (hi - lo) / last < PEGGED_RANGE
 
 
 def ohlcv_to_df(rows: list[list[Any]]) -> pd.DataFrame:
@@ -144,7 +152,7 @@ class ExchangeClient:
             if not m or not m.get("active", True) or m.get("quote") != quote or not m.get("spot", True):
                 continue
             base = m.get("base", "")
-            if base in STABLECOINS or LEVERAGED.search(base) or sym in (blacklist or []):
+            if base in STABLECOINS or LEVERAGED.search(base) or sym in (blacklist or []) or looks_pegged(t):
                 continue
             qv = t.get("quoteVolume") or (t.get("baseVolume") or 0) * (t.get("last") or 0)
             if qv and qv >= min_quote_volume:

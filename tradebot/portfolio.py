@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .backtest.engine import Costs, Trade
+from .backtest.engine import Costs, Trade, live_order
 from .backtest.metrics import max_drawdown_pct
 from .config import BotConfig
 from .core import simulate_core_detail
@@ -81,7 +81,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     booked: list[tuple[Trade, float, float]] = []
     skipped: dict[str, list[Trade]] = {}
     sizes = []
-    for t in sorted(trades, key=lambda t: (t.entry_time, t.symbol)):
+    for t in sorted(trades, key=live_order):
         still = []
         for item in sorted(open_, key=lambda x: x[0].exit_time):
             if item[0].exit_time <= t.entry_time:
