@@ -228,4 +228,15 @@ def test_report_compares_each_window_including_from_the_satellites_first_trade()
     res = portfolio_backtest(closes, trades, BotConfig(), capital=1000, fraction=0.65, since="2021-06-01")
     text = format_portfolio_backtest(res)
     assert "dip low" in text and text.count("Rule (65/35 must beat core at same exposure") == 3
-    assert "From the satellite's first trade (2022-02-05" in text
+    assert "From the satellite's first trade (2022-02-05) - THE WINDOW THAT MEASURES THE SATELLITE" in text
+    assert text.count("Break-even (all in this window)") == 1
+
+
+def test_rule_line_says_when_dips_predate_the_satellite():
+    idx = pd.date_range("2021-01-01", periods=700, freq="D", tz="UTC")
+    crash = np.r_[np.linspace(100, 200, 100), np.linspace(200, 80, 60), np.linspace(80, 300, 540)]  # dip in 2021
+    closes = {"BTC/USDT": pd.Series(crash, index=idx), "ETH/USDT": pd.Series(crash / 2, index=idx)}
+    trades = [trade("SOL/USDT", d, d + 8, 10.0, 10.6, start="2021-01-01") for d in range(500, 690, 6)]
+    text = format_portfolio_backtest(portfolio_backtest(closes, trades, BotConfig(), capital=1000, fraction=0.65,
+                                                        since=None))
+    assert "this dip comparison does not measure the satellite" in text

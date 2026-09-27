@@ -467,7 +467,12 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
     matched_name = "Core at same exposure"
     combined_name = f"Combined ({res.fraction:.0%} core)"
 
-    def table(title: str, start: pd.Timestamp | None) -> list[str]:
+    sat_first = None
+    if res.satellite_from is not None:
+        sat_first = pd.Timestamp(res.satellite_from)
+        sat_first = (sat_first.tz_localize("UTC") if sat_first.tz is None else sat_first.tz_convert("UTC")).floor("D")
+
+    def table(title: str, start: pd.Timestamp | None, measures_satellite: bool = False) -> list[str]:
         out = [title, f"  {'':<28}{'end value':>12}{'total':>10}{'per year':>10}{'worst dip':>11}{'dip low':>12}"
                       f"{'Sharpe':>8}{'exposure':>10}"]
         exposure = {combined_name: res.combined_exposure, "Core only": res.core_exposure,
@@ -509,6 +514,20 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
                        f"-{cdip:.1f}% ({ctop:%Y-%m-%d} to {clow:%Y-%m-%d}) vs -{mdip:.1f}% "
                        f"({mtop:%Y-%m-%d} to {mlow:%Y-%m-%d}) -> {'yes' if dip_ok else 'no'}. 65/35 {verdict}; "
                        f"with margins of +0.10 Sharpe or 3 points: {'yes' if margin_ok else 'no'}.")
+            if sat_first is not None and clow < sat_first and mlow < sat_first:
+                out.append(f"  Both worst dips bottomed before the satellite's first trade ({sat_first:%Y-%m-%d}), when it "
+                           f"was only cash: this dip comparison does not measure the satellite.")
+        if measures_satellite and "Satellite only" in seen and "Core only" in seen:
+            core_c, sat_c = res.curves["Core only"].dropna(), res.curves["Satellite only"].dropna()
+            if start is not None:
+                core_c, sat_c = core_c[core_c.index >= start], sat_c[sat_c.index >= start]
+            rho, _ = _corr(core_c, sat_c)
+            s_sat, s_core = seen["Satellite only"][0]["sharpe"], seen["Core only"][0]["sharpe"]
+            if rho is not None:
+                need = rho * s_core
+                out.append(f"  Break-even (all in this window): the satellite lifts the account's Sharpe only if its "
+                           f"Sharpe beats correlation x core Sharpe: {s_sat:.2f} vs {rho:.2f} x {s_core:.2f} = "
+                           f"{need:.2f} -> {'yes' if s_sat > need else 'no'}.")
         return out
 
     any_curve = next(iter(res.curves.values())).dropna()
@@ -520,12 +539,10 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
     lines += table(f"\nFull history ({any_curve.index[0]:%Y-%m-%d} to {any_curve.index[-1]:%Y-%m-%d}):", None)
     if res.since is not None and res.since > any_curve.index[0]:
         lines += table(f"\nSince {res.since:%Y-%m-%d} (each rebased to {res.capital:,.0f}):", res.since)
-    if res.satellite_from is not None:
-        first = pd.Timestamp(res.satellite_from)
-        first = (first.tz_localize("UTC") if first.tz is None else first.tz_convert("UTC")).floor("D")
-        if first > any_curve.index[0]:
-            lines += table(f"\nFrom the satellite's first trade ({first:%Y-%m-%d}; before it the satellite is cash, "
-                           f"so this window compares like with like - benchmark re-matched to it):", first)
+    if sat_first is not None and sat_first > any_curve.index[0]:
+        lines += table(f"\nFrom the satellite's first trade ({sat_first:%Y-%m-%d}) - THE WINDOW THAT MEASURES THE "
+                       f"SATELLITE (before it the satellite is only cash; benchmark re-matched to this window):",
+                       sat_first, measures_satellite=True)
     lines.append(f"\n'{matched_name}' holds the core at the combined account's average exposure (the rest in "
                  f"cash): what 65/35 must beat on Sharpe or worst dip for the satellite to add anything.")
     lines.append("\nYear by year (%):")
