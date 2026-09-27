@@ -147,7 +147,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 224 tests
+pytest -q              # 225 tests
 ```
 
 ### 1. Configure
@@ -374,7 +374,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | bad-data guard: skip frozen feeds, confirm any >10% jump on the next poll, ignore stale prices | on |
 | BTC volatility breaker: no new entries while BTC's recent volatility is 2.5× normal | off until `tradebot research breaker` supports it |
 | coins traded: most liquid by 24h volume; stablecoins, pegged coins (24h range < 0.3%) and leveraged tokens skipped; optionally only coins listed ≥ `universe.min_history_days` | same rule in learning, backtests and live |
-| when more signals arrive than slots are free | best reward:risk first - in live and in every backtest |
+| when more signals arrive than slots are free | the live order, mirrored by every backtest: at a shared close the shorter timeframe first (4h before 1d), then best reward:risk, ties by 24h volume rank |
 
 ## Commands
 
@@ -443,7 +443,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            224 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            225 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

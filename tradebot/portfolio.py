@@ -75,7 +75,8 @@ class SatelliteRun:
 
 def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIndex,
                        closes: dict[str, pd.Series] | None = None,
-                       open_risk_pct: float | None | str = "config") -> SatelliteRun:
+                       open_risk_pct: float | None | str = "config",
+                       symbol_rank: dict[str, int] | None = None) -> SatelliteRun:
     """Replay the satellite's trades like the live account and mark open ones to market daily.
 
     ``open_risk_pct``: the open-risk budget rule instead of max_open_positions (default: whatever
@@ -96,7 +97,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     def key(tr: Trade) -> str:
         return f"{tr.strategy}@{tr.timeframe}"
 
-    for t in sorted(trades, key=live_order):
+    for t in sorted(trades, key=lambda tr: live_order(tr, symbol_rank)):
         still = []
         for item in sorted(open_, key=lambda x: x[0].exit_time):
             if item[0].exit_time <= t.entry_time:
@@ -282,7 +283,8 @@ def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade
     core = detail["equity"] / capital
     core_exp = (detail["invested"] / detail["equity"]).fillna(0.0)
     index = core.index
-    sat = simulate_satellite(sat_trades, cfg, index, sat_closes, open_risk_pct=budget)
+    rank = {s: i for i, s in enumerate((universe or {}).get("symbols") or [])}  # volume order, like live
+    sat = simulate_satellite(sat_trades, cfg, index, sat_closes, open_risk_pct=budget, symbol_rank=rank)
     parts = combine_sleeves_detail(core, sat.equity, fraction, cfg.core.rebalance_sleeves_days, capital)
     combined_exp = (parts["core"] * core_exp + parts["satellite"] * sat.exposure) / parts["total"]
     closes = pd.DataFrame({k: pd.Series(v.to_numpy(dtype=float), index=_ns(v.index)) for k, v in core_closes.items()})

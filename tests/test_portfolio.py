@@ -192,3 +192,21 @@ def test_skips_are_attributed_to_same_close_ranking_or_slots_already_full():
     text = format_portfolio_backtest(portfolio_backtest(closes, held + [late] + same, BotConfig(),
                                                         capital=1000, fraction=0.65, since=None))
     assert "Why slots were full" in text and "slots held by momentum@4h 100%" in text
+
+
+def test_shared_close_follows_the_live_scan_order():
+    """At 00:00 UTC the live bot scans 4h before 1d, and breaks rank ties in universe (volume) order."""
+    from tradebot.portfolio import simulate_satellite
+
+    idx = pd.date_range("2022-01-01", periods=30, freq="D", tz="UTC")
+    four_h = trade("ZZZ/USDT", 5, 10, 100.0, 101.0)
+    four_h.timeframe, four_h.signal_rr = "4h", 2.0  # low reward:risk, but its scan runs first
+    daily = []
+    for s in ("AAA/USDT", "BBB/USDT", "CCC/USDT"):
+        t = trade(s, 5, 10, 100.0, 101.0)
+        t.strategy, t.signal_rr = "momentum", 8.0
+        daily.append(t)
+    rank = {"CCC/USDT": 0, "BBB/USDT": 1, "AAA/USDT": 2}  # CCC and BBB trade more volume than AAA
+    run = simulate_satellite([four_h] + daily, BotConfig(), idx, open_risk_pct=None, symbol_rank=rank)
+    assert {t.symbol for t in run.taken} == {"ZZZ/USDT", "CCC/USDT", "BBB/USDT"}
+    assert [d["trade"].symbol for d in run.skip_detail] == ["AAA/USDT"]

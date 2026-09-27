@@ -295,10 +295,13 @@ def backtest(
     return backtest_populated(pop, strategy, costs, **kwargs), pop
 
 
-def live_order(t: "Trade") -> tuple:
-    """Order candidates like the live bot: by time, then the scanner's rank (reward:risk without
-    the ML filter), so when slots run out the same trades are taken as live would take."""
-    return (t.entry_time, -t.signal_rr, t.symbol)
+def live_order(t: "Trade", rank: dict[str, int] | None = None) -> tuple:
+    """Order candidates exactly as the live bot handles them, so when slots run out the same
+    trades are taken: by time; at a shared close the shorter timeframe's scan runs first (4h
+    before 1d); within a scan by the scanner's rank (reward:risk without the ML filter), ties in
+    universe order (``rank``: symbol -> position in the volume-ranked list), then by name."""
+    tf = tf_ms(t.timeframe) if t.timeframe else 0
+    return (t.entry_time, tf, -t.signal_rr, (rank or {}).get(t.symbol, 1 << 30), t.symbol)
 
 
 def portfolio_simulation(
