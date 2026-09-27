@@ -186,12 +186,13 @@ def simulate_core(daily_closes: dict[str, pd.Series], cfg: CoreConfig, costs: Co
 
 def simulate_core_detail(daily_closes: dict[str, pd.Series], cfg: CoreConfig, costs: Costs,
                          start_equity: float = 1000.0) -> pd.DataFrame:
-    """simulate_core, plus the value held in coins each day (column ``invested``)."""
+    """simulate_core, plus per day: the value held in coins (``invested``), the number of trades
+    (``trades``) and the fees + slippage paid (``costs``)."""
     frame = pd.DataFrame(daily_closes).dropna(how="all").sort_index()
     weights = {s: trend_weights_series(frame[s].dropna(), cfg.sma_days).reindex(frame.index) for s in frame}
     n = max(len(frame.columns), 1)
     cash, qty = float(start_equity), {s: 0.0 for s in frame}
-    out, invested = [], []
+    out, invested, n_trades, paid = [], [], [], []
     buy_cost = (1 + costs.fee_rate) * (1 + costs.slippage_rate)
     for day, row in frame.iterrows():
         prices = {s: float(p) for s, p in row.items() if p == p}
@@ -206,6 +207,7 @@ def simulate_core_detail(daily_closes: dict[str, pd.Series], cfg: CoreConfig, co
             delta = slot * w - qty[s] * prices[s]
             if abs(delta) >= threshold:
                 plans.append((delta, s))
+        traded, cost = 0, 0.0
         for delta, s in sorted(plans):
             px = prices[s]
             if delta < 0:
@@ -213,14 +215,20 @@ def simulate_core_detail(daily_closes: dict[str, pd.Series], cfg: CoreConfig, co
                 fill = px * (1 - costs.slippage_rate)
                 cash += fill * q * (1 - costs.fee_rate)
                 qty[s] -= q
+                cost += q * (px - fill) + fill * q * costs.fee_rate
             else:
                 spend = min(delta, cash / buy_cost)
                 fill = px * (1 + costs.slippage_rate)
                 q = spend / px
                 cash -= fill * q * (1 + costs.fee_rate)
                 qty[s] += q
+                cost += q * (fill - px) + fill * q * costs.fee_rate
+            traded += q > 0
         held = sum(qty[s] * prices.get(s, 0.0) for s in qty)
         out.append(cash + held)
         invested.append(held)
-    return pd.DataFrame({"equity": np.array(out, dtype=float), "invested": np.array(invested, dtype=float)},
+        n_trades.append(traded)
+        paid.append(cost)
+    return pd.DataFrame({"equity": np.array(out, dtype=float), "invested": np.array(invested, dtype=float),
+                         "trades": np.array(n_trades, dtype=int), "costs": np.array(paid, dtype=float)},
                         index=frame.index)

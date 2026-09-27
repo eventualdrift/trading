@@ -127,6 +127,19 @@ it's chance. It also reruns the core with its 50/100/150/200-day averages scaled
 It prints only the spread (min / median / max) and never picks a variant; the bot keeps its
 settings.
 
+**An out-of-sample test of the core.** None of our backtests used BTC history before our
+Binance data starts (2017-08-17). `tradebot research oos-*` tests the live core rule, on BTC
+only, against buy-and-hold on Bitstamp's BTC/USD daily history up to 2017-08-16. The steps
+run in a fixed order:
+1. `oos-fetch` saves the raw candles and prints a data-quality summary: gaps, zero-volume days,
+   bad prints and the largest moves. It shows no results.
+2. `oos-register` writes the protocol and the data file's SHA-256 to the research ledger. The
+   protocol covers the cleaning rule, costs of 0.5% per side, the benchmark, the pass rule and
+   the reading of each outcome.
+3. `oos-run` runs only if registered, only on that exact file, and only once.
+
+`oos-show` prints the recorded result.
+
 **Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
 backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
 date, and saves both (with the selected strategies) to `reports/universe-<date>.json`. Rerun on
@@ -165,7 +178,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 234 tests
+pytest -q              # 240 tests
 ```
 
 ### 1. Configure
@@ -410,6 +423,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot research breaker [--ratios 2 2.5 3]` | evaluate the volatility breaker on real data |
 | `tradebot research sizing` | the pre-registered one-time test of the open-risk budget rule |
 | `tradebot research core [--universe-file f]` | core robustness, reporting only: all 30 sleeve-reset phases and the trend lengths scaled 0.8x/1.2x |
+| `tradebot research oos-fetch` → `oos-register` → `oos-run` (→ `oos-show`) | the one-time out-of-sample test of the core's rule on Bitstamp BTC/USD before 2017, in that order |
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
 | `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
 | `tradebot telegram-test` | Telegram setup helper |
@@ -462,7 +476,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            234 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            240 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

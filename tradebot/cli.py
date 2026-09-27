@@ -242,6 +242,8 @@ def cmd_research(args, cfg):
     from .learning import load_brain, load_context, load_datasets
     from .research import add_note, breaker_study, format_breaker_study
 
+    if args.topic.startswith("oos-"):
+        return _research_oos(args, cfg)
     if args.topic == "note":
         if not args.id or not args.text:
             sys.exit("usage: tradebot research note --id <test id> --text \"...\"")
@@ -344,6 +346,49 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                 universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
             "universe": universe}
+
+
+def _research_oos(args, cfg):
+    """The pre-2017 BTC out-of-sample test: fetch -> register -> run (once) -> show."""
+    from . import oos
+    from .provenance import code_version
+
+    step = args.topic
+    if step == "oos-fetch":
+        if args.synthetic:
+            sys.exit("the out-of-sample test uses real Bitstamp data only")
+        from .data import ExchangeClient
+
+        path = oos.fetch(ExchangeClient("bitstamp", market_type="spot"), cfg.data.dir)
+        print(oos.quality_summary(path))
+        print("\nNext: check the summary, then register the protocol: tradebot research oos-register")
+    elif step == "oos-register":
+        print(oos.format_protocol())
+        path = oos.data_path(cfg.data.dir)
+        if not path.exists():
+            sys.exit("\nNo data yet - run: tradebot research oos-fetch")
+        try:
+            reg = oos.register(cfg.state_path, cfg.data.dir, code_version())
+        except RuntimeError as exc:
+            sys.exit(f"\nNOT registered: {exc}")
+        print(f"\nRegistered {reg['registered_at']} with data SHA-256 {reg['data_sha256']} (code {reg['code']}). "
+              f"The run will refuse any other data. Next: tradebot research oos-run")
+    elif step == "oos-run":
+        try:
+            res = oos.run(cfg.state_path, cfg.data.dir, code_version())
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+        print(oos.format_result(res))
+        print("\nRecorded in the research ledger. This test does not run again.")
+    elif step == "oos-show":
+        res = oos.result(cfg.state_path)
+        reg = oos.registration(cfg.state_path)
+        if res:
+            print(oos.format_result(res))
+        elif reg:
+            print(f"Registered {reg['registered_at']} (data SHA-256 {reg['data_sha256']}); not run yet.")
+        else:
+            print("Not registered yet.")
 
 
 def _research_core(args, cfg, selection):
@@ -527,10 +572,12 @@ def main(argv: list[str] | None = None) -> None:
                     help="rerun on a saved coin list and data end date (reports/universe-*.json)")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
-    sp.add_argument("topic", choices=["breaker", "sizing", "core", "note"],
+    sp.add_argument("topic", choices=["breaker", "sizing", "core", "note", "oos-fetch", "oos-register", "oos-run",
+                                      "oos-show"],
                     help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget "
                          "test; core: robustness of the core (reset timing, trend lengths) - reporting only; "
-                         "note: annotate a recorded test (--id, --text)")
+                         "note: annotate a recorded test (--id, --text); oos-fetch / oos-register / oos-run / "
+                         "oos-show: the pre-2017 BTC out-of-sample test of the core, in that order")
     sp.add_argument("--id", default=None, help="note: the test id, e.g. sizing-open-risk-budget-v1")
     sp.add_argument("--text", default=None, help="note: the text to add")
     sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])
