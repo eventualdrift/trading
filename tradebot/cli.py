@@ -253,6 +253,8 @@ def cmd_research(args, cfg):
         sys.exit("No validated strategies yet - run `tradebot learn` first.")
     if args.topic == "sizing":
         return _research_sizing(args, cfg, selection)
+    if args.topic == "core":
+        return _research_core(args, cfg, selection)
     market = _market(cfg, args.synthetic)
     frozen = None
     if args.universe_file:
@@ -325,7 +327,9 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                                  code=code, config=snap)
         universe = {"source": source, "symbols": symbols, "first": first, "data_end_ms": data_end,
                     "file": path, "frozen": bool(frozen), "code": code, "config": snap,
-                    "config_hash": config_hash(snap)}
+                    "config_hash": config_hash(snap), "selection_now": keys,
+                    "selection_created": selection.created_at,
+                    "selection_saved": (frozen or {}).get("selection")}
         if frozen:
             universe["saved_code"] = frozen.get("code")
             saved_cfg = frozen.get("config")
@@ -340,6 +344,32 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                 universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
             "universe": universe}
+
+
+def _research_core(args, cfg, selection):
+    from .core_research import format_core_robustness, reset_phase_study, sma_scale_study
+    from .portfolio import _universe_lines, portfolio_backtest
+
+    fraction = cfg.core.fraction or 0.65
+    cfg.core.fraction = fraction
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
+    res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
+                             since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
+                             universe=x["universe"])
+    print(format_core_robustness(res, reset_phase_study(res), sma_scale_study(x["core_closes"], res, cfg), cfg))
+    print("\n".join([""] + _universe_lines(res)))
+    if not args.synthetic:
+        import json
+
+        folder = cfg.state_path / "research"
+        folder.mkdir(parents=True, exist_ok=True)
+        u = x["universe"] or {}
+        with open(folder / "ledger.jsonl", "a") as fh:  # what was looked at, for the variant count
+            fh.write(json.dumps({"id": "core-robustness", "kind": "report", "ran_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "variants_looked_at": {"reset_phases": int(res.reset_days),
+                                                        "sma_scales": [0.8, 1.0, 1.2]},
+                                 "selected": None, "universe_file": u.get("file"),
+                                 "data_end_ms": u.get("data_end_ms"), "code": u.get("code")}) + "\n")
 
 
 def _research_sizing(args, cfg, selection):
@@ -497,9 +527,10 @@ def main(argv: list[str] | None = None) -> None:
                     help="rerun on a saved coin list and data end date (reports/universe-*.json)")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
-    sp.add_argument("topic", choices=["breaker", "sizing", "note"],
+    sp.add_argument("topic", choices=["breaker", "sizing", "core", "note"],
                     help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget "
-                         "test; note: annotate a recorded test (--id, --text)")
+                         "test; core: robustness of the core (reset timing, trend lengths) - reporting only; "
+                         "note: annotate a recorded test (--id, --text)")
     sp.add_argument("--id", default=None, help="note: the test id, e.g. sizing-open-risk-budget-v1")
     sp.add_argument("--text", default=None, help="note: the text to add")
     sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])

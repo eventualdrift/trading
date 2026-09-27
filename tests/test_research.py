@@ -52,3 +52,23 @@ def test_cli_research_sizing_runs_once(tmp_path, monkeypatch, capsys, already_ra
     else:
         assert "VERDICT:" in out and "Pre-registered sizing test" in out and "not recorded" in out
         assert previous_result(state) is None  # synthetic data never uses up the one-time test
+
+
+def test_cli_research_core_reports_without_changing_anything(tmp_path, monkeypatch, capsys):
+    from tradebot.backtest.selection import ComboResult, Selection
+    from tradebot.cli import main
+    from tradebot.learning import SELECTION_FILE
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    Selection(0.0, [ComboResult("momentum", "1d", {}, {}, {}, 1, 1.0, True)]).save(state / SELECTION_FILE)
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"state_dir: {state}\ntimeframes: [1d]\nuniverse:\n  top_n: 3\nml:\n  enabled: false\n"
+                    "data:\n  history_days: {1d: 700}\n")
+    before = conf.read_text()
+    main(["--config", str(conf), "--env", str(tmp_path / "none.env"), "research", "core", "--synthetic",
+          "--days", "700"])
+    out = capsys.readouterr().out
+    assert "Core robustness - REPORTING ONLY" in out and "Trend lengths scaled" in out
+    assert conf.read_text() == before and not (state / "research").exists()  # synthetic: nothing recorded

@@ -121,6 +121,12 @@ and from the satellite's first trade), a rule line gives:
 The window from the satellite's first trade is the like-for-like one: before that date the
 satellite is only cash, and the benchmark is re-matched to that window.
 
+**How robust is the core?** `tradebot research core` replays the 65/35 account with each of
+the 30 possible sleeve-reset phases; in live the phase is set by the day the core started, so
+it's chance. It also reruns the core with its 50/100/150/200-day averages scaled by 0.8 and 1.2.
+It prints only the spread (min / median / max) and never picks a variant; the bot keeps its
+settings.
+
 **Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
 backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
 date, and saves both (with the selected strategies) to `reports/universe-<date>.json`. Rerun on
@@ -159,7 +165,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 230 tests
+pytest -q              # 234 tests
 ```
 
 ### 1. Configure
@@ -403,6 +409,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot portfolio-backtest [--capital 1000] [--core-fraction 0.65] [--since 2022-01-01]` | core + satellite account vs holding BTC |
 | `tradebot research breaker [--ratios 2 2.5 3]` | evaluate the volatility breaker on real data |
 | `tradebot research sizing` | the pre-registered one-time test of the open-risk budget rule |
+| `tradebot research core [--universe-file f]` | core robustness, reporting only: all 30 sleeve-reset phases and the trend lengths scaled 0.8x/1.2x |
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
 | `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
 | `tradebot telegram-test` | Telegram setup helper |
@@ -455,7 +462,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            230 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            234 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

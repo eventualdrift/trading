@@ -196,12 +196,22 @@ def satellite_daily(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIndex
     return simulate_satellite(trades, cfg, index, closes).equity
 
 
+def _last_scheduled_reset(first: pd.Timestamp, anchor: pd.Timestamp | None, reset_days: float) -> pd.Timestamp:
+    """The reset schedule is anchor, anchor + N days, ...: the last scheduled reset on or before ``first``."""
+    if anchor is None or reset_days <= 0:
+        return first
+    periods = (first - anchor).days // int(reset_days)
+    return anchor + pd.Timedelta(days=int(periods * int(reset_days)))
+
+
 def combine_sleeves_detail(core: pd.Series, satellite: pd.Series, fraction: float, reset_days: float,
-                           capital: float) -> pd.DataFrame:
+                           capital: float, anchor: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Two sleeves compounding separately, reset to the split every ``reset_days``. ``anchor`` fixes
+    the reset schedule in calendar time (default: the first day), so windows share one schedule."""
     rc = core.pct_change().fillna(0.0).to_numpy()
     rs = satellite.pct_change().fillna(0.0).to_numpy()
     ec, es = capital * fraction, capital * (1 - fraction)
-    last_reset = core.index[0]
+    last_reset = _last_scheduled_reset(core.index[0], anchor, reset_days)
     rows = []
     for i, day in enumerate(core.index):
         ec *= 1 + rc[i]
@@ -215,8 +225,8 @@ def combine_sleeves_detail(core: pd.Series, satellite: pd.Series, fraction: floa
 
 
 def combine_sleeves(core: pd.Series, satellite: pd.Series, fraction: float, reset_days: float,
-                    capital: float) -> pd.Series:
-    return combine_sleeves_detail(core, satellite, fraction, reset_days, capital)["total"]
+                    capital: float, anchor: pd.Timestamp | None = None) -> pd.Series:
+    return combine_sleeves_detail(core, satellite, fraction, reset_days, capital, anchor)["total"]
 
 
 # ------------------------------------------------------------------ report
@@ -271,14 +281,15 @@ def account_stats(res: "PortfolioBacktest", start: pd.Timestamp | None) -> dict[
 
 
 def _matched_core(core: pd.Series, core_exp: pd.Series, target_exp: pd.Series, reset_days: float,
-                  capital: float, start: pd.Timestamp | None) -> tuple[pd.Series, float]:
+                  capital: float, start: pd.Timestamp | None,
+                  anchor: pd.Timestamp | None = None) -> tuple[pd.Series, float]:
     """Core-only held at the combined account's average exposure (the rest in cash)."""
     if start is not None:
         core, core_exp, target_exp = (x[x.index >= start] for x in (core, core_exp, target_exp))
     avg_core = float(core_exp.mean())
     k = min(float(target_exp.mean()) / avg_core, 1.0) if avg_core > 0 else 0.0
     cash = pd.Series(1.0, index=core.index)
-    return combine_sleeves(core / core.iloc[0], cash, k, reset_days, capital), k
+    return combine_sleeves(core / core.iloc[0], cash, k, reset_days, capital, anchor), k
 
 
 def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade], cfg: BotConfig, *,
@@ -347,6 +358,10 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
                 f"flatters the satellite).")
         out.append(line)
         out.append("    Coins: " + ", ".join(s.split("/")[0] for s in syms))
+        if u.get("selection_now"):
+            made = u.get("selection_created")
+            made_txt = f" (selected by learn on {pd.Timestamp(made, unit='s', tz='UTC'):%Y-%m-%d %H:%M} UTC)" if made else ""
+            out.append(f"    Strategies: {', '.join(u['selection_now'])}{made_txt}")
         if u.get("data_end_ms"):
             out.append(f"    Data to {pd.Timestamp(u['data_end_ms'], unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC"
                        + (" (frozen: from the universe file)" if u.get("frozen") else ""))
@@ -536,6 +551,12 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
     if res.assumptions:
         lines.append(f"Satellite {res.assumptions[0].lower()}{res.assumptions[1:]} Core: market orders "
                      f"(taker fee + slippage). Satellite marked to market daily.")
+    u = res.universe or {}
+    saved_sel, now_sel = u.get("selection_saved"), u.get("selection_now")
+    if saved_sel and now_sel and sorted(saved_sel) != sorted(now_sel):
+        lines.append(f"NOTE: the strategy selection differs from the saved run's (then: {', '.join(saved_sel)}; now: "
+                     f"{', '.join(now_sel)}). The selection was made on this same data, so any change in the satellite's "
+                     f"result from adding or dropping a strategy is in-sample - not new evidence for the satellite.")
     lines += table(f"\nFull history ({any_curve.index[0]:%Y-%m-%d} to {any_curve.index[-1]:%Y-%m-%d}):", None)
     if res.since is not None and res.since > any_curve.index[0]:
         lines += table(f"\nSince {res.since:%Y-%m-%d} (each rebased to {res.capital:,.0f}):", res.since)
