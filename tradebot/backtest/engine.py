@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from ..strategies.base import Strategy
+from ..timeframes import tf_ms
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class TradeOutcome:
     r_multiple: float
     return_pct: float  # net return on notional as a fraction (0.01 = +1%)
     complete: bool  # False if the data ran out before the trade finished
+    protected_idx: int | None = None  # bar whose close moved the stop to entry (it can no longer lose)
 
 
 @dataclass
@@ -75,11 +77,13 @@ class Trade:
     return_pct: float
     stop_pct: float  # initial risk as a fraction of entry price
     signal_rr: float = 0.0  # reward:risk at the signal close - how the live bot ranks same-time signals
+    protected_time: pd.Timestamp | None = None  # when the stop reached entry (None: never)
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        for k in ("signal_time", "entry_time", "exit_time"):
-            d[k] = pd.Timestamp(d[k]).isoformat()
+        for k in ("signal_time", "entry_time", "exit_time", "protected_time"):
+            if d[k] is not None:
+                d[k] = pd.Timestamp(d[k]).isoformat()
         return d
 
 
@@ -134,6 +138,7 @@ def simulate_trade(
     activate_r = breakeven_at_r if breakeven_at_r > 0 else (1.0 if trail else 0.0)
     be_level = entry + sign * activate_r * risk if activate_r > 0 else None
     at_breakeven = False
+    protected_idx = None
     last = min(n - 1, e + max_hold - 1)
 
     exit_idx, exit_price, reason = last, c[last], ""
@@ -167,6 +172,7 @@ def simulate_trade(
             if (long and h[j] >= be_level) or (not long and l[j] <= be_level):
                 stop = entry  # intrabar checks apply from the next bar on
                 at_breakeven = moved = True
+                protected_idx = j
         if at_breakeven and trail:
             new = max(stop, h[j] - trail) if long else min(stop, l[j] + trail)
             moved = moved or new != stop
@@ -195,6 +201,7 @@ def simulate_trade(
         r_multiple=float(ret * entry / risk),
         return_pct=float(ret),
         complete=complete,
+        protected_idx=protected_idx if protected_idx is not None and protected_idx < exit_idx else None,
     )
 
 
@@ -232,6 +239,7 @@ def backtest_populated(
     trail = pop["trail_dist"].to_numpy(dtype=float) if "trail_dist" in pop else np.zeros(len(pop))
     idx = pop.index
     n = len(pop)
+    bar = pd.Timedelta(milliseconds=tf_ms(timeframe)) if timeframe else (idx[1] - idx[0] if n > 1 else pd.Timedelta(0))
     i = strategy.warmup if start_idx is None else max(start_idx, strategy.warmup)
     end = n - 1 if end_idx is None else min(end_idx, n - 1)
     trades: list[Trade] = []
@@ -273,6 +281,7 @@ def backtest_populated(
                 return_pct=out.return_pct,
                 stop_pct=abs(out.entry_price - sl) / out.entry_price,
                 signal_rr=reward_risk(side, c[i], sl, tp),
+                protected_time=(idx[out.protected_idx] + bar) if out.protected_idx is not None else None,
             )
         )
         i = max(out.exit_idx, i + 1)

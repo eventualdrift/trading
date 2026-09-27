@@ -20,6 +20,8 @@ universe:                # which markets the scanner watches
   whitelist: []          # e.g. [BTC/USDT, ETH/USDT, SOL/USDT] to scan only these
   blacklist: []
   refresh_hours: 6
+  min_history_days: 365  # skip coins listed less than a year ago (new listings); the next most
+                         # liquid established coin takes their place. Stablecoins are always skipped.
 
 # Candidate timeframes. The learning cycle backtests every strategy on each one and
 # only trades the combinations that are profitable out-of-sample.
@@ -48,6 +50,8 @@ costs:                   # used by backtests and paper trading - be pessimistic
 risk:
   risk_per_trade_pct: 1.0      # lose at most 1% of the account per trade
   max_open_positions: 3
+  max_open_risk_pct: null      # open-risk budget instead of a position count (paper only) - set it
+                               # only if `tradebot research sizing` passes
   max_position_pct: 30         # no single position above 30% of the account
   max_total_exposure_pct: 100  # never more than the account value in total (no leverage)
   daily_loss_limit_pct: 3      # stop opening trades for the day after -3%

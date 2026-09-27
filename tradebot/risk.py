@@ -12,6 +12,17 @@ from .config import RiskConfig
 from .models import Position, Signal
 
 
+def position_fraction(stop_pct: float, cfg: RiskConfig) -> float:
+    """Position size as a fraction of equity: risk / stop distance, capped per position."""
+    return min(cfg.risk_per_trade_pct / 100.0 / max(stop_pct, 1e-9), cfg.max_position_pct / 100.0)
+
+
+def risk_at_stake(side: str, entry: float, stop: float, amount: float) -> float:
+    """Money lost if the current stop is hit (before costs); 0 once the stop is at or past entry."""
+    per_unit = (entry - stop) if side == "long" else (stop - entry)
+    return max(per_unit, 0.0) * amount
+
+
 @dataclass
 class SizeDecision:
     amount: float
@@ -70,9 +81,19 @@ class RiskManager:
             )
         return SizeDecision(amount, notional, amount * per_unit)
 
-    def entry_block_reason(self, signal: Signal, open_positions: list[Position]) -> str | None:
-        if len(open_positions) >= self.cfg.max_open_positions:
-            return f"max open positions ({self.cfg.max_open_positions}) reached"
+    def entry_block_reason(self, signal: Signal, open_positions: list[Position],
+                           equity: float | None = None) -> str | None:
+        budget = self.cfg.max_open_risk_pct
+        if budget is None:
+            if len(open_positions) >= self.cfg.max_open_positions:
+                return f"max open positions ({self.cfg.max_open_positions}) reached"
+        elif equity is not None and equity > 0:
+            at_stake = sum(risk_at_stake(p.side, p.entry_price, p.stop_loss, p.open_amount) for p in open_positions)
+            stop_pct = abs(signal.entry - signal.stop_loss) / signal.entry if signal.entry > 0 else 1.0
+            new = position_fraction(stop_pct, self.cfg) * stop_pct * equity
+            if at_stake + new > equity * budget / 100.0 + 1e-9:
+                return (f"open-risk budget ({budget:g}%) reached: {at_stake / equity:.1%} at stake "
+                        f"+ {new / equity:.1%} for this trade")
         if any(p.symbol == signal.symbol for p in open_positions):
             return f"already in a {signal.symbol} position"
         if signal.reward_risk < self.cfg.min_reward_risk - 1e-9:

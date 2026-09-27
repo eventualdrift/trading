@@ -21,6 +21,7 @@ from .notify import formatting as fmt
 from .risk import RiskManager
 from .scanner import Scanner
 from .timeframes import index_ms, last_closed_open_ms, tf_ms
+from .universe import select_universe
 
 log = logging.getLogger(__name__)
 
@@ -115,9 +116,7 @@ class TradingBot:
         u = self.cfg.universe
         if not self._symbols or now_ms - self._symbols_at > u.refresh_hours * 3_600_000:
             try:
-                self._symbols = self.market.top_symbols(
-                    self.cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist
-                )
+                self._symbols = select_universe(self.market, self.cfg, now_ms)
                 self._symbols_at = now_ms
             except Exception as exc:
                 log.warning("universe refresh failed: %s", exc)
@@ -276,7 +275,7 @@ class TradingBot:
         burst = self.vol_burst(sig.created_at)
         if burst is not None:
             return burst
-        return self.risk.entry_block_reason(sig, open_positions)
+        return self.risk.entry_block_reason(sig, open_positions, equity)
 
     def vol_burst(self, now_ms: int) -> str | None:
         """Volatility circuit breaker: no new entries while BTC's hourly volatility is a

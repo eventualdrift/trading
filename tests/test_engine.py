@@ -177,3 +177,11 @@ def test_limit_entry_fills_only_when_price_trades_through():
     touch = bars([(100, 101, 99, 100), (100.5, 102, 100.0, 101)])  # only touches 100: no fill
     o, h, l, c = (touch[k].to_numpy() for k in ("open", "high", "low", "close"))
     assert simulate_trade(o, h, l, c, None, 0, "long", 95.0, 110.0, 10, costs) is None
+
+
+def test_protection_is_recorded_when_the_stop_reaches_entry():
+    # entry ~100.05, risk ~5.05: +1R is ~105.1, reached on bar 3; the trade runs on after that
+    rows = BASE + [(101, 103, 100, 102), (102, 106, 101, 105), (105, 107, 104, 106), (106, 108, 105, 107)]
+    out = run(rows, be=1.0, tp=200.0)
+    assert out.protected_idx == 3 and out.reason == "end_of_data"
+    assert run(BASE + [(101, 103, 100, 102)] * 4, be=1.0, tp=200.0).protected_idx is None  # never +1R

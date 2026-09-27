@@ -533,3 +533,33 @@ def test_working_limit_orders_count_toward_limits(cfg):
     other = Signal("ETH/USDT", "1h", "trend", "long", 100.0, 95.0, 110.0, 0, T0, T0 + 3 * MIN, T0 + DAY)
     assert bot.handle_signal(other, T0, 1000.0) is None
     assert "max open positions" in db.recent_signals(1)[0].note
+
+
+def test_open_risk_budget_in_the_bot(sim, cfg):
+    market, db, broker, notes, bot = sim
+    cfg.risk.max_open_risk_pct = 3.0
+    now = market.start_ms + 60 * DAY
+    market.set_now(now)
+
+    def pos(sym, stop):
+        return Position(symbol=sym, timeframe="1h", strategy="breakout", side="long", mode="paper", amount=1.0,
+                        entry_price=100.0, stop_loss=stop, take_profit=150.0, initial_stop=90.0, opened_at=now,
+                        max_hold_until=now + DAY)
+
+    sig = Signal(symbol="NEW/USDT", timeframe="1h", strategy="breakout", side="long", entry=100.0, stop_loss=90.0,
+                 take_profit=130.0, candle_time=now, created_at=now, valid_until=now + DAY, max_hold_until=now + DAY)
+    # equity 1000: each position risks 10 (1%); three fresh ones fill the 3% budget
+    fresh = [pos(s, 90.0) for s in ("A/USDT", "B/USDT", "C/USDT")]
+    assert "open-risk budget" in bot._entry_block(sig, fresh, 1000.0)
+    protected = [pos(s, 100.0) for s in ("A/USDT", "B/USDT", "C/USDT")]  # stops moved to entry
+    assert bot._entry_block(sig, protected + [pos("D/USDT", 90.0)], 1000.0) is None
+
+
+def test_open_risk_budget_is_paper_only(tmp_path, monkeypatch):
+    from tradebot.config import load_config
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    p = tmp_path / "c.yaml"
+    p.write_text("mode: live\nrisk:\n  max_open_risk_pct: 3\n")
+    with pytest.raises(ValueError, match="paper-only"):
+        load_config(p, env_file=None)

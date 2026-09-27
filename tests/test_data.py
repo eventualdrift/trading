@@ -73,3 +73,38 @@ def test_universe_skips_stablecoins_including_unlisted_pegged_ones():
     }
     client.ex.fetch_tickers = lambda *a, **k: tickers
     assert client.top_symbols("USDT", 10) == ["BTC/USDT", "SOL/USDT"]
+
+
+def test_universe_skips_new_listings_and_refills_from_established_coins():
+    import pandas as pd
+
+    from tradebot.config import BotConfig
+    from tradebot.universe import DAY_MS, select_universe
+
+    class Market:
+        id = "fake"
+        listed = {"AAA/USDT": 900, "NEW/USDT": 100, "BBB/USDT": 400, "CCC/USDT": 2000, "DDD/USDT": 30}
+        now = 3000 * DAY_MS
+
+        def now_ms(self):
+            return self.now
+
+        def top_symbols(self, quote, n, min_quote_volume=0.0, whitelist=None, blacklist=None):
+            return list(whitelist or self.listed)[:n]  # already ranked by volume
+
+        def history(self, symbol, tf, start_ms, end_ms=None):
+            first = self.now - self.listed[symbol] * DAY_MS
+            idx = pd.date_range(pd.Timestamp(max(first, start_ms), unit="ms", tz="UTC"),
+                                pd.Timestamp(end_ms, unit="ms", tz="UTC"), freq="D")
+            return pd.DataFrame({"close": 1.0}, index=idx)
+
+    cfg = BotConfig()
+    cfg.universe.top_n = 3
+    m = Market()
+    assert select_universe(m, cfg) == ["AAA/USDT", "NEW/USDT", "BBB/USDT"]  # off by default
+    cfg.universe.min_history_days = 365
+    notes = []
+    assert select_universe(m, cfg, log_fn=notes.append) == ["AAA/USDT", "BBB/USDT", "CCC/USDT"]
+    assert "NEW/USDT" in notes[0]
+    cfg.universe.whitelist = ["NEW/USDT"]  # an explicit whitelist is respected as is
+    assert select_universe(m, cfg) == ["NEW/USDT"]

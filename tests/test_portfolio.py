@@ -124,3 +124,25 @@ def test_full_slots_are_filled_in_the_live_bots_order():
                                     max_open_positions=3, start_equity=1.0)
     expected = {"BBB/USDT", "DDD/USDT", "CCC/USDT"}  # the two 8R setups, then 2R; AAA (1.5R) waits
     assert {t.symbol for t in run.taken} == expected == {t.symbol for t in taken}
+
+
+def test_open_risk_budget_frees_room_once_open_trades_are_protected():
+    from tradebot.portfolio import simulate_satellite
+
+    idx = pd.date_range("2022-01-01", periods=60, freq="D", tz="UTC")
+    t0 = pd.Timestamp("2022-01-01", tz="UTC")
+    early = [trade(s, 1, 40, 100.0, 120.0) for s in ("AAA/USDT", "BBB/USDT", "CCC/USDT")]
+    late = [trade(s, 10, 20, 100.0, 105.0) for s in ("DDD/USDT", "EEE/USDT")]
+    cfg = BotConfig()
+    # the 3-position rule: both late trades are skipped
+    base = simulate_satellite(early + late, cfg, idx, open_risk_pct=None)
+    assert len(base.taken) == 3 and len(base.skipped["max open positions (3)"]) == 2
+    # a 3% budget with nothing protected: same result (3 x 1% already at stake)
+    fresh = simulate_satellite(early + late, cfg, idx, open_risk_pct=3.0)
+    assert len(fresh.taken) == 3 and len(fresh.skipped["open-risk budget (3%)"]) == 2
+    # two early trades reach breakeven on day 5: their risk no longer counts, so both late ones fit
+    for t in early[:2]:
+        t.protected_time = t0 + pd.Timedelta(days=5)
+    freed = simulate_satellite(early + late, cfg, idx, open_risk_pct=3.0)
+    assert len(freed.taken) == 5 and not freed.skipped
+    assert freed.open_count.max() == 5

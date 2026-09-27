@@ -27,6 +27,7 @@ class UniverseConfig:
     whitelist: list[str] = field(default_factory=list)
     blacklist: list[str] = field(default_factory=list)
     refresh_hours: float = 6
+    min_history_days: float = 0  # only coins that have traded this long (e.g. 365: no new listings)
 
 
 @dataclass
@@ -49,6 +50,10 @@ class CostConfig:
 class RiskConfig:
     risk_per_trade_pct: float = 1.0  # % of equity lost if the stop-loss is hit
     max_open_positions: int = 3
+    # Open-risk budget (None = off). When set it REPLACES max_open_positions: a new trade is allowed
+    # while the risk still at stake (size x distance to the current stop; 0 once the stop is at or
+    # past entry) stays within this % of equity. Enable only if `tradebot research sizing` passed.
+    max_open_risk_pct: float | None = None
     max_position_pct: float = 30.0  # cap on a single position's notional, % of equity
     max_total_exposure_pct: float = 100.0  # cap on all open notional (100 = no leverage)
     daily_loss_limit_pct: float = 3.0  # pause new entries for the rest of the UTC day
@@ -247,6 +252,13 @@ class BotConfig:
             errors.append("risk.max_risk_multiplier must be in [1, 3] and keep any trade's risk <= 5%")
         if r.max_open_positions < 1:
             errors.append("risk.max_open_positions must be >= 1")
+        if r.max_open_risk_pct is not None and not r.risk_per_trade_pct <= r.max_open_risk_pct <= 20:
+            errors.append("risk.max_open_risk_pct must be between risk.risk_per_trade_pct and 20 (or null)")
+        if r.max_open_risk_pct is not None and self.mode == "live":
+            # live keeps the exchange stop at the original level as a safety net, so a "protected"
+            # trade can still lose its full risk if the bot is offline
+            errors.append("risk.max_open_risk_pct is paper-only in this version (live exchange stops stay at "
+                          "the original level)")
         if not 0 < r.max_position_pct <= 100:
             errors.append("risk.max_position_pct must be in (0, 100]")
         if r.min_reward_risk <= 0:

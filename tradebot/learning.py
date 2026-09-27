@@ -88,8 +88,9 @@ def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model
                    now_ms: int | None = None, log_fn=print) -> LearningResult:
     if cfg.learning.follow_state_dir:
         raise RuntimeError(f"this instance follows {cfg.learning.follow_state_dir} - run `learn` on that instance")
-    u = cfg.universe
-    symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    from .universe import select_universe
+
+    symbols = select_universe(market, cfg, now_ms, log_fn)
     log_fn(f"Universe: {len(symbols)} symbols: {', '.join(symbols)}")
     log_fn("Loading history...")
     datasets = load_datasets(market, cfg, symbols, store, now_ms, log_fn)

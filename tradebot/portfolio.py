@@ -24,6 +24,7 @@ from .backtest.engine import Costs, Trade, live_order
 from .backtest.metrics import max_drawdown_pct
 from .config import BotConfig
 from .core import simulate_core_detail
+from .risk import position_fraction
 
 
 def _ns(index) -> pd.DatetimeIndex:
@@ -69,9 +70,14 @@ class SatelliteRun:
 
 
 def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIndex,
-                       closes: dict[str, pd.Series] | None = None) -> SatelliteRun:
-    """Replay the satellite's trades like the live account and mark open ones to market daily."""
+                       closes: dict[str, pd.Series] | None = None,
+                       open_risk_pct: float | None | str = "config") -> SatelliteRun:
+    """Replay the satellite's trades like the live account and mark open ones to market daily.
+
+    ``open_risk_pct``: the open-risk budget rule instead of max_open_positions (default: whatever
+    risk.max_open_risk_pct says). Same acceptance and sizing as the live risk manager."""
     r = cfg.risk
+    budget = r.max_open_risk_pct if open_risk_pct == "config" else open_risk_pct
     index = _ns(index)
     n = len(index)
     closes = closes or {}
@@ -89,14 +95,26 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
             else:
                 still.append(item)
         open_ = still
-        if len(open_) >= r.max_open_positions:
-            skipped.setdefault(f"max open positions ({r.max_open_positions})", []).append(t)
-            continue
+        frac = position_fraction(t.stop_pct, r)
+        if budget is None:
+            if len(open_) >= r.max_open_positions:
+                skipped.setdefault(f"max open positions ({r.max_open_positions})", []).append(t)
+                continue
+        else:
+            at_stake = sum(n_ * ot.stop_pct for ot, n_, _ in open_
+                           if ot.protected_time is None or ot.protected_time > t.entry_time)
+            if at_stake + equity * frac * t.stop_pct > equity * budget / 100.0 + 1e-12:
+                skipped.setdefault(f"open-risk budget ({budget:g}%)", []).append(t)
+                continue
         if any(ot.symbol == t.symbol for ot, _, _ in open_):
             skipped.setdefault("already holding that coin", []).append(t)
             continue
-        frac = min(r.risk_per_trade_pct / 100.0 / max(t.stop_pct, 1e-9), r.max_position_pct / 100.0)
-        notional = equity * frac
+        room = equity * r.max_total_exposure_pct / 100.0 - sum(n_ for _, n_, _ in open_)
+        if room <= 0:
+            skipped.setdefault("total exposure limit", []).append(t)
+            continue
+        notional = min(equity * frac, room)  # like the live risk manager: shrink to fit
+        frac = notional / equity
         item = (t, notional, notional * t.return_pct)
         open_.append(item)
         booked.append(item)
@@ -201,6 +219,29 @@ class PortfolioBacktest:
     reset_days: float = 30
 
 
+def account_stats(res: "PortfolioBacktest", start: pd.Timestamp | None) -> dict[str, dict]:
+    """Stats of the combined account, core only, core at the same exposure and satellite only."""
+    def stats(curve: pd.Series, exposure: pd.Series | None) -> dict:
+        c = curve.dropna()
+        if start is not None:
+            c = c[c.index >= start]
+        out = curve_stats(c) if len(c) > 1 else {"total_pct": 0.0, "cagr_pct": 0.0, "max_dd_pct": 0.0, "sharpe": 0.0}
+        if exposure is not None and len(exposure):
+            e = exposure[exposure.index >= start] if start is not None else exposure
+            out["exposure"] = float(e.mean())
+        return out
+
+    combined_name = f"Combined ({res.fraction:.0%} core)"
+    matched, k = _matched_core(res.curves["Core only"], res.core_exposure, res.combined_exposure,
+                               res.reset_days, res.capital, start)
+    return {
+        "combined": stats(res.curves[combined_name], res.combined_exposure),
+        "core": stats(res.curves["Core only"], res.core_exposure),
+        "matched": {**stats(matched, res.core_exposure * k), "k": k},
+        "satellite": stats(res.curves["Satellite only"], res.satellite.exposure if res.satellite else None),
+    }
+
+
 def _matched_core(core: pd.Series, core_exp: pd.Series, target_exp: pd.Series, reset_days: float,
                   capital: float, start: pd.Timestamp | None) -> tuple[pd.Series, float]:
     """Core-only held at the combined account's average exposure (the rest in cash)."""
@@ -215,15 +256,17 @@ def _matched_core(core: pd.Series, core_exp: pd.Series, target_exp: pd.Series, r
 def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade], cfg: BotConfig, *,
                        capital: float = 1000.0, fraction: float | None = None,
                        since: str | None = "2022-01-01", sat_closes: dict[str, pd.Series] | None = None,
-                       combos: list[dict] | None = None, universe: dict | None = None) -> PortfolioBacktest:
+                       combos: list[dict] | None = None, universe: dict | None = None,
+                       open_risk_pct: float | None | str = "config") -> PortfolioBacktest:
     fraction = cfg.core.fraction if fraction is None else fraction
+    budget = cfg.risk.max_open_risk_pct if open_risk_pct == "config" else open_risk_pct
     costs = Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate)  # the core trades at market
     detail = simulate_core_detail(core_closes, cfg.core, costs, start_equity=capital)
     detail.index = _ns(detail.index)
     core = detail["equity"] / capital
     core_exp = (detail["invested"] / detail["equity"]).fillna(0.0)
     index = core.index
-    sat = simulate_satellite(sat_trades, cfg, index, sat_closes)
+    sat = simulate_satellite(sat_trades, cfg, index, sat_closes, open_risk_pct=budget)
     parts = combine_sleeves_detail(core, sat.equity, fraction, cfg.core.rebalance_sleeves_days, capital)
     combined_exp = (parts["core"] * core_exp + parts["satellite"] * sat.exposure) / parts["total"]
     closes = pd.DataFrame({k: pd.Series(v.to_numpy(dtype=float), index=_ns(v.index)) for k, v in core_closes.items()})
@@ -241,8 +284,11 @@ def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade
         curves["Hold " + "+".join(s.split("/")[0] for s in closes)] = norm.mean(axis=1) * capital
     first_sat = min((t.entry_time for t in sat_trades), default=None)
     r = cfg.risk
+    slots = (f"open-risk budget {budget:g}% (risk still at stake; 0 once a stop is at entry)" if budget is not None
+             else f"max {r.max_open_positions} open")
     sizing = (f"{r.risk_per_trade_pct:g}% of satellite equity at risk per trade (size = risk / stop distance), "
-              f"max {r.max_position_pct:g}% per position, max {r.max_open_positions} open, one per coin")
+              f"max {r.max_position_pct:g}% per position, {slots}, one per coin, "
+              f"total at most {r.max_total_exposure_pct:g}% of the satellite")
     return PortfolioBacktest(capital, fraction, curves, pd.Timestamp(since, tz="UTC") if since else None,
                              len(sat_trades), first_sat, sat, core_exp, combined_exp, combos or [], universe,
                              cfg.costs_description(), sizing, cfg.core.rebalance_sleeves_days)

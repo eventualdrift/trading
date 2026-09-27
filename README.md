@@ -138,7 +138,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 206 tests
+pytest -q              # 216 tests
 ```
 
 ### 1. Configure
@@ -195,6 +195,25 @@ tradebot research breaker     # would pausing entries during BTC volatility burs
 
 It prints each selected strategy with and without the breaker, in-sample and out-of-sample.
 It recommends `guards.vol_breaker: true` only if the breaker helps every strategy in both periods.
+
+```bash
+tradebot research sizing      # the pre-registered, one-time test of the open-risk budget
+```
+
+The satellite can hold at most 3 trades at once, and a trade whose stop has reached breakeven
+(so it can no longer lose) still takes one of those slots. The **open-risk budget** rule
+replaces the count with a limit on the money still at risk: 3% of the satellite, where a trade
+whose stop is at or past entry counts as 0. The rule and its pass criterion were written into
+the code before any real-data run:
+- **Pass** if, from 2022, the 65/35 account with the rule has a Sharpe at least 0.10 above
+  core-only, or a worst drawdown at least 3 points smaller than the core held at the same
+  exposure.
+- **One run only.** The first result on real data is recorded in `state/research/` and stands.
+  `--rerun` only shows it again, marked as a re-run, and every run is appended to
+  `research/ledger.jsonl` so the number of variants tried stays visible.
+- **If it passes**, it can be enabled for paper trading with `risk.max_open_risk_pct: 3`. It is
+  paper-only: live keeps the exchange stop at the original level as a safety net, so a
+  "protected" trade could still lose its full risk if the bot were offline.
 
 ### 5. Check the track record
 
@@ -345,6 +364,8 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | exchange-side stop-loss (live), verified after placing | on; sell if it can't be placed |
 | bad-data guard: skip frozen feeds, confirm any >10% jump on the next poll, ignore stale prices | on |
 | BTC volatility breaker: no new entries while BTC's recent volatility is 2.5× normal | off until `tradebot research breaker` supports it |
+| coins traded: most liquid by 24h volume; stablecoins, pegged coins (24h range < 0.3%) and leveraged tokens skipped; optionally only coins listed ≥ `universe.min_history_days` | same rule in learning, backtests and live |
+| when more signals arrive than slots are free | best reward:risk first - in live and in every backtest |
 
 ## Commands
 
@@ -360,6 +381,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot project [--capital 1000]` | range of outcomes for your account at 1-12 months, vs holding BTC |
 | `tradebot portfolio-backtest [--capital 1000] [--core-fraction 0.65] [--since 2022-01-01]` | core + satellite account vs holding BTC |
 | `tradebot research breaker [--ratios 2 2.5 3]` | evaluate the volatility breaker on real data |
+| `tradebot research sizing` | the pre-registered one-time test of the open-risk budget rule |
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
 | `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
 | `tradebot telegram-test` | Telegram setup helper |
@@ -402,7 +424,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            206 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            216 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

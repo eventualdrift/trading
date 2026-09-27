@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import BotConfig, load_config
+from .universe import describe_universe, select_universe
 
 log = logging.getLogger("tradebot")
 
@@ -86,8 +87,7 @@ def cmd_backtest(args, cfg):
     from .learning import load_context, load_datasets
 
     market = _market(cfg, args.synthetic)
-    u = cfg.universe
-    symbols = args.symbols or market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    symbols = args.symbols or select_universe(market, cfg, log_fn=print)
     tfs = [args.timeframe] if args.timeframe else cfg.timeframes
     strategies = [args.strategy] if args.strategy else list(cfg.strategies)
     cfg.timeframes = tfs
@@ -120,8 +120,7 @@ def cmd_scan(args, cfg):
     if not selection or not selection.selected:
         sys.exit("No validated strategies yet - run `tradebot learn` first.")
     market = _market(cfg, args.synthetic)
-    u = cfg.universe
-    symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    symbols = select_universe(market, cfg)
     scanner = Scanner(market, cfg, selection, model)
     now = market.now_ms()
     found = 0
@@ -166,14 +165,14 @@ def cmd_run(args, cfg):
     except ValueError as exc:
         sys.exit(str(exc))
 
-    def learner(current):
+    def learn_now(current):
         res = learning_cycle(cfg, learn_market, store=store, db=db, current_model=current, log_fn=log.info)
         return res.selection, res.model, res.summary
 
     follow = cfg.learning.follow_state_dir
+    learner = None if follow else learn_now  # a follower never learns: it reloads the leader's brain
     selection, model = load_brain(cfg)
     if follow:
-        learner = None  # never learns: uses (and reloads) the leader's selection and model
         print(f"Using the strategies in {follow} (learning.follow_state_dir)"
               + ("" if selection else " - none there yet; they'll be picked up once that instance learns"))
     elif selection is None and cfg.learning.learn_on_start:
@@ -226,8 +225,7 @@ def cmd_project(args, cfg):
     if not selection or not selection.selected:
         sys.exit("No validated strategies yet - run `tradebot learn` first (nothing to project).")
     market = _market(cfg, args.synthetic)
-    u = cfg.universe
-    symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    symbols = select_universe(market, cfg)
     cfg.timeframes = selection.timeframes()
     bench_symbol = f"BTC/{cfg.exchange.quote}"
     datasets = load_datasets(market, cfg, sorted(set(symbols) | {bench_symbol}), _store(cfg, market),
@@ -247,9 +245,10 @@ def cmd_research(args, cfg):
     selection, _ = load_brain(cfg)
     if not selection or not selection.selected:
         sys.exit("No validated strategies yet - run `tradebot learn` first.")
+    if args.topic == "sizing":
+        return _research_sizing(args, cfg, selection)
     market = _market(cfg, args.synthetic)
-    u = cfg.universe
-    symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+    symbols = select_universe(market, cfg)
     cfg.timeframes = selection.timeframes()
     store = _store(cfg, market)
     datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None)
@@ -261,24 +260,24 @@ def cmd_research(args, cfg):
     print(format_breaker_study(breaker_study(selection, datasets, cfg, context, tuple(args.ratios))))
 
 
-def cmd_portfolio_backtest(args, cfg):
-    from .learning import load_brain, load_context, load_datasets
-    from .portfolio import combo_split_stats, format_portfolio_backtest, portfolio_backtest
+def _portfolio_inputs(cfg, selection, synthetic: bool, days: int) -> dict:
+    """Everything the whole-account backtests need: core closes, satellite candidate trades,
+    daily closes to value them, per-strategy split stats and the universe used."""
     from .backtest.selection import run_combo
+    from .learning import load_context, load_datasets
+    from .portfolio import combo_split_stats
 
-    selection, _ = load_brain(cfg)
-    market = _market(cfg, args.synthetic)
+    market = _market(cfg, synthetic)
     store = _store(cfg, market)
     now = market.now_ms()
     core_closes = {}
     for sym in cfg.core.symbols:
-        df = (store.update(market, sym, "1d", args.days, now) if store is not None
-              else market.history(sym, "1d", now - args.days * 86_400_000, now))
+        df = (store.update(market, sym, "1d", days, now) if store is not None
+              else market.history(sym, "1d", now - days * 86_400_000, now))
         core_closes[sym] = df["close"]
     trades, combos, sat_closes, universe = [], [], {}, None
     if selection and selection.selected:
-        u = cfg.universe
-        symbols = market.top_symbols(cfg.exchange.quote, u.top_n, u.min_quote_volume, u.whitelist, u.blacklist)
+        symbols = select_universe(market, cfg)
         cfg.timeframes = selection.timeframes()
         datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None)
         context = load_context(market, cfg, store, log_fn=lambda *_: None)
@@ -292,12 +291,46 @@ def cmd_portfolio_backtest(args, cfg):
                 if sym not in sat_closes:  # daily closes to value open trades each day
                     sat_closes[sym] = df["close"] if tf == "1d" else df["close"].resample("1D").last().dropna()
                 first[sym] = min(first.get(sym, df.index[0]), df.index[0])
-        source = ("your universe.whitelist" if u.whitelist else
-                  f"today's top {u.top_n} {cfg.exchange.quote} pairs by 24h volume ({time.strftime('%Y-%m-%d')})")
-        universe = {"source": source, "symbols": symbols, "first": first}
+        universe = {"source": describe_universe(cfg, time.strftime("%Y-%m-%d")), "symbols": symbols, "first": first}
+    return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
+            "universe": universe}
+
+
+def _research_sizing(args, cfg, selection):
+    from .research import SIZING_TEST, format_sizing_study, previous_result, record_study, sizing_study
+
+    prev = previous_result(cfg.state_path)
+    if prev and not args.rerun:
+        print(f"This test already ran on {prev.get('ran_at')}: {'PASS' if prev['verdict']['pass'] else 'FAIL'}. "
+              f"It is a one-time test - its first result stands. (--rerun shows it again, marked as a re-run.)")
+        return
+    if cfg.risk.max_open_risk_pct is not None:
+        sys.exit("risk.max_open_risk_pct is already set in the config - the test compares against today's rule.")
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days)
+    fraction = cfg.core.fraction or 0.65
+    study = sizing_study(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
+                         sat_closes=x["sat_closes"], combos=x["combos"], universe=x["universe"])
+    if prev:
+        print(f"RE-RUN - not a new test. The first result ({prev.get('ran_at')}: "
+              f"{'PASS' if prev['verdict']['pass'] else 'FAIL'}) stands.\n")
+    print(format_sizing_study(study))
+    if not args.synthetic:
+        path = record_study(cfg.state_path, study, rerun=bool(prev))
+        print(f"\nRecorded: {path} (and research/ledger.jsonl)")
+    else:
+        print(f"\n(synthetic data: not recorded - {SIZING_TEST['id']} can still be run once on real data)")
+
+
+def cmd_portfolio_backtest(args, cfg):
+    from .learning import load_brain
+    from .portfolio import format_portfolio_backtest, portfolio_backtest
+
+    selection, _ = load_brain(cfg)
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days)
     fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
-    res = portfolio_backtest(core_closes, trades, cfg, capital=args.capital, fraction=fraction,
-                             since=args.since or None, sat_closes=sat_closes, combos=combos, universe=universe)
+    res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
+                             since=args.since or None, sat_closes=x["sat_closes"], combos=x["combos"],
+                             universe=x["universe"])
     print(format_portfolio_backtest(res, cfg.exchange.quote))
 
 
@@ -410,8 +443,12 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--since", default="2022-01-01", help="also report from this date (the test period)")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
-    sp.add_argument("topic", choices=["breaker"], help="breaker: the BTC volatility circuit breaker")
+    sp.add_argument("topic", choices=["breaker", "sizing"],
+                    help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget test")
     sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])
+    sp.add_argument("--capital", type=float, default=1000.0, help="sizing: account size")
+    sp.add_argument("--days", type=int, default=3200, help="sizing: daily history for the core")
+    sp.add_argument("--rerun", action="store_true", help="sizing: show the test again (marked as a re-run)")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("project", help="what could the account become? (Monte Carlo from out-of-sample trades)")
     sp.add_argument("--capital", type=float, default=1000.0)

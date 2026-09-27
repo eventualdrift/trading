@@ -61,3 +61,26 @@ def test_circuit_breakers():
     assert rm.daily_limit_hit(969, 1000)
     assert not rm.drawdown_hit(900, 1000)
     assert rm.drawdown_hit(849, 1000)
+
+
+def test_open_risk_budget_counts_only_risk_still_at_stake():
+    from tradebot.config import RiskConfig
+    from tradebot.models import Position, Signal
+    from tradebot.risk import RiskManager
+
+    rm = RiskManager(RiskConfig(max_open_risk_pct=3.0))
+
+    def pos(sym, stop):  # 10 coins bought at 100: 1% of a 10,000 account at risk with a stop at 90
+        return Position(symbol=sym, timeframe="1d", strategy="momentum", side="long", mode="paper", amount=10,
+                        entry_price=100, stop_loss=stop, take_profit=200, initial_stop=90, opened_at=0,
+                        max_hold_until=10**13)
+
+    sig = Signal(symbol="NEW/USDT", timeframe="1d", strategy="breakout", side="long", entry=50, stop_loss=45,
+                 take_profit=70, candle_time=0, created_at=0, valid_until=1, max_hold_until=1)
+    fresh = [pos("A/USDT", 90), pos("B/USDT", 90)]
+    assert rm.entry_block_reason(sig, fresh, 10_000) is None  # 2% at stake + 1% new = 3%
+    assert "open-risk budget" in rm.entry_block_reason(sig, fresh + [pos("C/USDT", 90)], 10_000)
+    protected = [pos(s, 100) for s in ("C/USDT", "D/USDT", "E/USDT", "F/USDT")]  # stops at entry: 0 at stake
+    assert rm.entry_block_reason(sig, fresh + protected, 10_000) is None  # 6 open, still allowed
+    rm.cfg.max_open_risk_pct = None  # off: the position count applies again
+    assert "max open positions" in rm.entry_block_reason(sig, fresh + protected, 10_000)
