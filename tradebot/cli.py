@@ -333,8 +333,8 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
             universe["config_diffs"] = config_differences(saved_cfg, snap) if saved_cfg else None
             if (frozen.get("code"), universe["saved_config_hash"]) != (code, universe["config_hash"]):
                 # same coins and data end, stamped with THIS run's code and settings: a complete reference
-                stamped = Path(universe_file).with_name(
-                    f"{Path(universe_file).stem}@{code.split('+')[0]}-{universe['config_hash']}.json")
+                base = Path(universe_file).stem.split("@")[0]  # the original run's name, without an older stamp
+                stamped = Path(universe_file).with_name(f"{base}@{code.split('+')[0]}-{universe['config_hash']}.json")
                 if not stamped.exists():
                     save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap)
                 universe["stamped_file"] = str(stamped)

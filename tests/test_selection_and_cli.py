@@ -107,6 +107,8 @@ def test_frozen_rerun_reports_and_stamps_code_and_settings(tmp_path, monkeypatch
     conf.write_text(conf.read_text() + "risk:\n  risk_per_trade_pct: 0.5\n")  # a setting changes
     main(args + ["--universe-file", str(stamped[0])])
     assert "Setting changed since the saved run - risk.risk_per_trade_pct: saved 1.0, now 0.5" in capsys.readouterr().out
+    names = sorted(p.name for p in tmp_path.glob("universe-old@*.json"))
+    assert len(names) == 2 and all(n.count("@") == 1 for n in names)  # re-stamped from the original name
 
 
 def test_research_note_leaves_the_result_unchanged(tmp_path, monkeypatch, capsys):
