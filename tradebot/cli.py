@@ -240,8 +240,14 @@ def cmd_project(args, cfg):
 
 def cmd_research(args, cfg):
     from .learning import load_brain, load_context, load_datasets
-    from .research import breaker_study, format_breaker_study
+    from .research import add_note, breaker_study, format_breaker_study
 
+    if args.topic == "note":
+        if not args.id or not args.text:
+            sys.exit("usage: tradebot research note --id <test id> --text \"...\"")
+        add_note(cfg.state_path, args.id, args.text)
+        print(f"Note added to {args.id} (research/ledger.jsonl); the recorded result is unchanged.")
+        return
     selection, _ = load_brain(cfg)
     if not selection or not selection.selected:
         sys.exit("No validated strategies yet - run `tradebot learn` first.")
@@ -276,6 +282,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
     from .backtest.selection import run_combo
     from .learning import load_context, load_datasets, load_frame
     from .portfolio import combo_split_stats
+    from .provenance import code_version, config_differences, config_hash, config_snapshot
     from .universe import load_universe, save_universe
 
     market = _market(cfg, synthetic)
@@ -310,12 +317,27 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                     sat_closes[sym] = df["close"] if tf == "1d" else df["close"].resample("1D").last().dropna()
                 first[sym] = min(first.get(sym, df.index[0]), df.index[0])
         source = frozen["source"] if frozen else describe_universe(cfg, time.strftime("%Y-%m-%d"))
+        code, snap = code_version(), config_snapshot(cfg)  # after cfg.timeframes was set: what the run used
         path = universe_file
         if not frozen and save_dir and not synthetic:
             stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(data_end / 1000))
-            path = save_universe(Path(save_dir) / f"universe-{stamp}.json", symbols, data_end, source, keys, cfg)
+            path = save_universe(Path(save_dir) / f"universe-{stamp}.json", symbols, data_end, source, keys, cfg,
+                                 code=code, config=snap)
         universe = {"source": source, "symbols": symbols, "first": first, "data_end_ms": data_end,
-                    "file": path, "frozen": bool(frozen)}
+                    "file": path, "frozen": bool(frozen), "code": code, "config": snap,
+                    "config_hash": config_hash(snap)}
+        if frozen:
+            universe["saved_code"] = frozen.get("code")
+            saved_cfg = frozen.get("config")
+            universe["saved_config_hash"] = config_hash(saved_cfg) if saved_cfg else None
+            universe["config_diffs"] = config_differences(saved_cfg, snap) if saved_cfg else None
+            if (frozen.get("code"), universe["saved_config_hash"]) != (code, universe["config_hash"]):
+                # same coins and data end, stamped with THIS run's code and settings: a complete reference
+                stamped = Path(universe_file).with_name(
+                    f"{Path(universe_file).stem}@{code.split('+')[0]}-{universe['config_hash']}.json")
+                if not stamped.exists():
+                    save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap)
+                universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
             "universe": universe}
 
@@ -327,13 +349,16 @@ def _research_sizing(args, cfg, selection):
     if prev and not args.rerun:
         print(f"This test already ran on {prev.get('ran_at')}: {'PASS' if prev['verdict']['pass'] else 'FAIL'}. "
               f"It is a one-time test - its first result stands. (--rerun shows it again, marked as a re-run.)")
+        for n in prev.get("notes", []):
+            print(f"  note ({n['at']}): {n['note']}")
         return
     if cfg.risk.max_open_risk_pct is not None:
         sys.exit("risk.max_open_risk_pct is already set in the config - the test compares against today's rule.")
+    fraction = cfg.core.fraction or 0.65
+    cfg.core.fraction = fraction
     # a test registered with a frozen universe runs on it (coins + data end date fixed in advance)
     x = _portfolio_inputs(cfg, selection, args.synthetic, args.days,
                           args.universe_file or SIZING_TEST.get("universe_file"))
-    fraction = cfg.core.fraction or 0.65
     study = sizing_study(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                          sat_closes=x["sat_closes"], combos=x["combos"], universe=x["universe"])
     if prev:
@@ -352,8 +377,9 @@ def cmd_portfolio_backtest(args, cfg):
     from .portfolio import format_portfolio_backtest, portfolio_backtest
 
     selection, _ = load_brain(cfg)
-    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
     fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
+    cfg.core.fraction = fraction  # recorded with the run: the split it actually used
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since=args.since or None, sat_closes=x["sat_closes"], combos=x["combos"],
                              universe=x["universe"])
@@ -471,8 +497,11 @@ def main(argv: list[str] | None = None) -> None:
                     help="rerun on a saved coin list and data end date (reports/universe-*.json)")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
-    sp.add_argument("topic", choices=["breaker", "sizing"],
-                    help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget test")
+    sp.add_argument("topic", choices=["breaker", "sizing", "note"],
+                    help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget "
+                         "test; note: annotate a recorded test (--id, --text)")
+    sp.add_argument("--id", default=None, help="note: the test id, e.g. sizing-open-risk-budget-v1")
+    sp.add_argument("--text", default=None, help="note: the text to add")
     sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])
     sp.add_argument("--capital", type=float, default=1000.0, help="sizing: account size")
     sp.add_argument("--days", type=int, default=3200, help="sizing: daily history for the core")

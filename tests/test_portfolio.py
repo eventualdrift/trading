@@ -195,7 +195,7 @@ def test_skips_are_attributed_to_same_close_ranking_or_slots_already_full():
 
 
 def test_shared_close_follows_the_live_scan_order():
-    """At 00:00 UTC the live bot scans 4h before 1d, and breaks rank ties in universe (volume) order."""
+    """At 00:00 UTC the live bot scans 4h before 1d, and breaks rank ties by the 24h volume known then."""
     from tradebot.portfolio import simulate_satellite
 
     idx = pd.date_range("2022-01-01", periods=30, freq="D", tz="UTC")
@@ -206,7 +206,26 @@ def test_shared_close_follows_the_live_scan_order():
         t = trade(s, 5, 10, 100.0, 101.0)
         t.strategy, t.signal_rr = "momentum", 8.0
         daily.append(t)
-    rank = {"CCC/USDT": 0, "BBB/USDT": 1, "AAA/USDT": 2}  # CCC and BBB trade more volume than AAA
-    run = simulate_satellite([four_h] + daily, BotConfig(), idx, open_risk_pct=None, symbol_rank=rank)
+    for t, vol in zip(daily, (1e6, 5e6, 9e6)):  # 24h volume at the signal candle: CCC > BBB > AAA
+        t.signal_volume = vol
+    run = simulate_satellite([four_h] + daily, BotConfig(), idx, open_risk_pct=None)
     assert {t.symbol for t in run.taken} == {"ZZZ/USDT", "CCC/USDT", "BBB/USDT"}
     assert [d["trade"].symbol for d in run.skip_detail] == ["AAA/USDT"]
+
+
+def test_report_compares_each_window_including_from_the_satellites_first_trade():
+    from tradebot.portfolio import worst_dip
+
+    eq = daily([100, 120, 90, 95, 130, 110])
+    dip, top, low = worst_dip(eq)
+    assert dip == pytest.approx(25.0) and top == eq.index[1] and low == eq.index[2]
+
+    idx = pd.date_range("2021-01-01", periods=700, freq="D", tz="UTC")
+    rng = np.random.default_rng(3)
+    closes = {"BTC/USDT": pd.Series(100 * np.cumprod(1 + rng.normal(0.001, 0.03, 700)), index=idx),
+              "ETH/USDT": pd.Series(50 * np.cumprod(1 + rng.normal(0.001, 0.04, 700)), index=idx)}
+    trades = [trade("SOL/USDT", d, d + 8, 10.0, 10.6, start="2021-01-01") for d in range(400, 690, 6)]
+    res = portfolio_backtest(closes, trades, BotConfig(), capital=1000, fraction=0.65, since="2021-06-01")
+    text = format_portfolio_backtest(res)
+    assert "dip low" in text and text.count("Rule (65/35 must beat core at same exposure") == 3
+    assert "From the satellite's first trade (2022-02-05" in text

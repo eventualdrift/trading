@@ -78,6 +78,7 @@ class Trade:
     stop_pct: float  # initial risk as a fraction of entry price
     signal_rr: float = 0.0  # reward:risk at the signal close - how the live bot ranks same-time signals
     protected_time: pd.Timestamp | None = None  # when the stop reached entry (None: never)
+    signal_volume: float = 0.0  # quote volume of the 24h up to the signal close (known then; live ranks ties by it)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -240,6 +241,9 @@ def backtest_populated(
     idx = pop.index
     n = len(pop)
     bar = pd.Timedelta(milliseconds=tf_ms(timeframe)) if timeframe else (idx[1] - idx[0] if n > 1 else pd.Timedelta(0))
+    per_day = max(1, round(pd.Timedelta(days=1) / bar)) if bar > pd.Timedelta(0) else 1
+    vol24 = ((pop["close"] * pop["volume"]).rolling(per_day, min_periods=1).sum().to_numpy(dtype=float)
+             if "volume" in pop else np.zeros(n))  # trailing 24h quote volume at each candle's close
     i = strategy.warmup if start_idx is None else max(start_idx, strategy.warmup)
     end = n - 1 if end_idx is None else min(end_idx, n - 1)
     trades: list[Trade] = []
@@ -282,6 +286,7 @@ def backtest_populated(
                 stop_pct=abs(out.entry_price - sl) / out.entry_price,
                 signal_rr=reward_risk(side, c[i], sl, tp),
                 protected_time=(idx[out.protected_idx] + bar) if out.protected_idx is not None else None,
+                signal_volume=float(vol24[i]) if vol24[i] == vol24[i] else 0.0,
             )
         )
         i = max(out.exit_idx, i + 1)
@@ -295,13 +300,13 @@ def backtest(
     return backtest_populated(pop, strategy, costs, **kwargs), pop
 
 
-def live_order(t: "Trade", rank: dict[str, int] | None = None) -> tuple:
+def live_order(t: "Trade") -> tuple:
     """Order candidates exactly as the live bot handles them, so when slots run out the same
     trades are taken: by time; at a shared close the shorter timeframe's scan runs first (4h
-    before 1d); within a scan by the scanner's rank (reward:risk without the ML filter), ties in
-    universe order (``rank``: symbol -> position in the volume-ranked list), then by name."""
+    before 1d); within a scan by the scanner's rank (reward:risk without the ML filter); ties go
+    to the coin with more 24h volume - the volume known at that candle, not today's ranking."""
     tf = tf_ms(t.timeframe) if t.timeframe else 0
-    return (t.entry_time, tf, -t.signal_rr, (rank or {}).get(t.symbol, 1 << 30), t.symbol)
+    return (t.entry_time, tf, -t.signal_rr, -t.signal_volume, t.symbol)
 
 
 def portfolio_simulation(

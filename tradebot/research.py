@@ -188,3 +188,23 @@ def previous_result(state_dir, test: dict = SIZING_TEST) -> dict | None:
 
     path = Path(state_dir) / "research" / f"{test['id']}.json"
     return json.loads(path.read_text()) if path.exists() else None
+
+
+def add_note(state_dir, test_id: str, text: str) -> dict:
+    """Annotate a recorded test without changing it: appended to the ledger and to the result's
+    notes (its numbers and verdict are never edited)."""
+    import json
+    import time
+    from pathlib import Path
+
+    folder = Path(state_dir) / "research"
+    folder.mkdir(parents=True, exist_ok=True)
+    entry = {"id": test_id, "kind": "note", "at": time.strftime("%Y-%m-%d %H:%M:%S"), "note": text}
+    with open(folder / "ledger.jsonl", "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    result = folder / f"{test_id}.json"
+    if result.exists():
+        data = json.loads(result.read_text())
+        data.setdefault("notes", []).append({"at": entry["at"], "note": text})
+        result.write_text(json.dumps(data, indent=2, default=str))
+    return entry

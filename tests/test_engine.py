@@ -185,3 +185,20 @@ def test_protection_is_recorded_when_the_stop_reaches_entry():
     out = run(rows, be=1.0, tp=200.0)
     assert out.protected_idx == 3 and out.reason == "end_of_data"
     assert run(BASE + [(101, 103, 100, 102)] * 4, be=1.0, tp=200.0).protected_idx is None  # never +1R
+
+
+def test_trades_carry_the_24h_volume_known_at_the_signal():
+    from tradebot.backtest.engine import backtest_populated
+
+    df = bars([(100, 101, 99, 100)] * 60, freq="4h")
+    df["volume"] = np.arange(60, dtype=float)  # growing volume: later candles trade more
+    pop = df.assign(enter_long=False, enter_short=False, exit_long=False, exit_short=False,
+                    long_sl=95.0, long_tp=120.0, short_sl=np.nan, short_tp=np.nan)
+    pop.loc[pop.index[30], "enter_long"] = True
+
+    class S:
+        name, warmup, max_hold_bars = "x", 0, 5
+
+    t = backtest_populated(pop, S(), COSTS, symbol="A/USDT", timeframe="4h")[0]
+    # 24h of 4h candles = the signal candle and the 5 before it (volumes 25..30), at price 100
+    assert t.signal_volume == pytest.approx(100 * sum(range(25, 31)))

@@ -66,7 +66,7 @@ def describe_universe(cfg: BotConfig, date: str) -> str:
 
 
 def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selection_keys: list[str],
-                  cfg: BotConfig) -> str:
+                  cfg: BotConfig, code: str | None = None, config: dict | None = None) -> str:
     """Freeze a run's coin list and data end date so it can be reproduced (--universe-file)."""
     import json
     import time
@@ -86,7 +86,9 @@ def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selec
         "selection": list(selection_keys),
         "rules": {"top_n": u.top_n, "min_quote_volume": u.min_quote_volume,
                   "min_history_days": u.min_history_days, "whitelist": u.whitelist, "blacklist": u.blacklist},
-    }, indent=2))
+        "code": code,  # git commit of the code that produced the run
+        "config": config,  # the settings it used (provenance.config_snapshot)
+    }, indent=2, default=str))
     return str(path)
 
 

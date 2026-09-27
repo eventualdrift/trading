@@ -50,6 +50,18 @@ def curve_stats(equity: pd.Series) -> dict[str, float]:
     }
 
 
+def worst_dip(equity: pd.Series) -> tuple[float, pd.Timestamp | None, pd.Timestamp | None]:
+    """(worst drawdown %, the peak before it, its low)."""
+    e = equity.dropna()
+    if len(e) < 2:
+        return 0.0, None, None
+    peak = e.cummax()
+    dd = e / peak - 1.0
+    low = dd.idxmin()
+    top = e.loc[:low].idxmax()
+    return float(-dd.min() * 100.0), top, low
+
+
 def yearly_returns(equity: pd.Series) -> pd.Series:
     ends = equity.groupby(equity.index.year).last()
     starts = pd.concat([pd.Series([equity.iloc[0]], index=[ends.index[0]]), ends.shift(1).dropna()])
@@ -75,8 +87,7 @@ class SatelliteRun:
 
 def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIndex,
                        closes: dict[str, pd.Series] | None = None,
-                       open_risk_pct: float | None | str = "config",
-                       symbol_rank: dict[str, int] | None = None) -> SatelliteRun:
+                       open_risk_pct: float | None | str = "config") -> SatelliteRun:
     """Replay the satellite's trades like the live account and mark open ones to market daily.
 
     ``open_risk_pct``: the open-risk budget rule instead of max_open_positions (default: whatever
@@ -97,7 +108,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     def key(tr: Trade) -> str:
         return f"{tr.strategy}@{tr.timeframe}"
 
-    for t in sorted(trades, key=lambda tr: live_order(tr, symbol_rank)):
+    for t in sorted(trades, key=live_order):
         still = []
         for item in sorted(open_, key=lambda x: x[0].exit_time):
             if item[0].exit_time <= t.entry_time:
@@ -283,8 +294,7 @@ def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade
     core = detail["equity"] / capital
     core_exp = (detail["invested"] / detail["equity"]).fillna(0.0)
     index = core.index
-    rank = {s: i for i, s in enumerate((universe or {}).get("symbols") or [])}  # volume order, like live
-    sat = simulate_satellite(sat_trades, cfg, index, sat_closes, open_risk_pct=budget, symbol_rank=rank)
+    sat = simulate_satellite(sat_trades, cfg, index, sat_closes, open_risk_pct=budget)
     parts = combine_sleeves_detail(core, sat.equity, fraction, cfg.core.rebalance_sleeves_days, capital)
     combined_exp = (parts["core"] * core_exp + parts["satellite"] * sat.exposure) / parts["total"]
     closes = pd.DataFrame({k: pd.Series(v.to_numpy(dtype=float), index=_ns(v.index)) for k, v in core_closes.items()})
@@ -342,6 +352,23 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
                        + (" (frozen: from the universe file)" if u.get("frozen") else ""))
         if u.get("file"):
             out.append(f"    Reproduce this run: --universe-file {u['file']}")
+        if u.get("code"):
+            from .provenance import config_summary
+
+            out.append(f"    Code: {u['code']} · settings {u.get('config_hash')}: {config_summary(u.get('config') or {})}")
+        if u.get("stamped_file"):
+            out.append(f"    Same coins and data end with this code and settings: --universe-file {u['stamped_file']}")
+        if u.get("frozen"):
+            saved_code, saved_hash = u.get("saved_code"), u.get("saved_config_hash")
+            if saved_code is None and saved_hash is None:
+                out.append("    ! The universe file predates code/settings recording: it can't confirm this rerun "
+                           "used the same code and settings as the original run.")
+            else:
+                if saved_code != u.get("code"):
+                    out.append(f"    ! Different code from the saved run ({saved_code} then, {u.get('code')} now): "
+                               f"numbers can differ for that reason alone.")
+                for d in u.get("config_diffs") or []:
+                    out.append(f"    ! Setting changed since the saved run - {d}")
         if first:
             earliest = min(first.values())
             late = sorted((v, s) for s, v in first.items() if v > earliest + pd.Timedelta(days=2))
@@ -438,11 +465,12 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
 
 def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> str:
     matched_name = "Core at same exposure"
+    combined_name = f"Combined ({res.fraction:.0%} core)"
 
     def table(title: str, start: pd.Timestamp | None) -> list[str]:
-        out = [title, f"  {'':<28}{'end value':>12}{'total':>10}{'per year':>10}{'worst dip':>11}{'Sharpe':>8}"
-                      f"{'exposure':>10}"]
-        exposure = {f"Combined ({res.fraction:.0%} core)": res.combined_exposure, "Core only": res.core_exposure,
+        out = [title, f"  {'':<28}{'end value':>12}{'total':>10}{'per year':>10}{'worst dip':>11}{'dip low':>12}"
+                      f"{'Sharpe':>8}{'exposure':>10}"]
+        exposure = {combined_name: res.combined_exposure, "Core only": res.core_exposure,
                     "Satellite only": res.satellite.exposure if res.satellite is not None else None}
         rows = list(res.curves.items())
         if res.core_exposure is not None and res.combined_exposure is not None:
@@ -451,6 +479,7 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
                                  res.reset_days, res.capital, start)
             rows.insert(2, (f"{matched_name} ({k:.0%})", m))
             exposure[rows[2][0]] = res.core_exposure * k
+        seen = {}
         for name, curve in rows:
             c = curve.dropna()
             if start is not None:
@@ -458,12 +487,28 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
             if len(c) < 2:
                 continue
             s = curve_stats(c)
+            dip, top, low = worst_dip(c)
+            seen[name] = (s, dip, top, low)
             end_value = res.capital * c.iloc[-1] / c.iloc[0]
             ex = exposure.get(name)
             ex_txt = f"{ex[ex.index >= start].mean() if start is not None else ex.mean():>9.0%}" \
                 if ex is not None and len(ex) else f"{'-':>9}"
+            low_txt = f"{low:%Y-%m-%d}" if low is not None else "-"
             out.append(f"  {name:<28}{end_value:>12,.0f}{s['total_pct']:>+9.0f}%{s['cagr_pct']:>+9.1f}%"
-                       f"{-s['max_dd_pct']:>10.0f}%{s['sharpe']:>8.2f} {ex_txt}")
+                       f"{-dip:>10.0f}%{low_txt:>12}{s['sharpe']:>8.2f} {ex_txt}")
+        matched_key = next((n for n in seen if n.startswith(matched_name)), None)
+        if combined_name in seen and matched_key:
+            (cs, cdip, ctop, clow), (ms, mdip, mtop, mlow) = seen[combined_name], seen[matched_key]
+            sharpe_ok, dip_ok = cs["sharpe"] > ms["sharpe"], cdip < mdip
+            margin_ok = cs["sharpe"] >= ms["sharpe"] + 0.10 or cdip <= mdip - 3.0
+            verdict = ("beats it on Sharpe and worst dip" if sharpe_ok and dip_ok else
+                       "beats it on Sharpe only" if sharpe_ok else
+                       "beats it on worst dip only" if dip_ok else "does not beat it")
+            out.append(f"  Rule (65/35 must beat core at same exposure on Sharpe OR worst dip): Sharpe "
+                       f"{cs['sharpe']:.2f} vs {ms['sharpe']:.2f} -> {'yes' if sharpe_ok else 'no'}; worst dip "
+                       f"-{cdip:.1f}% ({ctop:%Y-%m-%d} to {clow:%Y-%m-%d}) vs -{mdip:.1f}% "
+                       f"({mtop:%Y-%m-%d} to {mlow:%Y-%m-%d}) -> {'yes' if dip_ok else 'no'}. 65/35 {verdict}; "
+                       f"with margins of +0.10 Sharpe or 3 points: {'yes' if margin_ok else 'no'}.")
         return out
 
     any_curve = next(iter(res.curves.values())).dropna()
@@ -475,6 +520,12 @@ def format_portfolio_backtest(res: PortfolioBacktest, quote: str = "USDT") -> st
     lines += table(f"\nFull history ({any_curve.index[0]:%Y-%m-%d} to {any_curve.index[-1]:%Y-%m-%d}):", None)
     if res.since is not None and res.since > any_curve.index[0]:
         lines += table(f"\nSince {res.since:%Y-%m-%d} (each rebased to {res.capital:,.0f}):", res.since)
+    if res.satellite_from is not None:
+        first = pd.Timestamp(res.satellite_from)
+        first = (first.tz_localize("UTC") if first.tz is None else first.tz_convert("UTC")).floor("D")
+        if first > any_curve.index[0]:
+            lines += table(f"\nFrom the satellite's first trade ({first:%Y-%m-%d}; before it the satellite is cash, "
+                           f"so this window compares like with like - benchmark re-matched to it):", first)
     lines.append(f"\n'{matched_name}' holds the core at the combined account's average exposure (the rest in "
                  f"cash): what 65/35 must beat on Sharpe or worst dip for the satellite to add anything.")
     lines.append("\nYear by year (%):")

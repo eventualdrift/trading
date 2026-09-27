@@ -113,14 +113,26 @@ trading can be set up to match them.
 
 It also compares against the core alone held at the **same average exposure** as the combined
 account, with the rest in cash. Holding cash lowers drawdowns by itself, so the satellite only
-adds something if 65/35 beats that line.
+adds something if 65/35 beats that line. After each window (full history, the test period,
+and from the satellite's first trade), a rule line gives:
+- the result: does 65/35 beat that line on Sharpe or on worst dip?
+- the dates of each worst dip.
+
+The window from the satellite's first trade is the like-for-like one: before that date the
+satellite is only cash, and the benchmark is re-matched to that window.
 
 **Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
 backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
 date, and saves both (with the selected strategies) to `reports/universe-<date>.json`. Rerun on
 exactly that coin list and data with `--universe-file reports/universe-<date>.json`. The cached
-candles aren't changed by a frozen run. A pre-registered research test can name such a file,
-so its coins and data end date are fixed when it is registered.
+candles aren't changed by a frozen run. The file also records the git commit and the settings the
+run used. The report prints both, and a rerun flags any difference: the same coins and data
+under different code or settings can give different numbers. If the file lacks these records,
+or they differ, the rerun saves a copy of the file stamped with its own commit and settings.
+A pre-registered research test can name such a file, so its coins and data end date are fixed
+when it is registered. `tradebot research note --id <test> --text "..."` annotates a recorded test
+(for example, how it was run). The note is appended to `research/ledger.jsonl`, and the recorded
+result is never edited.
 
 The satellite's open trades are valued at every daily close (marked to market), so its dips
 and its correlation with the core count losses that were never realised. The satellite
@@ -147,7 +159,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 225 tests
+pytest -q              # 229 tests
 ```
 
 ### 1. Configure
@@ -443,7 +455,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            225 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            229 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 
