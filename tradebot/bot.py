@@ -40,6 +40,14 @@ HELP = """<b>Commands</b>
 Learner = Callable[[SignalModel | None], "tuple[Selection, SignalModel | None, str]"]
 
 
+def code_stamp() -> tuple[int, int]:
+    """(newest modification time, file count) of the bot's source files."""
+    from pathlib import Path
+
+    files = list(Path(__file__).resolve().parent.rglob("*.py"))
+    return max((f.stat().st_mtime_ns for f in files), default=0), len(files)
+
+
 class TradingBot:
     def __init__(
         self,
@@ -72,12 +80,13 @@ class TradingBot:
         self._last_equity_record = 0
         self._last_dashboard = 0
         self._dashboard_server = None
-        self._brain_stamp = None
-        self._last_brain_check = 0
-        if cfg.learning.follow_state_dir:
-            from .learning import brain_stamp
+        from .learning import brain_stamp
 
-            self._brain_stamp = brain_stamp(cfg)  # the files the caller loaded the brain from
+        self._brain_stamp = brain_stamp(cfg)  # the strategy/model files the caller loaded
+        self._last_brain_check = 0
+        self._code_stamp = code_stamp()  # the code this process is running
+        self._last_code_check = 0
+        self._code_notified = False
         self._last_orphan_sweep = 0
         self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
         self._pending_extreme: dict[str, int] = {}
@@ -327,6 +336,11 @@ class TradingBot:
     def tick(self, now_ms: int) -> None:
         with self._lock:
             self.manage_positions(now_ms)
+            if self.core is not None:  # move capital between sleeves BEFORE anything is sized or recorded
+                try:
+                    self._maybe_core_day(now_ms)
+                except Exception as exc:
+                    self._notify_error(f"core sleeve: {exc}", key="core")
             equity, prices = self.equity()
             self._update_breakers(now_ms, equity)
             self._maybe_write_dashboard(now_ms, prices)
@@ -341,15 +355,10 @@ class TradingBot:
                 else:
                     log.info("skipping stale %s candle (bot started late)", tf)
                 self._set(f"last_scan:{tf}", candle)
-            if self.core is not None:
-                try:
-                    self._maybe_core_day(now_ms)
-                except Exception as exc:
-                    self._notify_error(f"core sleeve: {exc}", key="core")
             self._maybe_daily_summary(now_ms, equity)
-        if self.cfg.learning.follow_state_dir:
-            self._maybe_follow_brain(now_ms)
-        else:
+        self._check_code_version(now_ms)
+        self._maybe_reload_brain(now_ms)
+        if not self.cfg.learning.follow_state_dir:
             self._maybe_learn(now_ms)
 
     def on_candle_close(self, tf: str, now_ms: int, candle_open_ms: int) -> None:
@@ -793,26 +802,46 @@ class TradingBot:
             event=False,  # routine, and the dashboard shows the same numbers
         )
 
-    def _maybe_follow_brain(self, now_ms: int) -> None:
-        """Side-by-side instance: pick up the leader's selection/model whenever it retrains."""
+    def _maybe_reload_brain(self, now_ms: int) -> None:
+        """Pick up a strategy selection/model written outside this process: a `tradebot learn` run by
+        hand, or (side-by-side) the leader instance retraining."""
         if now_ms - self._last_brain_check < 5 * 60_000:
             return
+        if self._learn_thread is not None and self._learn_thread.is_alive():
+            return  # our own cycle is writing the files; it installs the result itself
         self._last_brain_check = now_ms
         from .learning import brain_stamp, load_brain
 
+        follow = self.cfg.learning.follow_state_dir
         try:
             stamp = brain_stamp(self.cfg)
             if stamp == self._brain_stamp:
                 return
             selection, model = load_brain(self.cfg)
             self._brain_stamp = stamp
+            if selection is None:
+                return
             self.set_brain(selection, model)
-            combos = ", ".join(c.key for c in (selection.selected if selection else [])) or "none"
-            self.notify(f"🧠 Strategies reloaded from {fmt.esc(self.cfg.learning.follow_state_dir)}: "
-                        f"{fmt.esc(combos)}")
+            combos = ", ".join(c.key for c in selection.selected) or "none"
+            source = f"from {fmt.esc(follow)}" if follow else "(a learning cycle ran outside the bot)"
+            self.notify(f"🧠 Strategies reloaded {source}: {fmt.esc(combos)}")
         except Exception as exc:
-            self._notify_error(f"could not reload strategies from {self.cfg.learning.follow_state_dir}: {exc}",
+            self._notify_error(f"could not reload strategies from {follow or 'the state folder'}: {exc}",
                                key="brain")
+
+    def _check_code_version(self, now_ms: int) -> None:
+        """A `git pull` without a restart leaves this process on the old code while other commands
+        (learn, report) run the new code against the same database. Say so once."""
+        if self._code_notified or now_ms - self._last_code_check < 10 * 60_000:
+            return
+        self._last_code_check = now_ms
+        try:
+            if code_stamp() != self._code_stamp:
+                self._code_notified = True
+                self.notify("⚠️ <b>New bot code is on disk</b>, but this bot is still running the version it "
+                            "started with. Run the tests and restart the bot to load it.")
+        except Exception as exc:
+            log.debug("code version check failed: %s", exc)
 
     def _maybe_learn(self, now_ms: int, force: bool = False) -> bool:
         if self.learner is None or (self._learn_thread and self._learn_thread.is_alive()):
@@ -826,6 +855,9 @@ class TradingBot:
             try:
                 selection, model, summary = self.learner(self.model)
                 self.set_brain(selection, model)
+                from .learning import brain_stamp
+
+                self._brain_stamp = brain_stamp(self.cfg)  # our own files: no "reloaded" notice
                 self.notify("🧠 <b>Self-learning cycle complete</b>\n" + fmt.esc(summary))
             except Exception as exc:
                 log.exception("learning cycle failed")

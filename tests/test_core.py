@@ -124,3 +124,30 @@ def test_report_shows_sleeve_pnl(core_bot, cfg):
             bot.tick(now)
     text = sleeve_summary(db, cfg, "paper")
     assert "Core" in text and "Satellite" in text and "Holding BTC" in text
+
+
+def test_first_day_moves_capital_before_sizing_signals_or_recording(cfg):
+    """On the first start the 65% must reach the core before the daily scan sizes any trade
+    (they are sized from the satellite's own equity) and before the first equity snapshot."""
+    from .test_bot import selection
+
+    cfg.core.fraction = 0.65
+    market = SyntheticMarket(["BTC/USDT", "ETH/USDT"], days=420, base_tf="1h", seed=21)
+    db = Database(cfg.state_path / "order.db")
+    broker = PaperBroker(db, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), 1000.0, market)
+    bot = TradingBot(cfg, market, broker, db, MemoryNotifier(), selection=selection(("momentum", "1d")))
+    seen = []
+    original = bot.on_candle_close
+
+    def spy(tf, now_ms, candle):
+        seen.append((tf, bot.core.initialized, broker.cash))
+        return original(tf, now_ms, candle)
+
+    bot.on_candle_close = spy
+    now = market.start_ms + 250 * DAY + 30_000  # 30s after a daily close
+    market.set_now(now)
+    bot.tick(now)
+    assert seen and seen[0][0] == "1d"
+    assert seen[0][1] is True and seen[0][2] == pytest.approx(350.0)  # sized from the satellite's 350
+    snaps = db.snapshots("paper")
+    assert snaps["core"].iloc[0] > 600  # no "core $0" first snapshot

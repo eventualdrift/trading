@@ -563,3 +563,33 @@ def test_open_risk_budget_is_paper_only(tmp_path, monkeypatch):
     p.write_text("mode: live\nrisk:\n  max_open_risk_pct: 3\n")
     with pytest.raises(ValueError, match="paper-only"):
         load_config(p, env_file=None)
+
+
+def test_bot_reloads_strategies_written_by_a_manual_learn(sim, cfg):
+    from tradebot.learning import SELECTION_FILE
+
+    market, db, broker, notes, bot = sim
+    now = market.start_ms + 60 * DAY
+    market.set_now(now)
+    bot.tick(now)
+    assert {c.key for c in bot.selection.selected} == {"breakout@1h", "trend@4h"}
+    selection(("momentum", "1d")).save(cfg.state_path / SELECTION_FILE)  # `tradebot learn` from the shell
+    now += 10 * 60_000
+    market.set_now(now)
+    bot.tick(now)
+    assert {c.key for c in bot.selection.selected} == {"momentum@1d"}
+    assert any("Strategies reloaded" in m for m in notes.messages)
+
+
+def test_warns_once_when_the_code_on_disk_changes(sim, monkeypatch):
+    import tradebot.bot as botmod
+
+    market, db, broker, notes, bot = sim
+    now = market.start_ms + 60 * DAY
+    for step in range(3):
+        if step == 1:
+            monkeypatch.setattr(botmod, "code_stamp", lambda: (1, 1))  # a `git pull` changed the files
+        now += 11 * 60_000
+        market.set_now(now)
+        bot.tick(now)
+    assert sum("New bot code is on disk" in m for m in notes.messages) == 1

@@ -138,7 +138,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 216 tests
+pytest -q              # 220 tests
 ```
 
 ### 1. Configure
@@ -403,6 +403,16 @@ docker compose logs -f
 
 State (database, strategy selection, ML model) lives in `./state`; price history in `./data`.
 
+**Updating.** After every `git pull`, install, test and **restart** the bot. A running bot keeps
+its old code in memory while other commands use the new code on the same database. If you
+forget, it warns you on Telegram ("New bot code is on disk"). A strategy selection written by
+a manual `tradebot learn` is picked up within 5 minutes without a restart.
+
+```bash
+cd ~/tradebot && git pull && .venv/bin/pip install -q -e ".[dev]" && .venv/bin/pytest -q \
+  && launchctl kickstart -k gui/$(id -u)/<your service label>     # or: docker compose restart
+```
+
 ## Project layout
 
 ```
@@ -424,7 +434,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            216 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            220 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

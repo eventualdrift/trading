@@ -73,6 +73,8 @@ class Database:
         types = self._types[cls]
         kwargs = {}
         for k in row.keys():
+            if k not in types:  # a column added by a newer version of the bot: not ours to read
+                continue
             v = row[k]
             t = types.get(k)
             if t is dict:

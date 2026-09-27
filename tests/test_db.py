@@ -46,3 +46,16 @@ def test_migration_adds_columns(tmp_path):
     db = Database(path)
     db.insert_signal(Signal("A/USDT", "1h", "trend", "long", 1, 0.9, 1.2, 0, 0, 0, 0))
     assert db.recent_signals(1)[0].symbol == "A/USDT"
+
+
+def test_rows_written_by_a_newer_version_can_still_be_read(tmp_path):
+    """Old code must not crash on a column added by newer code (a pull without a restart)."""
+    from tradebot.db import Database
+    from tradebot.models import Position
+
+    db = Database(tmp_path / "t.db")
+    pid = db.insert_position(Position(symbol="A/USDT", timeframe="1d", strategy="x", side="long", mode="paper",
+                                      amount=1, entry_price=10, stop_loss=9, take_profit=12, initial_stop=9,
+                                      opened_at=0, max_hold_until=1))
+    db._conn.execute("ALTER TABLE positions ADD COLUMN some_future_field REAL DEFAULT 1.5")
+    assert db.get_position(pid).symbol == "A/USDT"
