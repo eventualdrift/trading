@@ -42,19 +42,31 @@ def brain_stamp(cfg: BotConfig) -> tuple:
     return tuple(out)
 
 
-def load_datasets(market, cfg: BotConfig, symbols: list[str], store=None, now_ms: int | None = None,
-                  log_fn=print) -> dict[str, dict[str, pd.DataFrame]]:
+def load_frame(market, store, symbol: str, tf: str, days: float, now_ms: int | None = None,
+               end_ms: int | None = None) -> pd.DataFrame:
+    """History for one symbol/timeframe. With ``end_ms`` (a frozen data end date) the cache is
+    read but never changed; otherwise it is brought up to date."""
+    from .timeframes import drop_unclosed
+
+    if end_ms is not None:
+        if store is not None:
+            return store.frozen(market, symbol, tf, days, end_ms)
+        return drop_unclosed(market.history(symbol, tf, end_ms - int(days * 86_400_000), end_ms), tf, end_ms)
     now = now_ms or market.now_ms()
+    if store is not None:
+        return store.update(market, symbol, tf, days, now)
+    return market.history(symbol, tf, now - int(days * 86_400_000), now)
+
+
+def load_datasets(market, cfg: BotConfig, symbols: list[str], store=None, now_ms: int | None = None,
+                  log_fn=print, end_ms: int | None = None) -> dict[str, dict[str, pd.DataFrame]]:
     out: dict[str, dict[str, pd.DataFrame]] = {}
     for tf in cfg.timeframes:
         days = cfg.data.history_days.get(tf, 365)
         out[tf] = {}
         for sym in symbols:
             try:
-                if store is not None:
-                    df = store.update(market, sym, tf, days, now)
-                else:
-                    df = market.history(sym, tf, now - days * 86_400_000, now)
+                df = load_frame(market, store, sym, tf, days, now_ms, end_ms)
             except Exception as exc:
                 log_fn(f"  ! {sym} {tf}: {exc}")
                 continue
@@ -64,18 +76,17 @@ def load_datasets(market, cfg: BotConfig, symbols: list[str], store=None, now_ms
     return out
 
 
-def load_context(market, cfg: BotConfig, store=None, now_ms: int | None = None, log_fn=print):
+def load_context(market, cfg: BotConfig, store=None, now_ms: int | None = None, log_fn=print,
+                 end_ms: int | None = None):
     """BTC daily + hourly history for the market context (uptrend filter, vol breaker, ML)."""
     from .context import context_symbol
 
-    now = now_ms or market.now_ms()
     sym = context_symbol(cfg.exchange.quote)
     frames = {}
     for tf in ("1d", "1h"):
         days = max(cfg.data.history_days.values(), default=365) + (cfg.context.uptrend_days if tf == "1d" else 30)
         try:
-            frames[tf] = (store.update(market, sym, tf, days, now) if store is not None
-                          else market.history(sym, tf, now - days * 86_400_000, now))
+            frames[tf] = load_frame(market, store, sym, tf, days, now_ms, end_ms)
         except Exception as exc:
             log_fn(f"  ! market context ({sym} {tf}) unavailable: {exc}")
             frames[tf] = None

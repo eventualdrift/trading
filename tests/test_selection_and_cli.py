@@ -49,3 +49,27 @@ def test_demo_runs_offline(tmp_path, monkeypatch, capsys):
     main(["demo", "--days", "240", "--sim-days", "4", "--symbols-n", "2"])
     out = capsys.readouterr().out
     assert "SYNTHETIC" in out and "Go-live readiness" in out
+
+
+def test_portfolio_backtest_reruns_on_a_frozen_universe(tmp_path, monkeypatch, capsys):
+    import json
+
+    from tradebot.backtest.selection import ComboResult, Selection
+    from tradebot.learning import SELECTION_FILE
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    Selection(0.0, [ComboResult("momentum", "1d", {}, {}, {}, 1, 1.0, True)]).save(state / SELECTION_FILE)
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"state_dir: {state}\ntimeframes: [1d]\nuniverse:\n  top_n: 4\nml:\n  enabled: false\n"
+                    "data:\n  history_days: {1d: 600}\n")
+    ufile = tmp_path / "universe.json"
+    end_ms = 1_748_736_000_000  # 2025-06-01, inside the synthetic history (2024-01 to 2025-09)
+    ufile.write_text(json.dumps({"symbols": ["BTC/USDT", "SOL/USDT"], "data_end_ms": end_ms,
+                                 "source": "saved run", "selection": ["momentum@1d"]}))
+    main(["--config", str(conf), "--env", str(tmp_path / "none.env"), "portfolio-backtest", "--synthetic",
+          "--days", "600", "--since", "", "--universe-file", str(ufile)])
+    out = capsys.readouterr().out
+    assert "Coins: BTC, SOL" in out and "Data to 2025-06-01 00:00 UTC (frozen" in out
+    assert "to 2025-05-31)" in out  # every series stops at the frozen data end date

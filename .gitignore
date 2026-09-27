@@ -22,3 +22,4 @@ dist/
 *.sqlite
 *.log
 .DS_Store
+/reports/

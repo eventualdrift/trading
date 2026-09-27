@@ -248,11 +248,17 @@ def cmd_research(args, cfg):
     if args.topic == "sizing":
         return _research_sizing(args, cfg, selection)
     market = _market(cfg, args.synthetic)
-    symbols = select_universe(market, cfg)
+    frozen = None
+    if args.universe_file:
+        from .universe import load_universe
+
+        frozen = load_universe(args.universe_file)
+    symbols = list(frozen["symbols"]) if frozen else select_universe(market, cfg)
+    end = frozen["data_end_ms"] if frozen else None
     cfg.timeframes = selection.timeframes()
     store = _store(cfg, market)
-    datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None)
-    context = load_context(market, cfg, store, log_fn=print)
+    datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None, end_ms=end)
+    context = load_context(market, cfg, store, log_fn=print, end_ms=end)
     if context is None:
         sys.exit("BTC history unavailable - cannot evaluate the breaker.")
     print("Volatility circuit breaker: selected strategies with and without it "
@@ -260,27 +266,39 @@ def cmd_research(args, cfg):
     print(format_breaker_study(breaker_study(selection, datasets, cfg, context, tuple(args.ratios))))
 
 
-def _portfolio_inputs(cfg, selection, synthetic: bool, days: int) -> dict:
+def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file: str | None = None,
+                      save_dir: str | None = "reports") -> dict:
     """Everything the whole-account backtests need: core closes, satellite candidate trades,
-    daily closes to value them, per-strategy split stats and the universe used."""
+    daily closes to value them, per-strategy split stats and the universe used.
+
+    ``universe_file``: rerun on a saved coin list AND its data end date (reproducible). Without it
+    the universe is today's, and it is saved to ``save_dir`` so the run can be reproduced later."""
     from .backtest.selection import run_combo
-    from .learning import load_context, load_datasets
+    from .learning import load_context, load_datasets, load_frame
     from .portfolio import combo_split_stats
+    from .universe import load_universe, save_universe
 
     market = _market(cfg, synthetic)
     store = _store(cfg, market)
-    now = market.now_ms()
+    frozen = load_universe(universe_file) if universe_file else None
+    end = frozen["data_end_ms"] if frozen else None
+    data_end = end or market.now_ms()
     core_closes = {}
     for sym in cfg.core.symbols:
-        df = (store.update(market, sym, "1d", days, now) if store is not None
-              else market.history(sym, "1d", now - days * 86_400_000, now))
-        core_closes[sym] = df["close"]
+        core_closes[sym] = load_frame(market, store, sym, "1d", days, end_ms=end)["close"]
     trades, combos, sat_closes, universe = [], [], {}, None
     if selection and selection.selected:
-        symbols = select_universe(market, cfg)
+        keys = [c.key for c in selection.selected]
+        if frozen:
+            symbols = list(frozen["symbols"])
+            if frozen.get("selection") and sorted(frozen["selection"]) != sorted(keys):
+                print(f"WARNING: the strategies selected now ({', '.join(keys)}) differ from the saved run's "
+                      f"({', '.join(frozen['selection'])}) - results will differ for that reason.")
+        else:
+            symbols = select_universe(market, cfg)
         cfg.timeframes = selection.timeframes()
-        datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None)
-        context = load_context(market, cfg, store, log_fn=lambda *_: None)
+        datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None, end_ms=end)
+        context = load_context(market, cfg, store, log_fn=lambda *_: None, end_ms=end)
         for c in selection.selected:
             is_t, oos_t, _ = run_combo(datasets.get(c.timeframe, {}), c.strategy, c.params, c.timeframe, cfg, context)
             trades += is_t + oos_t
@@ -291,7 +309,13 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int) -> dict:
                 if sym not in sat_closes:  # daily closes to value open trades each day
                     sat_closes[sym] = df["close"] if tf == "1d" else df["close"].resample("1D").last().dropna()
                 first[sym] = min(first.get(sym, df.index[0]), df.index[0])
-        universe = {"source": describe_universe(cfg, time.strftime("%Y-%m-%d")), "symbols": symbols, "first": first}
+        source = frozen["source"] if frozen else describe_universe(cfg, time.strftime("%Y-%m-%d"))
+        path = universe_file
+        if not frozen and save_dir and not synthetic:
+            stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(data_end / 1000))
+            path = save_universe(Path(save_dir) / f"universe-{stamp}.json", symbols, data_end, source, keys, cfg)
+        universe = {"source": source, "symbols": symbols, "first": first, "data_end_ms": data_end,
+                    "file": path, "frozen": bool(frozen)}
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
             "universe": universe}
 
@@ -306,7 +330,9 @@ def _research_sizing(args, cfg, selection):
         return
     if cfg.risk.max_open_risk_pct is not None:
         sys.exit("risk.max_open_risk_pct is already set in the config - the test compares against today's rule.")
-    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days)
+    # a test registered with a frozen universe runs on it (coins + data end date fixed in advance)
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days,
+                          args.universe_file or SIZING_TEST.get("universe_file"))
     fraction = cfg.core.fraction or 0.65
     study = sizing_study(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                          sat_closes=x["sat_closes"], combos=x["combos"], universe=x["universe"])
@@ -326,7 +352,7 @@ def cmd_portfolio_backtest(args, cfg):
     from .portfolio import format_portfolio_backtest, portfolio_backtest
 
     selection, _ = load_brain(cfg)
-    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days)
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
     fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since=args.since or None, sat_closes=x["sat_closes"], combos=x["combos"],
@@ -441,6 +467,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--core-fraction", type=float, default=None, help="default: core.fraction, or 0.65 if unset")
     sp.add_argument("--days", type=int, default=3200, help="daily history for the core (default ~8.8 years)")
     sp.add_argument("--since", default="2022-01-01", help="also report from this date (the test period)")
+    sp.add_argument("--universe-file", default=None,
+                    help="rerun on a saved coin list and data end date (reports/universe-*.json)")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
     sp.add_argument("topic", choices=["breaker", "sizing"],
@@ -449,6 +477,7 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--capital", type=float, default=1000.0, help="sizing: account size")
     sp.add_argument("--days", type=int, default=3200, help="sizing: daily history for the core")
     sp.add_argument("--rerun", action="store_true", help="sizing: show the test again (marked as a re-run)")
+    sp.add_argument("--universe-file", default=None, help="run on a saved coin list and data end date")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("project", help="what could the account become? (Monte Carlo from out-of-sample trades)")
     sp.add_argument("--capital", type=float, default=1000.0)

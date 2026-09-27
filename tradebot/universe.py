@@ -63,3 +63,38 @@ def describe_universe(cfg: BotConfig, date: str) -> str:
         return "your universe.whitelist"
     age = f", traded for at least {u.min_history_days:g} days" if u.min_history_days > 0 else ""
     return f"today's top {u.top_n} {cfg.exchange.quote} pairs by 24h volume{age} ({date})"
+
+
+def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selection_keys: list[str],
+                  cfg: BotConfig) -> str:
+    """Freeze a run's coin list and data end date so it can be reproduced (--universe-file)."""
+    import json
+    import time
+    from pathlib import Path
+
+    import pandas as pd
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    u = cfg.universe
+    path.write_text(json.dumps({
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "data_end": pd.Timestamp(data_end_ms, unit="ms", tz="UTC").isoformat(),
+        "data_end_ms": int(data_end_ms),
+        "source": source,
+        "symbols": list(symbols),
+        "selection": list(selection_keys),
+        "rules": {"top_n": u.top_n, "min_quote_volume": u.min_quote_volume,
+                  "min_history_days": u.min_history_days, "whitelist": u.whitelist, "blacklist": u.blacklist},
+    }, indent=2))
+    return str(path)
+
+
+def load_universe(path) -> dict:
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(path).read_text())
+    if not data.get("symbols") or "data_end_ms" not in data:
+        raise ValueError(f"{path} is not a saved universe (needs 'symbols' and 'data_end_ms')")
+    return data

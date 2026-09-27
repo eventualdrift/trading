@@ -67,6 +67,10 @@ class SatelliteRun:
     sizes: list[float] = field(default_factory=list)  # entry notional / equity, per taken trade
     realized_end: float = 1.0  # same number portfolio_simulation gives
     unmarked: int = 0  # taken trades without daily prices (valued only when closed)
+    # one entry per trade skipped because the slots/budget were full: the strategies holding the
+    # slots then, and whether it lost at the same close (it would have fit without the trades
+    # taken at that very moment, i.e. it was out-ranked) or found them already full
+    skip_detail: list[dict] = field(default_factory=list)
 
 
 def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIndex,
@@ -86,7 +90,12 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     open_: list[tuple[Trade, float, float]] = []  # (trade, notional, pnl)
     booked: list[tuple[Trade, float, float]] = []
     skipped: dict[str, list[Trade]] = {}
+    skip_detail: list[dict] = []
     sizes = []
+
+    def key(tr: Trade) -> str:
+        return f"{tr.strategy}@{tr.timeframe}"
+
     for t in sorted(trades, key=live_order):
         still = []
         for item in sorted(open_, key=lambda x: x[0].exit_time):
@@ -96,16 +105,23 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
                 still.append(item)
         open_ = still
         frac = position_fraction(t.stop_pct, r)
-        if budget is None:
-            if len(open_) >= r.max_open_positions:
-                skipped.setdefault(f"max open positions ({r.max_open_positions})", []).append(t)
-                continue
-        else:
-            at_stake = sum(n_ * ot.stop_pct for ot, n_, _ in open_
+
+        def full(holding) -> bool:
+            if budget is None:
+                return len(holding) >= r.max_open_positions
+            at_stake = sum(n_ * ot.stop_pct for ot, n_, _ in holding
                            if ot.protected_time is None or ot.protected_time > t.entry_time)
-            if at_stake + equity * frac * t.stop_pct > equity * budget / 100.0 + 1e-12:
-                skipped.setdefault(f"open-risk budget ({budget:g}%)", []).append(t)
-                continue
+            return at_stake + equity * frac * t.stop_pct > equity * budget / 100.0 + 1e-12
+
+        if full(open_):
+            reason = (f"max open positions ({r.max_open_positions})" if budget is None
+                      else f"open-risk budget ({budget:g}%)")
+            skipped.setdefault(reason, []).append(t)
+            earlier = [x for x in open_ if x[0].entry_time != t.entry_time]
+            skip_detail.append({"trade": t, "strategy": key(t), "same_close": not full(earlier),
+                                "holders": [key(ot) for ot, _, _ in open_],
+                                "winners": [key(ot) for ot, _, _ in open_ if ot.entry_time == t.entry_time]})
+            continue
         if any(ot.symbol == t.symbol for ot, _, _ in open_):
             skipped.setdefault("already holding that coin", []).append(t)
             continue
@@ -158,7 +174,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
         exposure=pd.Series(np.divide(gross, eq, out=np.zeros(n), where=eq > 0), index=index),
         open_count=pd.Series(count, index=index),
         taken=[t for t, _, _ in booked], skipped=skipped, sizes=sizes,
-        realized_end=realized_end, unmarked=unmarked,
+        realized_end=realized_end, unmarked=unmarked, skip_detail=skip_detail,
     )
 
 
@@ -308,10 +324,35 @@ def _day(ts) -> str:
     return pd.Timestamp(ts).strftime("%Y-%m-%d") if ts is not None else "-"
 
 
+def _universe_lines(res: "PortfolioBacktest") -> list[str]:
+    out: list[str] = []
+    u = res.universe
+    if u:
+        syms = u.get("symbols", [])
+        first = {s: pd.Timestamp(v) for s, v in (u.get("first") or {}).items()}
+        line = (f"  Universe: {u.get('source', 'today')} - {len(syms)} coins, NOT the coins listed at the time. "
+                f"Coins that fell out of the top or were delisted are missing (survivorship bias - it "
+                f"flatters the satellite).")
+        out.append(line)
+        out.append("    Coins: " + ", ".join(s.split("/")[0] for s in syms))
+        if u.get("data_end_ms"):
+            out.append(f"    Data to {pd.Timestamp(u['data_end_ms'], unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC"
+                       + (" (frozen: from the universe file)" if u.get("frozen") else ""))
+        if u.get("file"):
+            out.append(f"    Reproduce this run: --universe-file {u['file']}")
+        if first:
+            earliest = min(first.values())
+            late = sorted((v, s) for s, v in first.items() if v > earliest + pd.Timedelta(days=2))
+            out.append(f"    {len(first) - len(late)} of {len(first)} have data from {_day(earliest)}; "
+                       f"{len(late)} start later" + (": " + ", ".join(f"{s.split('/')[0]} {_day(v)}" for v, s in late[:12])
+                                                     + (" ..." if len(late) > 12 else "") if late else ""))
+    return out
+
+
 def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
     sat = res.satellite
     if sat is None or not res.satellite_trades:
-        return ["", "Satellite measurement: no satellite trades (no strategy selected yet)."]
+        return ["", "Satellite measurement: no satellite trades (no strategy selected yet)."] + _universe_lines(res)
     start = pd.Timestamp(res.satellite_from)
     active = sat.equity.index >= start.floor("D")
     taken, skipped = sat.taken, [t for ts in sat.skipped.values() for t in ts]
@@ -333,6 +374,27 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
             sk = [t for t in skipped if f"{t.strategy}@{t.timeframe}" == k]
             out.append(f"    {k:<16} {len(tk) + len(sk):>5} -> {len(tk):>4} ({len(tk) / max(len(tk) + len(sk), 1):.0%}); "
                        f"taken {exp(tk)} · skipped {exp(sk)}")
+    if sat.skip_detail:
+        out.append("  Why slots were full (per skipped strategy): 'same close' = it would have fit but "
+                   "higher-ranked signals at the same close took the slots; 'already full' = slots were "
+                   "held by earlier trades:")
+        for k in sorted({d["strategy"] for d in sat.skip_detail}):
+            ds = [d for d in sat.skip_detail if d["strategy"] == k]
+            same = [d for d in ds if d["same_close"]]
+            full_ = [d for d in ds if not d["same_close"]]
+
+            def shares(lists) -> str:
+                counts: dict[str, int] = {}
+                for lst in lists:
+                    for h in lst:
+                        counts[h] = counts.get(h, 0) + 1
+                total = sum(counts.values()) or 1
+                return ", ".join(f"{h} {c / total:.0%}" for h, c in sorted(counts.items(), key=lambda kv: -kv[1]))
+
+            out.append(f"    {k:<16} {len(ds):>5} skipped: {len(same)} same close"
+                       + (f" (won by {shares([d['winners'] for d in same])})" if same else "")
+                       + f"; {len(full_)} already full"
+                       + (f" (slots held by {shares([d['holders'] for d in full_])})" if full_ else ""))
     if sat.sizes:
         s = np.array(sat.sizes) * 100
         out.append(f"  Position size at entry (% of satellite equity): mean {s.mean():.1f}%, median "
@@ -366,20 +428,7 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
     fmt = (lambda v: f"{v:+.2f}" if v is not None else "n/a")
     out.append(f"  Correlation, core vs satellite returns (both active): daily {fmt(d)} ({nd} days), "
                f"weekly {fmt(w)} ({nw} weeks); satellite vs BTC daily {fmt(b)}")
-    u = res.universe
-    if u:
-        syms = u.get("symbols", [])
-        first = {s: pd.Timestamp(v) for s, v in (u.get("first") or {}).items()}
-        line = (f"  Universe: {u.get('source', 'today')} - {len(syms)} coins, NOT the coins listed at the time. "
-                f"Coins that fell out of the top or were delisted are missing (survivorship bias - it "
-                f"flatters the satellite).")
-        out.append(line)
-        if first:
-            earliest = min(first.values())
-            late = sorted((v, s) for s, v in first.items() if v > earliest + pd.Timedelta(days=2))
-            out.append(f"    {len(first) - len(late)} of {len(first)} have data from {_day(earliest)}; "
-                       f"{len(late)} start later" + (": " + ", ".join(f"{s.split('/')[0]} {_day(v)}" for v, s in late[:12])
-                                                     + (" ..." if len(late) > 12 else "") if late else ""))
+    out += _universe_lines(res)
     out.append("  The candidate trades include the period used to select these strategies, so the satellite's "
                "results are optimistic.")
     return out

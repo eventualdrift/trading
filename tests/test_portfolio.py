@@ -162,3 +162,33 @@ def test_measurement_shows_which_strategies_got_the_slots():
     res = portfolio_backtest(closes, trades, BotConfig(), capital=1000, fraction=0.65, since=None)
     text = format_portfolio_backtest(res)
     assert "By strategy" in text and "momentum@4h" in text and "breakout@1d" in text
+
+
+def test_skips_are_attributed_to_same_close_ranking_or_slots_already_full():
+    from tradebot.portfolio import simulate_satellite
+
+    idx = pd.date_range("2022-01-01", periods=60, freq="D", tz="UTC")
+    held = []
+    for s in ("A1/USDT", "A2/USDT", "A3/USDT"):  # three 4h trades fill the slots on day 2
+        t = trade(s, 2, 30, 100.0, 101.0)
+        t.strategy, t.timeframe, t.signal_rr = "momentum", "4h", 8.0
+        held.append(t)
+    late = trade("L/USDT", 10, 15, 100.0, 105.0)  # daily breakout: slots already full
+    late.strategy = "breakout"
+    same = []  # day 40: four daily signals at one close compete for 3 free slots
+    for s, rr in (("S1/USDT", 8.0), ("S2/USDT", 3.0), ("S3/USDT", 2.5), ("S4/USDT", 2.0)):
+        t = trade(s, 40, 45, 100.0, 101.0)
+        t.strategy = "breakout" if rr < 8 else "momentum"
+        t.signal_rr = rr
+        same.append(t)
+    run = simulate_satellite(held + [late] + same, BotConfig(), idx, open_risk_pct=None)
+    by_symbol = {d["trade"].symbol: d for d in run.skip_detail}
+    assert set(by_symbol) == {"L/USDT", "S4/USDT"}
+    assert not by_symbol["L/USDT"]["same_close"] and by_symbol["L/USDT"]["holders"] == ["momentum@4h"] * 3
+    assert by_symbol["S4/USDT"]["same_close"]  # lowest reward:risk at that close: out-ranked
+    assert sorted(by_symbol["S4/USDT"]["winners"]) == ["breakout@1d", "breakout@1d", "momentum@1d"]
+    closes = {"BTC/USDT": pd.Series(np.linspace(100, 120, 60), index=idx),
+              "ETH/USDT": pd.Series(np.linspace(50, 60, 60), index=idx)}
+    text = format_portfolio_backtest(portfolio_backtest(closes, held + [late] + same, BotConfig(),
+                                                        capital=1000, fraction=0.65, since=None))
+    assert "Why slots were full" in text and "slots held by momentum@4h 100%" in text

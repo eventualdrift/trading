@@ -108,3 +108,17 @@ def test_universe_skips_new_listings_and_refills_from_established_coins():
     assert "NEW/USDT" in notes[0]
     cfg.universe.whitelist = ["NEW/USDT"]  # an explicit whitelist is respected as is
     assert select_universe(m, cfg) == ["NEW/USDT"]
+
+
+def test_frozen_loads_never_change_the_cache(tmp_path):
+    from tradebot.learning import load_frame
+
+    m = SyntheticMarket(["AAA/USDT"], days=40, base_tf="1h", seed=3)
+    store = OHLCVStore(tmp_path, m.id)
+    full = store.update(m, "AAA/USDT", "1h", 30)
+    before = store.path("AAA/USDT", "1h").read_bytes()
+    end = int(full.index[-100].value // 1_000_000)
+    frozen = load_frame(m, store, "AAA/USDT", "1h", 10, end_ms=end)
+    assert frozen.index[-1] < full.index[-100]  # only candles closed by the frozen end date
+    assert len(frozen) == 10 * 24 - 1 or len(frozen) == 10 * 24
+    assert store.path("AAA/USDT", "1h").read_bytes() == before  # the cache still has the newer data

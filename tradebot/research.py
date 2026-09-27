@@ -110,8 +110,11 @@ def sizing_study(core_closes, trades, cfg: BotConfig, *, capital: float, fractio
             "skipped": {k: len(v) for k, v in (sat.skipped.items() if sat else [])},
             "sizing": res.sizing,
         }
+    u = universe or {}
     return {"test": test, "fraction": fraction, "capital": capital, "candidates": len(trades),
             "assumptions": cfg.costs_description(), "runs": runs,
+            "universe": {"symbols": u.get("symbols"), "data_end_ms": u.get("data_end_ms"), "file": u.get("file"),
+                         "source": u.get("source")},
             "verdict": sizing_verdict(runs["rule"]["test"], test),
             "baseline_verdict": sizing_verdict(runs["baseline"]["test"], test)}
 
@@ -173,7 +176,9 @@ def record_study(state_dir, study: dict, rerun: bool = False):
     with open(folder / "ledger.jsonl", "a") as fh:
         fh.write(json.dumps({"id": study["test"]["id"], "ran_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                              "variants_tested": study["test"]["variants_tested"], "rerun": rerun,
-                             "pass": study["verdict"]["pass"]}) + "\n")
+                             "pass": study["verdict"]["pass"],
+                             "universe_file": (study.get("universe") or {}).get("file"),
+                             "data_end_ms": (study.get("universe") or {}).get("data_end_ms")}) + "\n")
     return path
 
 

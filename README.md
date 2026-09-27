@@ -115,10 +115,19 @@ It also compares against the core alone held at the **same average exposure** as
 account, with the rest in cash. Holding cash lowers drawdowns by itself, so the satellite only
 adds something if 65/35 beats that line.
 
+**Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
+backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
+date, and saves both (with the selected strategies) to `reports/universe-<date>.json`. Rerun on
+exactly that coin list and data with `--universe-file reports/universe-<date>.json`. The cached
+candles aren't changed by a frozen run. A pre-registered research test can name such a file,
+so its coins and data end date are fixed when it is registered.
+
 The satellite's open trades are valued at every daily close (marked to market), so its dips
 and its correlation with the core count losses that were never realised. The satellite
 section then shows:
-- candidate trades taken vs skipped, and why each was skipped;
+- candidate trades taken vs skipped, and why each was skipped. Per strategy it shows whether
+  the slots were already held by earlier trades (and by which strategies), or whether
+  higher-ranked signals at the same close took them;
 - average position size and exposure;
 - the number of trades behind each strategy's in-sample and out-of-sample R;
 - the correlation of the core's and the satellite's daily and weekly returns;
@@ -138,7 +147,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 221 tests
+pytest -q              # 224 tests
 ```
 
 ### 1. Configure
@@ -434,7 +443,7 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            221 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            224 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

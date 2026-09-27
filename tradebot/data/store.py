@@ -42,6 +42,23 @@ class OHLCVStore:
         finally:
             tmp.unlink(missing_ok=True)
 
+    def frozen(self, client, symbol: str, tf: str, days: int, end_ms: int) -> pd.DataFrame:
+        """The ``days`` before ``end_ms`` (closed candles only) WITHOUT changing the cache - for
+        reproducing a run on a fixed data end date. Missing parts are fetched but not saved."""
+        start = end_ms - int(days * 86_400_000)
+        df = self.load(symbol, tf)
+        if not df.empty:
+            ms = index_ms(df.index)
+            covered = ms[0] <= start + 2 * tf_ms(tf) and ms[-1] + tf_ms(tf) >= end_ms - tf_ms(tf)
+        else:
+            covered = False
+        if not covered and client is not None:
+            fresh = client.history(symbol, tf, start, end_ms)
+            df = pd.concat([df, fresh]) if not df.empty else fresh
+            df = df[~df.index.duplicated(keep="last")].sort_index()
+        df = drop_unclosed(df, tf, end_ms)
+        return df[df.index >= pd.Timestamp(start, unit="ms", tz="UTC")]
+
     def update(self, client, symbol: str, tf: str, days: int, now_ms: int | None = None) -> pd.DataFrame:
         """Bring the cached history up to date and return the last ``days`` of it."""
         now = now_ms or client.now_ms()
