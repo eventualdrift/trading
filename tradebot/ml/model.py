@@ -80,7 +80,7 @@ class ModelReport:
             f"  test set: all signals {self.base_expectancy_r:+.3f}R ({self.base_win_rate:.0%} win, {self.n_test} trades) "
             f"-> filtered {self.filtered_expectancy_r:+.3f}R ({self.filtered_win_rate:.0%} win, {self.filtered_trades} trades), "
             f"threshold {self.threshold:.2f}, AUC {auc}"
-            + (f", taken-vs-rejected t={self.edge_t:.1f}" if self.edge_t is not None else "")
+            + (f", taken-vs-rejected t={self.edge_t:.2f}" if self.edge_t is not None else "")
             + (f"\n  bigger bets on high-confidence setups: {'yes' if self.confidence_scaling else 'no'}"
                f" (their edge over the rest: {self.confidence_edge_r:+.2f}R)" if self.confidence_edge_r is not None else "")
         )
@@ -204,7 +204,7 @@ def train_model(
         se = np.sqrt(taken_r.var(ddof=1) / len(taken_r) + rejected.var(ddof=1) / len(rejected))
         rep.edge_t = float((taken_r.mean() - rejected.mean()) / se) if se > 0 else 0.0
         if rep.edge_t < cfg.min_edge_t:
-            problems.append(f"taken trades don't beat rejected ones convincingly (t={rep.edge_t:.1f} < {cfg.min_edge_t})")
+            problems.append(f"taken trades don't beat rejected ones convincingly (t={rep.edge_t:.2f} < {cfg.min_edge_t:.2f})")
     else:
         problems.append("the filter takes or rejects too few test trades to show an edge")
     if rep.filtered_trades < cfg.min_test_trades:

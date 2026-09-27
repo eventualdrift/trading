@@ -146,3 +146,19 @@ def test_open_risk_budget_frees_room_once_open_trades_are_protected():
     freed = simulate_satellite(early + late, cfg, idx, open_risk_pct=3.0)
     assert len(freed.taken) == 5 and not freed.skipped
     assert freed.open_count.max() == 5
+
+
+def test_measurement_shows_which_strategies_got_the_slots():
+    idx = pd.date_range("2021-01-01", periods=400, freq="D", tz="UTC")
+    closes = {"BTC/USDT": pd.Series(np.linspace(100, 200, 400), index=idx),
+              "ETH/USDT": pd.Series(np.linspace(50, 80, 400), index=idx)}
+    trades = []
+    for d in range(250, 390, 4):
+        a = trade(f"A{d}/USDT", d, d + 30, 10.0, 10.5, start="2021-01-01")
+        a.strategy, a.timeframe, a.signal_rr = "momentum", "4h", 8.0
+        b = trade(f"B{d}/USDT", d, d + 3, 10.0, 11.0, start="2021-01-01")
+        b.strategy, b.signal_rr = "breakout", 2.0
+        trades += [a, b]
+    res = portfolio_backtest(closes, trades, BotConfig(), capital=1000, fraction=0.65, since=None)
+    text = format_portfolio_backtest(res)
+    assert "By strategy" in text and "momentum@4h" in text and "breakout@1d" in text

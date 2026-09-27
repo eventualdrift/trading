@@ -325,6 +325,14 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
            f"skipped {len(skipped)}" + "".join(f"; {len(v)} {k}" for k, v in sat.skipped.items()),
            f"  R per trade (trade count): all candidates {exp(everything)} · taken {exp(taken)} · "
            f"skipped {exp(skipped)}"]
+    keys = sorted({f"{t.strategy}@{t.timeframe}" for t in everything})
+    if len(keys) > 1:  # which strategies got the slots
+        out.append("  By strategy (candidates -> taken; R of taken / skipped):")
+        for k in keys:
+            tk = [t for t in taken if f"{t.strategy}@{t.timeframe}" == k]
+            sk = [t for t in skipped if f"{t.strategy}@{t.timeframe}" == k]
+            out.append(f"    {k:<16} {len(tk) + len(sk):>5} -> {len(tk):>4} ({len(tk) / max(len(tk) + len(sk), 1):.0%}); "
+                       f"taken {exp(tk)} · skipped {exp(sk)}")
     if sat.sizes:
         s = np.array(sat.sizes) * 100
         out.append(f"  Position size at entry (% of satellite equity): mean {s.mean():.1f}%, median "
@@ -336,8 +344,10 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
                f"average open positions {c.mean():.1f}")
     if sat.unmarked:
         out.append(f"  ! {sat.unmarked} trades had no daily prices and are valued only when closed")
-    out.append(f"  Marked-to-market end value matches the realised replay: "
-               f"{sat.equity.iloc[-1]:.4f} vs {sat.realized_end:.4f} (x start)")
+    gap = sat.equity.iloc[-1] - sat.realized_end
+    out.append(f"  End value, marked to market vs realised replay: {sat.equity.iloc[-1]:.4f} vs {sat.realized_end:.4f} "
+               f"(x start)" + ("" if abs(gap) < 1e-9 else
+                               " - the difference is trades still open or closing after the last daily close"))
     if res.combos:
         out.append("  Per strategy - the trades behind each R figure (in-sample / out-of-sample split is per coin):")
         for cst in res.combos:
