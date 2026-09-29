@@ -138,7 +138,10 @@ run in a fixed order:
    the reading of each outcome.
 3. `oos-run` runs only if registered, only on that exact file, and only once.
 
-`oos-show` prints the recorded result.
+Run each step on its own and review its output before the next: the quality summary is meant
+to be read before the protocol is registered. `oos-show` prints the recorded result, with any
+notes added later by `tradebot research note --id core-btc-pre2017-v1 --text "..."` (a note
+never changes the result).
 
 **Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
 backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
@@ -178,7 +181,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 240 tests
+pytest -q              # 249 tests
 ```
 
 ### 1. Configure
@@ -270,6 +273,41 @@ Go-live readiness (paper track record):
   [PASS] drawdown within limit: max drawdown 6.2% (limit 15.0%)
   => READY for live trading (start small!)
 ```
+
+### Paper vs backtest, trade by trade: `tradebot reconcile`
+
+A few months of paper trading cannot say whether the strategies make money: there are too few
+trades. What it can test is whether the bot does what the backtest models.
+`tradebot reconcile` replays the backtest over the paper period on frozen candles (the cache is
+not changed; the report prints the `--since`/`--end` that reproduce it) and compares:
+
+- **Signals** (coin, strategy, candle): which each side saw, and why the other didn't: the bot
+  was not running, a scan error, the coin list is approximated, or not explained.
+- **Taken vs skipped**: the backtest's slot decisions, starting from the paper positions open
+  when the window begins, against what paper did. Disagreements are grouped by cause. Two
+  causes are known backtest simplifications:
+  - the backtest frees a slot at the *open* of the candle in which a held trade exits, but
+    paper holds that trade until it sells. The report reruns the slot decisions with exits at
+    the candle close.
+  - the backtest replays each coin/strategy one trade at a time, before slots are allotted. So
+    a trade it then skips still blocks that coin/strategy's next signals, which paper is free to
+    take.
+- **Fills**, for trades both sides entered: entry and exit price against the modelled fill (in
+  basis points), exit reason and candle, R, and fees.
+- **The core**: daily target weights against the backtest's; the rebalance rule replayed from
+  paper's own logged state (cash and holdings before each rebalance, backtest targets, daily
+  closes) to see if the same coins trade; fills against the daily close +/- slippage, and fees.
+
+What the bot was working with (coin list, active strategies, core targets and state, scan
+errors, sleeve moves) comes from its activity log (the `botlog` table), which starts with this
+version. Before that, the coin list, strategies and core targets are approximated, and the
+report says so. Running time comes from the 15-minute equity snapshots.
+
+```bash
+tradebot reconcile [--since "2026-10-01"] [--end "2026-12-31 00:00"] [--csv reconcile.csv]
+```
+
+Reporting only: nothing changes what the bot trades.
 
 ### 6. Go live (only when ready)
 
@@ -426,10 +464,11 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot research oos-fetch` → `oos-register` → `oos-run` (→ `oos-show`) | the one-time out-of-sample test of the core's rule on Bitstamp BTC/USD before 2017, in that order |
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
 | `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
+| `tradebot reconcile [--since ...] [--end ...] [--csv file]` | paper vs backtest, trade by trade, on frozen candles (reporting only) |
 | `tradebot telegram-test` | Telegram setup helper |
 | `tradebot demo` | offline demo on synthetic data |
 
-Add `--synthetic` to `learn`, `backtest`, `scan`, `project`, `research` or `portfolio-backtest` to try them
+Add `--synthetic` to `learn`, `backtest`, `scan`, `project`, `research`, `portfolio-backtest` or `reconcile` to try them
 without internet access (results on synthetic data are meaningless). `--config` and `--env` pick
 another config file and secrets file (for side-by-side instances).
 
@@ -476,7 +515,8 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-tests/            240 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+  reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core)
+tests/            249 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 

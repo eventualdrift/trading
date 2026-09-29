@@ -307,4 +307,6 @@ def format_result(res: dict) -> str:
         lines.append(f"  Sharpe at least buy-and-hold's: {'yes' if res['sharpe_ok'] else 'no'}; shallower worst dip: "
                      f"{'yes' if res['dip_ok'] else 'no'}")
     lines.append(f"  VERDICT: {res['verdict'].upper()} - {res['reading']}")
+    for n in res.get("notes", []):  # added afterwards with `tradebot research note`; the result is unchanged
+        lines.append(f"  Note ({n['at']}): {n['note']}")
     return "\n".join(lines)

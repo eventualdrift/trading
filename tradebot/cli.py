@@ -514,6 +514,66 @@ def cmd_config_set(args, cfg):
         print(f"  {line}")
 
 
+def cmd_reconcile(args, cfg):
+    import pandas as pd
+
+    from .db import Database
+    from .learning import load_brain, load_context, load_datasets, load_frame
+    from .provenance import code_version, config_hash, config_snapshot
+    from .reconcile import format_reconciliation, reconcile, write_csv
+    from .timeframes import last_closed_open_ms
+
+    db = Database(cfg.state_path / "tradebot.db")
+    mode = cfg.mode
+    market = _market(cfg, args.synthetic)
+    store = _store(cfg, market)
+    # frozen candles: nothing in the cache changes and --end reproduces the run
+    end = (int(pd.Timestamp(args.end, tz="UTC").value // 1_000_000) if args.end
+           else last_closed_open_ms(market.now_ms(), "1h") + 3_600_000)
+    if args.since:
+        since = int(pd.Timestamp(args.since, tz="UTC").value // 1_000_000)
+    else:  # the paper period: from the first signal or equity snapshot
+        firsts = [s.created_at for s in db.signals_since(0)[:1]]
+        snaps = db.snapshots(mode)
+        if len(snaps):
+            firsts.append(int(snaps.index[0].value // 1_000_000))
+        if not firsts:
+            sys.exit("no paper history yet (no signals or equity snapshots)")
+        since = min(firsts)
+    selection, _ = load_brain(cfg)
+    logged = db.botlog(mode, "universe")
+    if logged and logged[0][0] <= since:
+        fallback = list(logged[0][1])
+    else:  # coin lists not logged for (part of) the window: coins paper signalled or held + today's list
+        fallback = sorted({s.symbol for s in db.signals_since(since - 86_400_000)}
+                          | {p.symbol for p in db.positions_since(mode, since)}
+                          | set(logged[0][1] if logged else []) | set(select_universe(market, cfg)))
+    symbols = sorted(set(fallback).union(*(set(d) for _, d in logged)))
+    tfs = {c.timeframe for c in (selection.selected if selection else [])}
+    for _, d in db.botlog(mode, "selection"):
+        tfs |= {c["timeframe"] for c in d.get("combos", [])}
+    if not tfs:
+        sys.exit("no strategies selected - nothing to reconcile")
+    cfg.timeframes = sorted(tfs)
+    print(f"Loading candles for {len(symbols)} coins ({', '.join(cfg.timeframes)}) to "
+          f"{pd.Timestamp(end, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC ...", file=sys.stderr)
+    datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None, end_ms=end)
+    context = load_context(market, cfg, store, log_fn=lambda *_: None, end_ms=end)
+    days = max(cfg.core.sma_days) + 60 + (end - since) // 86_400_000
+    core = ({s: load_frame(market, store, s, "1d", days, end_ms=end)["close"] for s in cfg.core.symbols}
+            if cfg.core.fraction > 0 else {})
+    rec = reconcile(db, cfg, datasets, context, core, since, end, selection, fallback)
+    fmt_t = "%Y-%m-%d %H:%M"
+    rec.header = [f"  Candles frozen at {pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}} UTC · code {code_version()} "
+                  f"· settings {config_hash(config_snapshot(cfg))}",
+                  f"  Reproduce: tradebot reconcile --since \"{pd.Timestamp(since, unit='ms', tz='UTC'):{fmt_t}}\" "
+                  f"--end \"{pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}}\""]
+    print(format_reconciliation(rec, cfg))
+    if args.csv:
+        write_csv(rec, args.csv)
+        print(f"\nevery signal row written to {args.csv}")
+
+
 def cmd_telegram_test(args, cfg):
     import requests
 
@@ -601,6 +661,11 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--csv", default=None, help="also write every signal's row to this CSV file")
     sp = sub.add_parser("config-set", help="change settings in the config file (keeps comments, makes a backup)")
     sp.add_argument("assignments", nargs="+", metavar="key=value", help="e.g. costs.fee_rate=0.00075 core.fraction=0.65")
+    sp = sub.add_parser("reconcile", help="paper vs backtest, trade by trade (reporting only)")
+    sp.add_argument("--since", default=None, help="start of the paper period (default: its first record)")
+    sp.add_argument("--end", default=None, help="freeze the candles at this UTC time (default: the last full hour)")
+    sp.add_argument("--csv", default=None, help="also write every signal row to this CSV")
+    sp.add_argument("--synthetic", action="store_true")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -618,7 +683,7 @@ def main(argv: list[str] | None = None) -> None:
         "init": cmd_init, "learn": cmd_learn, "backtest": cmd_backtest, "scan": cmd_scan,
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
-        "compare-entries": cmd_compare_entries, "config-set": cmd_config_set,
+        "compare-entries": cmd_compare_entries, "config-set": cmd_config_set, "reconcile": cmd_reconcile,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

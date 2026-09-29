@@ -52,8 +52,9 @@ class OHLCVStore:
             covered = ms[0] <= start + 2 * tf_ms(tf) and ms[-1] + tf_ms(tf) >= end_ms - tf_ms(tf)
         else:
             covered = False
-        if not covered and client is not None:
-            fresh = client.history(symbol, tf, start, end_ms)
+        if not covered and client is not None:  # fetch only the tail when the cache has the start
+            head = not df.empty and ms[0] <= start + 2 * tf_ms(tf)
+            fresh = client.history(symbol, tf, int(ms[-1]) if head else start, end_ms)
             df = pd.concat([df, fresh]) if not df.empty else fresh
             df = df[~df.index.duplicated(keep="last")].sort_index()
         df = drop_unclosed(df, tf, end_ms)

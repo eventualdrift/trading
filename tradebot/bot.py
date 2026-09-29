@@ -1,6 +1,7 @@
 """The trading bot: watches the market 24/7, sends signals, manages positions."""
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -91,6 +92,7 @@ class TradingBot:
         self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
         self._pending_extreme: dict[str, int] = {}
         self._stop = threading.Event()
+        self._log_selection()
         if hasattr(broker, "persist"):  # live broker saves order ids BEFORE each order is sent
             broker.persist = self.db.update_position
         self.core = (CoreSleeve(db, cfg.core, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), self.mode, market)
@@ -117,6 +119,27 @@ class TradingBot:
             if model is not None:
                 self.model = model
             self.scanner = Scanner(self.market, self.cfg, self.selection, self.model)
+            self._log_selection()
+
+    def _log(self, kind: str, data, ts: int | None = None) -> None:
+        """Record what the bot is working with (reconciliation against the backtest); never fatal."""
+        try:
+            self.db.log_bot(ts if ts is not None else self._now_ms(), self.mode, kind, data)
+        except Exception as exc:
+            log.debug("botlog %s failed: %s", kind, exc)
+
+    def _log_selection(self) -> None:
+        sel = self.selection
+        data = {"combos": [{"strategy": c.strategy, "timeframe": c.timeframe, "params": c.params}
+                           for c in (sel.selected if sel else [])],
+                "created_at": sel.created_at if sel else None, "ml": self.model is not None}
+        try:
+            last = self.db.last_botlog(self.mode, "selection")
+            if last is not None and last[1] == json.loads(json.dumps(data, default=str)):
+                return
+        except Exception as exc:
+            log.debug("botlog read failed: %s", exc)
+        self._log("selection", data)
 
     def active_timeframes(self) -> list[str]:
         return self.selection.timeframes() if self.selection else []
@@ -125,7 +148,10 @@ class TradingBot:
         u = self.cfg.universe
         if not self._symbols or now_ms - self._symbols_at > u.refresh_hours * 3_600_000:
             try:
-                self._symbols = select_universe(self.market, self.cfg, now_ms)
+                symbols = select_universe(self.market, self.cfg, now_ms)
+                if symbols != self._symbols:
+                    self._log("universe", symbols, now_ms)
+                self._symbols = symbols
                 self._symbols_at = now_ms
             except Exception as exc:
                 log.warning("universe refresh failed: %s", exc)
@@ -242,11 +268,16 @@ class TradingBot:
             self.core.initialize(amount)
             self._shift_breakers(-amount)
             self._set("sleeves_last_ms", now_ms)
+            self._log("core_transfer", {"amount": amount, "why": "core started"}, now_ms)
             self.notify(f"🏛 <b>Core sleeve started</b>: {amount:,.2f} {quote} ({c.fraction:.0%}) moved into the "
                         f"BTC/ETH trend allocation; {sat - amount:,.2f} {quote} stays with the signal strategies.")
         elif c.rebalance_sleeves_days > 0 and now_ms - self._get("sleeves_last_ms", 0) >= c.rebalance_sleeves_days * 86_400_000:
             self._rebalance_sleeves(now_ms, prices)
-        trades = self.core.rebalance(now_ms, prices)
+        targets = self.core.target_weights(now_ms)
+        before = {"cash": self.core.cash, "holdings": self.core.holdings}  # the state the rebalance started from
+        trades = self.core.rebalance(now_ms, prices, targets)
+        self._log("core_day", {"day": day, "targets": targets, "prices": prices, **before, "trades": len(trades)},
+                  now_ms)
         if trades:
             self.notify(fmt.format_core_rebalance(trades, self.core.weights, self.core.equity(prices), quote))
 
@@ -266,11 +297,13 @@ class TradingBot:
             self.broker.transfer(-moved)
             self.core.deposit(moved)
             self._shift_breakers(-moved)
+            self._log("core_transfer", {"amount": moved, "why": "sleeve reset"}, now_ms)
             text = f"{moved:,.2f} {quote} satellite → core"
         else:
             moved, _ = self.core.withdraw(-delta, prices, now_ms)
             self.broker.transfer(moved)
             self._shift_breakers(moved)
+            self._log("core_transfer", {"amount": -moved, "why": "sleeve reset"}, now_ms)
             text = f"{moved:,.2f} {quote} core → satellite"
         self.notify(f"⚖️ Sleeves reset to {c.fraction:.0%} core: moved {text}.")
 
@@ -367,6 +400,8 @@ class TradingBot:
         res = self.scanner.scan(tf, symbols, now_ms, candle_open_ms, open_positions)
         for err in res.errors:
             log.warning("scan: %s", err)
+        if res.errors:
+            self._log("scan_errors", {"tf": tf, "candle": candle_open_ms, "errors": res.errors[:50]}, now_ms)
         for pid, reason in res.exits.items():
             pos = self.db.get_position(pid)
             if pos and pos.status == "open":

@@ -122,3 +122,22 @@ def test_frozen_loads_never_change_the_cache(tmp_path):
     assert frozen.index[-1] < full.index[-100]  # only candles closed by the frozen end date
     assert len(frozen) == 10 * 24 - 1 or len(frozen) == 10 * 24
     assert store.path("AAA/USDT", "1h").read_bytes() == before  # the cache still has the newer data
+
+
+def test_frozen_load_past_the_cache_fetches_only_the_tail(tmp_path):
+    from tradebot.learning import load_frame
+
+    m = SyntheticMarket(["AAA/USDT"], days=40, base_tf="1h", seed=3)
+    store = OHLCVStore(tmp_path, m.id)
+    end = m.now_ms()
+    m.set_now(end - 5 * 86_400_000)  # the cache was last updated five days ago
+    store.update(m, "AAA/USDT", "1h", 30)
+    before = store.path("AAA/USDT", "1h").read_bytes()
+    m.set_now(end)
+    calls = []
+    real = m.history
+    m.history = lambda sym, tf, since, until: calls.append(since) or real(sym, tf, since, until)
+    frozen = load_frame(m, store, "AAA/USDT", "1h", 20, end_ms=end)
+    assert calls and min(calls) >= end - 6 * 86_400_000  # only the missing days are fetched
+    assert len(frozen) >= 20 * 24 - 1 and frozen.index.is_unique and frozen.index.is_monotonic_increasing
+    assert store.path("AAA/USDT", "1h").read_bytes() == before  # and not saved

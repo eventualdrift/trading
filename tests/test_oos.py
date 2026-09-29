@@ -103,5 +103,11 @@ def test_cli_register_run_show(tmp_path, monkeypatch, capsys):
     assert "VERDICT" in capsys.readouterr().out
     main(base + ["oos-show"])
     assert "VERDICT" in capsys.readouterr().out
+    verdict = oos.result(tmp_path / "state")["verdict"]
+    main(base + ["note", "--id", "core-btc-pre2017-v1", "--text", "registered before the summary was reviewed"])
+    main(base + ["oos-show"])
+    out = capsys.readouterr().out
+    assert "registered before the summary was reviewed" in out and "Note (" in out
+    assert oos.result(tmp_path / "state")["verdict"] == verdict  # a note never changes the result
     with pytest.raises(SystemExit):
         main(base + ["oos-run"])  # once only

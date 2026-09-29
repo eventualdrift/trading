@@ -42,6 +42,8 @@ class Database:
                 "CREATE TABLE IF NOT EXISTS snapshots (ts INTEGER, mode TEXT, total REAL, core REAL, "
                 "satellite REAL, btc_price REAL)")
             self._conn.execute("CREATE TABLE IF NOT EXISTS events (ts INTEGER, mode TEXT, text TEXT)")
+            # what the bot was working with, for reconciling paper against the backtest (reporting only)
+            self._conn.execute("CREATE TABLE IF NOT EXISTS botlog (ts INTEGER, mode TEXT, kind TEXT, data TEXT)")
 
     # ------------------------------------------------------------- plumbing
     def _ensure_table(self, table: str, cls) -> None:
@@ -213,6 +215,22 @@ class Database:
     def log_event(self, ts: int, mode: str, text: str) -> None:
         with self._lock:
             self._conn.execute("INSERT INTO events VALUES (?,?,?)", (ts, mode, text))
+
+    def log_bot(self, ts: int, mode: str, kind: str, data) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO botlog VALUES (?,?,?,?)", (ts, mode, kind, json.dumps(data, default=str)))
+
+    def botlog(self, mode: str, kind: str, since_ms: int = 0) -> list[tuple[int, object]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT ts, data FROM botlog WHERE mode=? AND kind=? AND ts>=? ORDER BY ts, rowid",
+                                      (mode, kind, since_ms)).fetchall()
+        return [(int(r[0]), json.loads(r[1])) for r in rows]
+
+    def last_botlog(self, mode: str, kind: str):
+        with self._lock:
+            row = self._conn.execute("SELECT ts, data FROM botlog WHERE mode=? AND kind=? ORDER BY ts DESC, rowid DESC "
+                                     "LIMIT 1", (mode, kind)).fetchone()
+        return (int(row[0]), json.loads(row[1])) if row else None
 
     def events(self, mode: str, limit: int = 30) -> list[dict]:
         with self._lock:

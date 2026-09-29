@@ -59,3 +59,16 @@ def test_rows_written_by_a_newer_version_can_still_be_read(tmp_path):
                                       opened_at=0, max_hold_until=1))
     db._conn.execute("ALTER TABLE positions ADD COLUMN some_future_field REAL DEFAULT 1.5")
     assert db.get_position(pid).symbol == "A/USDT"
+
+
+def test_bot_activity_log(tmp_path):
+    db = Database(tmp_path / "t.db")
+    assert db.last_botlog("paper", "universe") is None
+    db.log_bot(200, "paper", "universe", ["BTC/USDT", "ETH/USDT"])
+    db.log_bot(100, "paper", "universe", ["BTC/USDT"])
+    db.log_bot(150, "live", "universe", ["SOL/USDT"])
+    db.log_bot(300, "paper", "core_day", {"day": 0, "targets": {"BTC/USDT": 0.75}})
+    assert db.botlog("paper", "universe") == [(100, ["BTC/USDT"]), (200, ["BTC/USDT", "ETH/USDT"])]
+    assert db.botlog("paper", "universe", since_ms=150) == [(200, ["BTC/USDT", "ETH/USDT"])]
+    assert db.last_botlog("paper", "universe") == (200, ["BTC/USDT", "ETH/USDT"])
+    assert db.botlog("paper", "core_day")[0][1]["targets"] == {"BTC/USDT": 0.75}
