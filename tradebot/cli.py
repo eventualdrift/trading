@@ -98,9 +98,11 @@ def cmd_backtest(args, cfg):
     print(cfg.costs_description())
     for tf in tfs:
         for name in strategies:
-            is_t, oos_t, _ = run_combo(datasets[tf], name, cfg.strategies.get(name, {}), tf, cfg, context)
-            trades = is_t + oos_t
-            all_trades += trades
+            cand: dict = {}
+            is_t, oos_t, _ = run_combo(datasets[tf], name, cfg.strategies.get(name, {}), tf, cfg, context,
+                                       candidates=cand)
+            all_trades += is_t + oos_t
+            trades = cand.get("is", []) + cand.get("oos", [])  # the account replay picks from every signal
             curve, taken = portfolio_simulation(trades, risk_per_trade_pct=r.risk_per_trade_pct,
                                                 max_position_pct=r.max_position_pct,
                                                 max_open_positions=r.max_open_positions)
@@ -186,6 +188,10 @@ def cmd_run(args, cfg):
         print("WARNING: no validated strategy - the bot will only manage existing positions and "
               "re-learn on schedule (or on /learn).")
     print(f"tradebot running in {cfg.mode.upper()} mode on {market.id}. Ctrl+C to stop.")
+    import signal
+
+    # launchd / docker stop and restart with SIGTERM: finish the tick and record a clean stop
+    signal.signal(signal.SIGTERM, lambda *_: bot.stop("SIGTERM: service stopped or restarted"))
     try:
         bot.run_forever()
     except KeyboardInterrupt:
@@ -283,6 +289,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
 
     ``universe_file``: rerun on a saved coin list AND its data end date (reproducible). Without it
     the universe is today's, and it is saved to ``save_dir`` so the run can be reproduced later."""
+    from .backtest.engine import refine_flat_times
     from .backtest.selection import run_combo
     from .learning import load_context, load_datasets, load_frame
     from .portfolio import combo_split_stats
@@ -311,9 +318,12 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
         datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None, end_ms=end)
         context = load_context(market, cfg, store, log_fn=lambda *_: None, end_ms=end)
         for c in selection.selected:
-            is_t, oos_t, _ = run_combo(datasets.get(c.timeframe, {}), c.strategy, c.params, c.timeframe, cfg, context)
-            trades += is_t + oos_t
-            combos.append(combo_split_stats(c.key, is_t, oos_t))
+            cand: dict = {}
+            is_t, oos_t, _ = run_combo(datasets.get(c.timeframe, {}), c.strategy, c.params, c.timeframe, cfg, context,
+                                       candidates=cand)
+            trades += cand.get("is", []) + cand.get("oos", [])  # every signal: the account replay picks
+            combos.append(combo_split_stats(c.key, is_t, oos_t))  # the strategy on its own
+        refine_flat_times(trades, datasets, cfg.costs.slippage_rate)
         first = {}
         for tf, ds in sorted(datasets.items(), key=lambda kv: kv[0] != "1d"):  # daily data first
             for sym, df in ds.items():
@@ -521,7 +531,7 @@ def cmd_reconcile(args, cfg):
     from .learning import load_brain, load_context, load_datasets, load_frame
     from .provenance import code_version, config_hash, config_snapshot
     from .reconcile import format_reconciliation, reconcile, write_csv
-    from .timeframes import last_closed_open_ms
+    from .timeframes import last_closed_open_ms, tf_ms
 
     db = Database(cfg.state_path / "tradebot.db")
     mode = cfg.mode
@@ -554,7 +564,7 @@ def cmd_reconcile(args, cfg):
         tfs |= {c["timeframe"] for c in d.get("combos", [])}
     if not tfs:
         sys.exit("no strategies selected - nothing to reconcile")
-    cfg.timeframes = sorted(tfs)
+    cfg.timeframes = sorted(tfs, key=tf_ms)
     print(f"Loading candles for {len(symbols)} coins ({', '.join(cfg.timeframes)}) to "
           f"{pd.Timestamp(end, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC ...", file=sys.stderr)
     datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None, end_ms=end)
@@ -565,7 +575,7 @@ def cmd_reconcile(args, cfg):
     rec = reconcile(db, cfg, datasets, context, core, since, end, selection, fallback)
     fmt_t = "%Y-%m-%d %H:%M"
     rec.header = [f"  Candles frozen at {pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}} UTC · code {code_version()} "
-                  f"· settings {config_hash(config_snapshot(cfg))}",
+                  f"· settings {config_hash(config_snapshot(cfg))} (timeframes {', '.join(cfg.timeframes)})",
                   f"  Reproduce: tradebot reconcile --since \"{pd.Timestamp(since, unit='ms', tz='UTC'):{fmt_t}}\" "
                   f"--end \"{pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}}\""]
     print(format_reconciliation(rec, cfg))

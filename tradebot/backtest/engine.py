@@ -55,6 +55,7 @@ class TradeOutcome:
     return_pct: float  # net return on notional as a fraction (0.01 = +1%)
     complete: bool  # False if the data ran out before the trade finished
     protected_idx: int | None = None  # bar whose close moved the stop to entry (it can no longer lose)
+    exit_at: str = "close"  # when in the exit bar the position went flat: "open" | "intrabar" | "close"
 
 
 @dataclass
@@ -79,10 +80,15 @@ class Trade:
     signal_rr: float = 0.0  # reward:risk at the signal close - how the live bot ranks same-time signals
     protected_time: pd.Timestamp | None = None  # when the stop reached entry (None: never)
     signal_volume: float = 0.0  # quote volume of the 24h up to the signal close (known then; live ranks ties by it)
+    exit_at: str = "close"  # "open" (gapped through the stop), "intrabar" (stop touched) or "close"
+    # when the position is flat and its slot is free: the exit bar's close, its open for a gap
+    # through the stop, or (refine_flat_times) the close of the finer candle that touched the stop.
+    # None (hand-built trades): exit_time
+    flat_time: pd.Timestamp | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        for k in ("signal_time", "entry_time", "exit_time", "protected_time"):
+        for k in ("signal_time", "entry_time", "exit_time", "protected_time", "flat_time"):
             if d[k] is not None:
                 d[k] = pd.Timestamp(d[k]).isoformat()
         return d
@@ -142,25 +148,25 @@ def simulate_trade(
     protected_idx = None
     last = min(n - 1, e + max_hold - 1)
 
-    exit_idx, exit_price, reason = last, c[last], ""
+    exit_idx, exit_price, reason, exit_at = last, c[last], "", "close"
     for j in range(e, last + 1):
         stop_reason = _stop_reason(at_breakeven, long, stop, entry)
         if long:
             if j > e and o[j] <= stop:
-                exit_idx, exit_price, reason = j, o[j] * (1 - slip), stop_reason
+                exit_idx, exit_price, reason, exit_at = j, o[j] * (1 - slip), stop_reason, "open"
                 break
             if l[j] <= stop:
-                exit_idx, exit_price, reason = j, stop * (1 - slip), stop_reason
+                exit_idx, exit_price, reason, exit_at = j, stop * (1 - slip), stop_reason, "intrabar"
                 break
             if c[j] >= tp:
                 exit_idx, exit_price, reason = j, tp * (1 - slip), "take_profit"
                 break
         else:
             if j > e and o[j] >= stop:
-                exit_idx, exit_price, reason = j, o[j] * (1 + slip), stop_reason
+                exit_idx, exit_price, reason, exit_at = j, o[j] * (1 + slip), stop_reason, "open"
                 break
             if h[j] >= stop:
-                exit_idx, exit_price, reason = j, stop * (1 + slip), stop_reason
+                exit_idx, exit_price, reason, exit_at = j, stop * (1 + slip), stop_reason, "intrabar"
                 break
             if c[j] <= tp:
                 exit_idx, exit_price, reason = j, tp * (1 + slip), "take_profit"
@@ -203,6 +209,7 @@ def simulate_trade(
         return_pct=float(ret),
         complete=complete,
         protected_idx=protected_idx if protected_idx is not None and protected_idx < exit_idx else None,
+        exit_at=exit_at,
     )
 
 
@@ -218,6 +225,68 @@ def reward_risk(side: str, close: float, sl: float, tp: float) -> float:
     return reward / risk if risk > 0 else 0.0
 
 
+def _prepared(pop: pd.DataFrame, timeframe: str) -> dict:
+    n = len(pop)
+    idx = pop.index
+    bar = pd.Timedelta(milliseconds=tf_ms(timeframe)) if timeframe else (idx[1] - idx[0] if n > 1 else pd.Timedelta(0))
+    per_day = max(1, round(pd.Timedelta(days=1) / bar)) if bar > pd.Timedelta(0) else 1
+    return {
+        "ohlc": tuple(pop[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close")),
+        "el": pop["enter_long"].to_numpy(), "es": pop["enter_short"].to_numpy(),
+        "xl": pop["exit_long"].to_numpy(), "xs": pop["exit_short"].to_numpy(),
+        "lsl": pop["long_sl"].to_numpy(dtype=float), "ltp": pop["long_tp"].to_numpy(dtype=float),
+        "ssl": pop["short_sl"].to_numpy(dtype=float), "stp": pop["short_tp"].to_numpy(dtype=float),
+        "trail": pop["trail_dist"].to_numpy(dtype=float) if "trail_dist" in pop else np.zeros(n),
+        "vol24": ((pop["close"] * pop["volume"]).rolling(per_day, min_periods=1).sum().to_numpy(dtype=float)
+                  if "volume" in pop else np.zeros(n)),  # trailing 24h quote volume at each candle's close
+        "idx": idx, "bar": bar, "n": n,
+    }
+
+
+def _trade_at(p: dict, i: int, strategy: Strategy, costs: Costs, symbol: str, timeframe: str, allow_short: bool,
+              breakeven_at_r: float, min_reward_risk: float) -> tuple[Trade | None, bool]:
+    """The trade a signal on bar ``i`` makes if it is taken -> (trade or None, was there a signal)."""
+    o, h, lo, c = p["ohlc"]
+    go_long = bool(p["el"][i])
+    go_short = bool(p["es"][i]) and allow_short
+    if go_long == go_short:  # neither, or conflicting signals
+        return None, False
+    side = "long" if go_long else "short"
+    sl, tp = (p["lsl"][i], p["ltp"][i]) if go_long else (p["ssl"][i], p["stp"][i])
+    if reward_risk(side, c[i], sl, tp) < min_reward_risk:
+        return None, False
+    out = simulate_trade(o, h, lo, c, p["xl"] if go_long else p["xs"], i, side, sl, tp,
+                         strategy.max_hold_bars, costs, breakeven_at_r, p["trail"][i])
+    if out is None:
+        return None, True
+    idx, bar, vol = p["idx"], p["bar"], p["vol24"][i]
+    exit_time = idx[out.exit_idx]
+    return Trade(
+        symbol=symbol,
+        timeframe=timeframe,
+        strategy=strategy.name,
+        side=side,
+        signal_idx=i,
+        signal_time=idx[i],
+        entry_time=idx[out.entry_idx],
+        exit_time=exit_time,
+        entry_price=out.entry_price,
+        exit_price=out.exit_price,
+        stop_loss=float(sl),
+        take_profit=float(tp),
+        reason=out.reason,
+        bars_held=out.exit_idx - out.entry_idx + 1,
+        r_multiple=out.r_multiple,
+        return_pct=out.return_pct,
+        stop_pct=abs(out.entry_price - sl) / out.entry_price,
+        signal_rr=reward_risk(side, c[i], sl, tp),
+        protected_time=(idx[out.protected_idx] + bar) if out.protected_idx is not None else None,
+        signal_volume=float(vol) if vol == vol else 0.0,
+        exit_at=out.exit_at,
+        flat_time=exit_time if out.exit_at == "open" else exit_time + bar,
+    ), True
+
+
 def backtest_populated(
     pop: pd.DataFrame,
     strategy: Strategy,
@@ -231,66 +300,74 @@ def backtest_populated(
     start_idx: int | None = None,
     end_idx: int | None = None,
 ) -> list[Trade]:
-    """Sequential (one position at a time) backtest over an already-populated frame."""
-    o, h, l, c = (pop[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
-    el, es = pop["enter_long"].to_numpy(), pop["enter_short"].to_numpy()
-    xl, xs = pop["exit_long"].to_numpy(), pop["exit_short"].to_numpy()
-    lsl, ltp = pop["long_sl"].to_numpy(dtype=float), pop["long_tp"].to_numpy(dtype=float)
-    ssl, stp = pop["short_sl"].to_numpy(dtype=float), pop["short_tp"].to_numpy(dtype=float)
-    trail = pop["trail_dist"].to_numpy(dtype=float) if "trail_dist" in pop else np.zeros(len(pop))
-    idx = pop.index
-    n = len(pop)
-    bar = pd.Timedelta(milliseconds=tf_ms(timeframe)) if timeframe else (idx[1] - idx[0] if n > 1 else pd.Timedelta(0))
-    per_day = max(1, round(pd.Timedelta(days=1) / bar)) if bar > pd.Timedelta(0) else 1
-    vol24 = ((pop["close"] * pop["volume"]).rolling(per_day, min_periods=1).sum().to_numpy(dtype=float)
-             if "volume" in pop else np.zeros(n))  # trailing 24h quote volume at each candle's close
+    """Sequential (one position at a time) backtest over an already-populated frame: the
+    strategy on its own, as selection scores it. Account replays use ``candidate_trades``."""
+    p = _prepared(pop, timeframe)
     i = strategy.warmup if start_idx is None else max(start_idx, strategy.warmup)
-    end = n - 1 if end_idx is None else min(end_idx, n - 1)
+    end = p["n"] - 1 if end_idx is None else min(end_idx, p["n"] - 1)
     trades: list[Trade] = []
     while i < end:
-        go_long = bool(el[i])
-        go_short = bool(es[i]) and allow_short
-        if go_long == go_short:  # neither, or conflicting signals
+        t, _ = _trade_at(p, i, strategy, costs, symbol, timeframe, allow_short, breakeven_at_r, min_reward_risk)
+        if t is None:
             i += 1
             continue
-        side = "long" if go_long else "short"
-        sl, tp = (lsl[i], ltp[i]) if go_long else (ssl[i], stp[i])
-        if reward_risk(side, c[i], sl, tp) < min_reward_risk:
-            i += 1
-            continue
-        out = simulate_trade(
-            o, h, l, c, xl if go_long else xs, i, side, sl, tp,
-            strategy.max_hold_bars, costs, breakeven_at_r, trail[i],
-        )
-        if out is None:
-            i += 1
-            continue
-        trades.append(
-            Trade(
-                symbol=symbol,
-                timeframe=timeframe,
-                strategy=strategy.name,
-                side=side,
-                signal_idx=i,
-                signal_time=idx[i],
-                entry_time=idx[out.entry_idx],
-                exit_time=idx[out.exit_idx],
-                entry_price=out.entry_price,
-                exit_price=out.exit_price,
-                stop_loss=float(sl),
-                take_profit=float(tp),
-                reason=out.reason,
-                bars_held=out.exit_idx - out.entry_idx + 1,
-                r_multiple=out.r_multiple,
-                return_pct=out.return_pct,
-                stop_pct=abs(out.entry_price - sl) / out.entry_price,
-                signal_rr=reward_risk(side, c[i], sl, tp),
-                protected_time=(idx[out.protected_idx] + bar) if out.protected_idx is not None else None,
-                signal_volume=float(vol24[i]) if vol24[i] == vol24[i] else 0.0,
-            )
-        )
-        i = max(out.exit_idx, i + 1)
+        trades.append(t)
+        i = max(t.signal_idx + t.bars_held, i + 1)  # = the exit bar: a new signal may come on it
     return trades
+
+
+def candidate_trades(
+    pop: pd.DataFrame,
+    strategy: Strategy,
+    costs: Costs,
+    *,
+    symbol: str = "",
+    timeframe: str = "",
+    allow_short: bool = False,
+    breakeven_at_r: float = 0.0,
+    min_reward_risk: float = 0.0,
+    start_idx: int | None = None,
+    end_idx: int | None = None,
+) -> list[Trade]:
+    """EVERY signal with the trade it makes if taken - for account replays, which decide from
+    their own open positions which ones are taken (as live does: a coin already held blocks a
+    new signal on it, a slot it did not take blocks nothing)."""
+    p = _prepared(pop, timeframe)
+    start = strategy.warmup if start_idx is None else max(start_idx, strategy.warmup)
+    end = p["n"] - 1 if end_idx is None else min(end_idx, p["n"] - 1)
+    out = []
+    for i in range(start, end):
+        t, _ = _trade_at(p, i, strategy, costs, symbol, timeframe, allow_short, breakeven_at_r, min_reward_risk)
+        if t is not None:
+            out.append(t)
+    return out
+
+
+def flat_at(t: Trade) -> pd.Timestamp:
+    """When ``t`` no longer holds a slot."""
+    return t.flat_time if t.flat_time is not None else t.exit_time
+
+
+def refine_flat_times(trades: list[Trade], datasets: dict[str, dict[str, pd.DataFrame]], slippage: float) -> None:
+    """A stop touched inside a long candle (a 1d trade) freed its slot when it was touched, not at
+    the candle's close: where a shorter timeframe of the same coin is loaded, find the first of its
+    candles that reached the stop and free the slot at that candle's close (when the next scan of
+    that timeframe could use it)."""
+    by_tf = sorted(datasets, key=tf_ms)
+    for t in trades:
+        if t.exit_at != "intrabar":
+            continue
+        bar = tf_ms(t.timeframe)
+        finer = next((tf for tf in by_tf if tf_ms(tf) < bar and t.symbol in datasets[tf]), None)
+        if finer is None:
+            continue
+        df = datasets[finer][t.symbol]
+        part = df.iloc[df.index.searchsorted(t.exit_time):df.index.searchsorted(t.exit_time + pd.Timedelta(milliseconds=bar))]
+        long = t.side == "long"
+        level = t.exit_price / (1 - slippage) if long else t.exit_price / (1 + slippage)
+        hit = part["low"] <= level * (1 + 1e-9) if long else part["high"] >= level * (1 - 1e-9)
+        if hit.any():
+            t.flat_time = hit.idxmax() + pd.Timedelta(milliseconds=tf_ms(finer))
 
 
 def backtest(
@@ -328,8 +405,8 @@ def portfolio_simulation(
     taken: list[Trade] = []
     for t in sorted(trades, key=live_order):
         still_open = []
-        for ot, pnl in sorted(open_, key=lambda x: x[0].exit_time):
-            if ot.exit_time <= t.entry_time:
+        for ot, pnl in sorted(open_, key=lambda x: flat_at(x[0])):
+            if flat_at(ot) <= t.entry_time:  # the slot is free only once the position is flat
                 equity += pnl
                 curve[ot.exit_time] = equity
             else:

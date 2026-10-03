@@ -202,3 +202,97 @@ def test_trades_carry_the_24h_volume_known_at_the_signal():
     t = backtest_populated(pop, S(), COSTS, symbol="A/USDT", timeframe="4h")[0]
     # 24h of 4h candles = the signal candle and the 5 before it (volumes 25..30), at price 100
     assert t.signal_volume == pytest.approx(100 * sum(range(25, 31)))
+
+
+# ------------------------------------------------- account replays: candidates and flat times
+def _pop(rows, flags, sl=95.0, tp=110.0, start="2024-01-01", freq="1h"):
+    import pandas as pd
+
+    df = bars(rows, start=start, freq=freq)
+    n = len(df)
+    f = np.zeros(n, dtype=bool)
+    f[list(flags)] = True
+    return df.assign(enter_long=f, enter_short=False, exit_long=False, exit_short=False,
+                     long_sl=sl, long_tp=tp, short_sl=np.nan, short_tp=np.nan).astype({"enter_short": bool}), pd
+
+
+class _Strat:
+    name, warmup, max_hold_bars = "x", 0, 50
+
+
+FLAT = (100, 101, 99, 100)
+
+
+def test_flat_time_says_when_the_slot_is_free():
+    from tradebot.backtest.engine import backtest_populated
+
+    hour = np.timedelta64(1, "h")
+    for exit_bar, exit_at, extra in (((101, 103, 94, 100), "intrabar", 1),  # stop touched inside the candle
+                                     ((90, 91, 89, 90), "open", 0),  # gapped through the stop at the open
+                                     ((101, 111, 100, 110), "close", 1)):  # target: decided at the close
+        pop, _ = _pop([FLAT, FLAT, exit_bar, FLAT], [0])
+        (t,) = backtest_populated(pop, _Strat(), COSTS, symbol="A", timeframe="1h")
+        assert t.exit_at == exit_at and t.exit_time == pop.index[2]
+        assert t.flat_time == pop.index[2] + extra * hour
+
+
+def test_candidates_include_signals_the_strategy_alone_would_skip():
+    from tradebot.backtest.engine import backtest_populated, candidate_trades
+
+    pop, _ = _pop([FLAT] * 12, [0, 3])  # the second signal comes while the first trade is still open
+    alone = backtest_populated(pop, _Strat(), COSTS, symbol="A", timeframe="1h")
+    every = candidate_trades(pop, _Strat(), COSTS, symbol="A", timeframe="1h")
+    assert [t.signal_idx for t in alone] == [0] and [t.signal_idx for t in every] == [0, 3]
+
+
+def test_a_skipped_trade_no_longer_blocks_its_coins_next_signal():
+    """One slot. A on coin A takes it; B's first signal is skipped; B's second signal, while B's
+    skipped trade would still have been running, is taken once A is flat - as live does."""
+    import pandas as pd
+
+    from tradebot.backtest.engine import candidate_trades
+    from tradebot.config import BotConfig
+    from tradebot.portfolio import simulate_satellite
+
+    a, _ = _pop([FLAT] * 3 + [(100, 111, 100, 110)] + [FLAT] * 20, [0])  # A: in at 1h, target at 3h close
+    b, _ = _pop([FLAT] * 24, [1, 6], tp=200.0)  # B: signals at 1h and 6h; each runs to the time stop
+    cands = (candidate_trades(a, _Strat(), COSTS, symbol="A/USDT", timeframe="1h")
+             + candidate_trades(b, _Strat(), COSTS, symbol="B/USDT", timeframe="1h"))
+    cfg = BotConfig()
+    cfg.risk.max_open_positions = 1
+    run = simulate_satellite(cands, cfg, pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"))
+    assert [(t.symbol, t.signal_idx) for t in run.taken] == [("A/USDT", 0), ("B/USDT", 6)]
+    assert [(t.symbol, t.signal_idx) for t in run.skipped["max open positions (1)"]] == [("B/USDT", 1)]
+
+
+def test_a_position_holds_its_slot_until_its_exit_candle_closes():
+    import pandas as pd
+
+    from tradebot.config import BotConfig
+    from tradebot.portfolio import simulate_satellite
+
+    held, new = _trade("A", 1, 5), _trade("B", 5, 9)  # A exits during the candle in which B would enter
+    held.flat_time = held.exit_time + pd.Timedelta(hours=1)
+    cfg = BotConfig()
+    cfg.risk.max_open_positions = 1
+    idx = pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC")
+    _, taken = portfolio_simulation([held, new], risk_per_trade_pct=1, max_position_pct=100, max_open_positions=1)
+    assert [t.symbol for t in taken] == ["A"] == [t.symbol for t in simulate_satellite([held, new], cfg, idx).taken]
+    held.flat_time = held.exit_time  # a gap through the stop at that candle's open: flat before B enters
+    _, taken = portfolio_simulation([held, new], risk_per_trade_pct=1, max_position_pct=100, max_open_positions=1)
+    assert [t.symbol for t in taken] == ["A", "B"] == [t.symbol for t in simulate_satellite([held, new], cfg, idx).taken]
+
+
+def test_a_stop_inside_a_daily_candle_frees_the_slot_at_the_finer_candle():
+    import pandas as pd
+
+    from tradebot.backtest.engine import backtest_populated, refine_flat_times
+
+    day = [FLAT, FLAT, (100, 101, 90, 96), FLAT]  # stop (95) touched on day 2
+    pop, _ = _pop(day, [0], start="2024-01-01", freq="1D")
+    (t,) = backtest_populated(pop, _Strat(), COSTS, symbol="A", timeframe="1d")
+    assert t.exit_at == "intrabar" and t.flat_time == pd.Timestamp("2024-01-04", tz="UTC")
+    four = bars([(100, 101, 99, 100)] * 13 + [(99, 100, 94.5, 95)] + [(96, 97, 95, 96)] * 4, start="2024-01-01",
+                freq="4h")  # the 4h candle from 2024-01-03 04:00 reaches the stop
+    refine_flat_times([t], {"1d": {"A": pop}, "4h": {"A": four}}, COSTS.slippage_rate)
+    assert t.flat_time == pd.Timestamp("2024-01-03 08:00", tz="UTC")

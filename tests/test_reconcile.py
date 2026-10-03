@@ -12,7 +12,8 @@ from tradebot.db import Database
 from tradebot.execution import PaperBroker
 from tradebot.learning import load_context
 from tradebot.notify import MemoryNotifier
-from tradebot.reconcile import Timeline, format_reconciliation, reconcile, uptime, write_csv
+from tradebot.reconcile import (Reconciliation, Timeline, format_reconciliation, format_uptime, reconcile,
+                                uptime, write_csv)
 from tradebot.timeframes import drop_unclosed
 
 DAY = 86_400_000
@@ -75,12 +76,12 @@ def test_reconciliation_of_a_paper_run_matches_trade_by_trade(paper_run):
     assert all(r.exit_paper.split(" @")[0] == r.exit_model.split(" @")[0] for r in closed)
     assert all(r.exit_same_candle for r in closed)
     assert all(abs(r.fees_paper_pct - r.fees_model_pct) < 0.02 for r in closed)
-    # slot disagreements the backtest's early slot release explains: paper was full at that moment
-    early = [r for r in rows if r.backtest == "taken" and r.backtest_exits_at_close != "taken"
-             and not r.paper.startswith("opened")]
-    assert all("max open positions" in r.paper for r in early)
+    # the account replay takes from every signal and frees a slot when the position is flat, like
+    # paper: with one contested slot, every taken/skipped decision agrees
+    assert not [r for r in rows if r.cause]
+    assert sum(r.backtest == "taken" for r in rows) >= 10 and any("max open positions" in r.paper for r in rows)
     text = format_reconciliation(rec, cfg)
-    assert "Bot running 100% of the window" in text
+    assert "the bot was running 100% of the window" in text and "Down per UTC day: none" in text
     assert "not logged" not in text  # coin list and strategies were logged from the first tick
     assert "Taken vs skipped agree on" in text and "Core:\n  off in this configuration" in text
 
@@ -93,36 +94,55 @@ def test_reconciliation_names_what_differs(paper_run, tmp_path):
     sigs = sorted(db2.signals_since(0), key=lambda s: s.candle_time)
     opened = [s for s in sigs if s.id in positions and positions[s.id].status == "closed"
               and base[(s.symbol, s.candle_time)].entry_bps is not None]
-    skipped = [s for s in sigs if s.status == "skipped"]
-    assert opened and len(skipped) >= 3
+    by_candle = {}
+    for s in sigs:
+        by_candle.setdefault(s.candle_time, []).append(s)
+    lone = [s for s in sigs if s.status == "skipped" and len(by_candle[s.candle_time]) == 1]  # alone at its close
+    assert len(opened) >= 2 and len(lone) >= 5
     # 1) paper paid 1% more on one entry
     pos = positions[opened[0].id]
     pos.entry_price *= 1.01
     db2.update_position(pos)
-    # 2) a signal paper never recorded; 3) one lost to a scan error; 4) one while the bot was down
-    gone, errored, down = skipped[0], skipped[1], skipped[2]
-    for s in (gone, errored, down):
+    # 2) paper had no signal although it scanned; 3) a scan error; 4) the bot was down; 5) the candle
+    # was skipped as stale; 6) the bot was up but no scan was recorded
+    gone, errored, down, stale, unscanned = lone[:5]
+    for s in (gone, errored, down, stale, unscanned):
         db2._conn.execute("DELETE FROM signals WHERE id=?", (s.id,))
+    for s in (down, stale, unscanned):
+        db2._conn.execute("DELETE FROM botlog WHERE kind='scan' AND data LIKE ?", (f'%"candle": {s.candle_time},%',))
     db2.log_bot(errored.created_at, "paper", "scan_errors",
                 {"tf": "1h", "candle": errored.candle_time, "errors": [f"{errored.symbol} 1h: latest candle missing/stale"]})
+    db2.log_bot(stale.created_at, "paper", "scan_skipped", {"tf": "1h", "candle": stale.candle_time, "age_s": 5400})
     close = down.candle_time + HOUR
-    db2._conn.execute("DELETE FROM snapshots WHERE ts BETWEEN ? AND ?", (close - 2 * HOUR, close + 2 * HOUR))
+    db2._conn.execute("DELETE FROM snapshots WHERE ts BETWEEN ? AND ?", (close - 10 * 60_000, close + 2 * HOUR))
+    # 7) a live-only check stopped paper from opening a trade the backtest took
+    first = opened[1]
+    db2._conn.execute("UPDATE signals SET status='skipped', note=? WHERE id=?",
+                      ("price 1.0 already outside the entry zone", first.id))
+    db2._conn.execute("DELETE FROM positions WHERE signal_id=?", (first.id,))
 
     rec = run_reconcile(paper_run, db2)
     rows = {(r.symbol, r.candle_ms): r for r in rec.rows}
     assert rows[(opened[0].symbol, opened[0].candle_time)].entry_bps == pytest.approx(100, abs=15)
-    assert rows[(gone.symbol, gone.candle_time)].paper == "(no signal: not explained)"
+    assert rows[(gone.symbol, gone.candle_time)].paper == "(no signal: scanned, live found no signal (its candles differ))"
     assert rows[(errored.symbol, errored.candle_time)].paper.startswith("(no signal: scan error: ")
-    assert rows[(down.symbol, down.candle_time)].paper == "(no signal: bot not running)"
+    assert rows[(down.symbol, down.candle_time)].paper.startswith("(no signal: bot not running at the close")
+    assert rows[(stale.symbol, stale.candle_time)].paper == \
+        "(no signal: candle skipped: the bot reached it 1h30 after the close (stale-candle rule))"
+    assert rows[(unscanned.symbol, unscanned.candle_time)].paper == "(no signal: no scan recorded while the bot was running)"
+    row = rows[(first.symbol, first.candle_time)]
+    assert row.backtest == "taken" and row.cause == "first difference: a live-only check (price 1.0 already outside the entry zone)"
+    others = [r for r in rec.rows if r.cause and r is not row]
+    assert all(r.cause.startswith("knock-on: holdings already differed") for r in others)
     text = format_reconciliation(rec, cfg)
-    assert "Backtest only: " in text and "bot not running" in text and "down " in text
+    assert "Backtest only:" in text and "Every gap (1;" in text and "1 first differences" in text
 
 
 def test_csv_has_every_row(paper_run, tmp_path):
     rec = run_reconcile(paper_run)
     write_csv(rec, tmp_path / "rec.csv")
     df = pd.read_csv(tmp_path / "rec.csv")
-    assert len(df) == len(rec.rows) and {"paper", "backtest", "entry_bps", "backtest_exits_at_close"} <= set(df.columns)
+    assert len(df) == len(rec.rows) and {"paper", "backtest", "cause", "entry_bps", "exit_late_h"} <= set(df.columns)
 
 
 @pytest.fixture(scope="module")
@@ -183,12 +203,46 @@ def test_timeline_and_uptime(cfg):
     assert tl.at(50) == ["X"] and tl.at(100) == ["A"] and tl.at(250) == ["A", "B"]
     assert tl.approximate(50) and not tl.approximate(150)
     db = Database(cfg.state_path / "u.db")
+    q = 15 * 60_000
     for k in range(20):
         if not 8 <= k < 12:  # an hour without snapshots
-            db.record_snapshot(k * 15 * 60_000, "paper", 1000.0, 0.0, 1000.0, None)
-    up, downs, first, last = uptime(db, "paper")
-    assert up(3 * 15 * 60_000) and not up(10 * 15 * 60_000)
-    assert downs == [(7 * 15 * 60_000, 12 * 15 * 60_000)]
+            db.record_snapshot(k * q, "paper", 1000.0, 0.0, 1000.0, None)
+    up = uptime(db, "paper")
+    assert up.up(3 * q) and not up.up(10 * q)
+    assert not up.up(7 * q + 10 * 60_000)  # 10 minutes after the last snapshot before the gap: already down
+    assert [(g.start, g.end) for g in up.gaps] == [(7 * q, 12 * q)]
+    assert up.gaps[0].cause == "before the start/stop/sleep log"
+
+
+def test_gaps_are_explained_by_starts_stops_and_pauses(cfg):
+    db = Database(cfg.state_path / "g.db")
+    q, h, t0 = 15 * 60_000, HOUR, 2 * DAY  # from 1970-01-03 00:00 UTC
+    alive = [(0, 2), (10, 12), (15, 17), (20, 22), (30, 32)]  # hours the bot ran
+    for a, b in alive:
+        for t in range(t0 + a * h, t0 + b * h + 1, q):
+            db.record_snapshot(t, "paper", 1000.0, 0.0, 1000.0, None)
+    db.log_bot(t0 - h, "paper", "start", {"prev_alive_ms": None, "prev_clean_stop": None})
+    db.log_bot(t0 + 10 * h, "paper", "pause", {"from": t0 + 2 * h, "to": t0 + 10 * h, "gap_s": 8 * 3600,
+                                               "asleep_s": 8 * 3600 - 60})
+    db.log_bot(t0 + 15 * h, "paper", "pause", {"from": t0 + 12 * h, "to": t0 + 15 * h, "gap_s": 3 * 3600, "asleep_s": 0})
+    db.log_bot(t0 + 17 * h + q, "paper", "stop", {"why": "SIGTERM: service stopped or restarted"})
+    db.log_bot(t0 + 20 * h, "paper", "start", {"prev_alive_ms": t0 + 17 * h, "prev_clean_stop": True})
+    db.log_bot(t0 + 30 * h, "paper", "start", {"prev_alive_ms": t0 + 22 * h, "prev_clean_stop": False})
+    up = uptime(db, "paper", t0, t0 + 32 * h)
+    causes = [g.cause for g in up.gaps]
+    assert len(causes) == 4
+    assert causes[0] == "computer asleep 7h59"
+    assert causes[1] == "bot running but not looping 3h00 (a hang or a very slow call)"
+    assert causes[2] == "bot stopped 01-03 17:15 (SIGTERM: service stopped or restarted); restarted 01-03 20:00"
+    assert causes[3] == ("bot ended without a clean stop (crash, kill or power loss), last alive 01-03 22:00; "
+                         "restarted 01-04 06:00")
+    assert up.down_ms(t0, t0 + 32 * h) == (8 + 3 + 3 + 8) * h
+    assert up.up(t0 + h) and not up.up(t0 + 2 * h + 10 * 60_000) and not up.up(t0 + 25 * h)
+    rec = Reconciliation(t0, t0 + 32 * h, uptime=up, uptime_share=1 - up.down_ms(t0, t0 + 32 * h) / (32 * h))
+    text = "\n".join(format_uptime(rec))
+    assert "running 31% of the window" in text and "Starts, stops and sleep recorded" not in text
+    assert "Down per UTC day: 01-03 16.0h of 24h, 01-04 6.0h of 8h" in text
+    assert "Every gap (4;" in text and "01-03 02:00 -> 01-03 10:00   8h00  computer asleep 7h59" in text
 
 
 def test_cli_reconcile_runs_on_frozen_candles(tmp_path, monkeypatch, capsys):

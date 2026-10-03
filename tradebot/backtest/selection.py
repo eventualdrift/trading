@@ -19,7 +19,7 @@ import pandas as pd
 from ..config import BotConfig
 from ..context import apply_vol_breaker
 from ..strategies import make_strategy
-from .engine import Trade, backtest_populated, portfolio_simulation
+from .engine import Trade, backtest_populated, candidate_trades, portfolio_simulation
 from .metrics import summarize, trade_metrics
 
 
@@ -85,9 +85,13 @@ def run_combo(
     cfg: BotConfig,
     context=None,
     vol_breaker: float | None = None,
+    candidates: dict | None = None,
 ) -> tuple[list[Trade], list[Trade], dict[str, float]]:
     """Backtest one combination on all symbols -> (in-sample, out-of-sample, per-symbol exp).
-    ``vol_breaker``: block entries while BTC's volatility ratio is above this (research)."""
+    ``vol_breaker``: block entries while BTC's volatility ratio is above this (research).
+    ``candidates``: a dict to fill with every signal's trade for account replays,
+    {"is": [...], "oos": [...]} split at the same point (nothing purged: an account replay
+    runs straight through)."""
     strategy = make_strategy(strategy_name, params)
     costs = cfg.costs_model()
     frac = cfg.selection.in_sample_fraction
@@ -98,11 +102,12 @@ def run_combo(
         pop = apply_vol_breaker(strategy.populate(df, context, timeframe), context, timeframe, vol_breaker)
         split = strategy.warmup + int((len(df) - strategy.warmup) * frac)
         split_time = pop.index[min(split, len(pop) - 1)]
-        trades = backtest_populated(
-            pop, strategy, costs, symbol=symbol, timeframe=timeframe,
-            allow_short=cfg.allow_short, breakeven_at_r=cfg.risk.breakeven_at_r,
-            min_reward_risk=cfg.risk.min_reward_risk,
-        )
+        kw = dict(symbol=symbol, timeframe=timeframe, allow_short=cfg.allow_short,
+                  breakeven_at_r=cfg.risk.breakeven_at_r, min_reward_risk=cfg.risk.min_reward_risk)
+        trades = backtest_populated(pop, strategy, costs, **kw)
+        if candidates is not None:
+            for t in candidate_trades(pop, strategy, costs, **kw):
+                candidates.setdefault("oos" if t.signal_idx >= split else "is", []).append(t)
         admitted = []
         for t in trades:
             if t.signal_idx >= split:

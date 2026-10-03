@@ -35,7 +35,18 @@ def config_snapshot(cfg: BotConfig) -> dict:
     d = asdict(cfg)
     snap = {k: d[k] for k in SECTIONS}
     snap["universe"] = {k: v for k, v in snap["universe"].items() if k != "refresh_hours"}
+    # the timeframes a run used, shortest first: the same set always gives the same hash
+    snap["timeframes"] = sorted(dict.fromkeys(snap["timeframes"]), key=_tf_order)
     return snap
+
+
+def _tf_order(tf: str) -> tuple:
+    from .timeframes import tf_ms
+
+    try:
+        return (tf_ms(tf), tf)
+    except Exception:
+        return (float("inf"), tf)
 
 
 def config_hash(snapshot: dict) -> str:

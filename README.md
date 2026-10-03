@@ -156,6 +156,17 @@ when it is registered. `tradebot research note --id <test> --text "..."` annotat
 (for example, how it was run). The note is appended to `research/ledger.jsonl`, and the recorded
 result is never edited.
 
+The satellite is replayed as one account, the way the live bot trades it: every signal of the
+selected strategies is a candidate. A signal is skipped if its coin is already held, or if the
+slots (or the open-risk budget) are full. A position holds its slot until it is flat, which is the close of
+its exit candle. There are two exceptions: a gap through the stop frees the slot at that candle's
+open, and a stop touched inside a daily candle frees it at the close of the 4h candle that touched it.
+(Before this version each strategy was first replayed on its own, one trade at a time, so a
+trade the account then skipped still blocked that coin's next signals, and a slot was freed at
+the open of the exit candle. The reconciliation found both. Results recorded before then used
+that replay.) Each strategy's own in-sample and out-of-sample statistics still come from that
+one-trade-at-a-time replay, which is how selection scores it.
+
 The satellite's open trades are valued at every daily close (marked to market), so its dips
 and its correlation with the core count losses that were never realised. The satellite
 section then shows:
@@ -181,7 +192,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 249 tests
+pytest -q              # 259 tests
 ```
 
 ### 1. Configure
@@ -281,27 +292,32 @@ trades. What it can test is whether the bot does what the backtest models.
 `tradebot reconcile` replays the backtest over the paper period on frozen candles (the cache is
 not changed; the report prints the `--since`/`--end` that reproduce it) and compares:
 
+- **Uptime**: the share of the window the bot ran, the hours down on each UTC day, and every gap
+  with its cause: the computer was asleep, the bot was running but not looping (a hang or a very
+  slow call), it was stopped (and why: SIGTERM from launchd/docker, Ctrl+C), or it ended without
+  a clean stop (a crash, a kill or a power loss) and when it was last alive.
 - **Signals** (coin, strategy, candle): which each side saw, and why the other didn't: the bot
-  was not running, a scan error, the coin list is approximated, or not explained.
-- **Taken vs skipped**: the backtest's slot decisions, starting from the paper positions open
-  when the window begins, against what paper did. Disagreements are grouped by cause. Two
-  causes are known backtest simplifications:
-  - the backtest frees a slot at the *open* of the candle in which a held trade exits, but
-    paper holds that trade until it sells. The report reruns the slot decisions with exits at
-    the candle close.
-  - the backtest replays each coin/strategy one trade at a time, before slots are allotted. So
-    a trade it then skips still blocks that coin/strategy's next signals, which paper is free to
-    take.
+  was not running at the close, the candle was skipped as stale (the bot reached it more than an
+  hour after the close), a scan error, live scanned but found no signal (its candles differ),
+  or the coin list is approximated.
+- **Taken vs skipped**: the backtest's account replay, starting from the paper positions open
+  when the window begins, against what paper did. A disagreement is a **first difference** when
+  both sides held the same coins before that close (the report names the cause: a live-only
+  check such as the bad-data guard or "price already outside the entry zone", the ML filter, or
+  the order within one close), otherwise a **knock-on** of an earlier one.
 - **Fills**, for trades both sides entered: entry and exit price against the modelled fill (in
-  basis points), exit reason and candle, R, and fees.
+  basis points), exit reason and candle, R, fees, and for each exit how much later paper exited
+  and why (the bot was down, or a bot-managed exit sold at the price when it looked).
 - **The core**: daily target weights against the backtest's; the rebalance rule replayed from
   paper's own logged state (cash and holdings before each rebalance, backtest targets, daily
   closes) to see if the same coins trade; fills against the daily close +/- slippage, and fees.
 
-What the bot was working with (coin list, active strategies, core targets and state, scan
-errors, sleeve moves) comes from its activity log (the `botlog` table), which starts with this
-version. Before that, the coin list, strategies and core targets are approximated, and the
-report says so. Running time comes from the 15-minute equity snapshots.
+What the bot was working with (coin list, active strategies, core targets and state, every scan
+and stale-candle skip, scan errors, sleeve moves, starts, stops and pauses) comes from its
+activity log (the `botlog` table). Where part of that log doesn't reach back far enough, the
+report says what is approximated. A pause is the main loop not coming round for 5 minutes; the
+bot compares the wall clock with a clock that stops while the computer sleeps, so it can tell
+sleep from a hang.
 
 ```bash
 tradebot reconcile [--since "2026-10-01"] [--end "2026-12-31 00:00"] [--csv reconcile.csv]
@@ -516,7 +532,7 @@ tradebot/
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
   reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core)
-tests/            249 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            259 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 ```
 
@@ -528,6 +544,20 @@ tests/            249 tests: look-ahead checks, live-vs-backtest parity (signals
 - Backtests are deliberately pessimistic: the stop wins when stop and target share a candle, a
   take-profit only counts when the candle closes beyond the target (wicks don't), and all exits
   pay slippage. They can't model order-book depth on small coins.
+- How exits are executed, backtest vs live/paper. The backtest checks each candle of the
+  trade's timeframe. A stop touched inside it fills at the stop less slippage (0.05%), or at the
+  open if the candle opened beyond it. This holds for breakeven and trailing stops too. A target
+  needs a close beyond it. Exit signals and time stops fill at the close. Live and paper check
+  every poll (30 s), replaying each completed 1-minute candle since the last check:
+  - The original stop (an exchange stop-market order in live) fills at the stop, or at the
+    1-minute open if it gapped, like the backtest.
+  - Breakeven and trailing stops are bot-managed: live leaves the exchange stop at the original
+    level. When a 1-minute candle crosses them, the bot sells at the price when it looks.
+  - The take-profit sells as soon as the current price is beyond the target, not at a close.
+
+  While the bot runs, these exits sell within about a minute of the level. After downtime (a
+  sleeping laptop) they sell at the price on waking, which can be far worse. The original stop
+  is still replayed at its level.
 - Paper-only for now: the core sleeve and limit-order entries (`costs.entry_order: limit`).
   Live mode refuses both until their live order paths have been built and reviewed.
 - Next: a strategy research phase with safeguards against luck. New strategies come from a

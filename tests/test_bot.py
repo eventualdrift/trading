@@ -593,3 +593,40 @@ def test_warns_once_when_the_code_on_disk_changes(sim, monkeypatch):
         market.set_now(now)
         bot.tick(now)
     assert sum("New bot code is on disk" in m for m in notes.messages) == 1
+
+
+def test_runs_record_start_stop_and_whether_the_last_one_ended_cleanly(sim):
+    market, db, broker, notes, bot = sim
+    bot.stop("SIGTERM: service stopped or restarted")
+    bot.run_forever()  # stops straight after start-up
+    (_, start), = db.botlog("paper", "start")
+    assert start["prev_clean_stop"] is None and start["code"]
+    assert db.botlog("paper", "stop")[-1][1]["why"] == "SIGTERM: service stopped or restarted"
+    bot._set("alive_ms", 123)
+    bot.run_forever()  # the previous run recorded its stop: a clean restart
+    assert db.botlog("paper", "start")[-1][1]["prev_clean_stop"] is True
+    bot._set("running", True)  # as if the process had died without recording a stop
+    bot.run_forever()
+    assert db.botlog("paper", "start")[-1][1] == {**db.botlog("paper", "start")[-1][1], "prev_clean_stop": False,
+                                                  "prev_alive_ms": 123}
+
+
+def test_a_long_pause_is_split_into_asleep_and_stuck(sim):
+    market, db, broker, notes, bot = sim
+    bot._note_pause(1000.0, 50.0, 1100.0, 150.0)  # under 5 minutes: not a pause
+    assert db.botlog("paper", "pause") == []
+    bot._note_pause(1000.0, 50.0, 1000.0 + 3600, 50.0 + 600)  # an hour on the wall clock, 10 min awake
+    (_, p), = db.botlog("paper", "pause")
+    assert p == {"from": 1_000_000, "to": 4_600_000, "gap_s": 3600, "asleep_s": 3000}
+
+
+def test_scans_and_stale_candles_are_recorded(sim):
+    market, db, broker, notes, bot = sim
+    four = 4 * 3_600_000
+    now = (market.start_ms + 60 * DAY) // four * four + 2 * 3_600_000 + 30_000  # 2h after a 4h close
+    market.set_now(now)
+    bot.tick(now)
+    scans = [d for _, d in db.botlog("paper", "scan")]
+    assert [d["tf"] for d in scans] == ["1h"] and scans[0]["symbols"] == 4 and scans[0]["lag_s"] == 30
+    (_, skipped), = db.botlog("paper", "scan_skipped")
+    assert skipped == {"tf": "4h", "candle": now - 30_000 - 2 * 3_600_000 - four, "age_s": 7230}

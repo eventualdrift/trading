@@ -101,7 +101,7 @@ def test_portfolio_backtest_reports_the_satellite_measurement():
                              universe={"source": "today's top 30", "symbols": ["SOL/USDT"],
                                        "first": {"SOL/USDT": idx[0]}})
     text = format_portfolio_backtest(res)
-    for needle in ("Candidate trades: 96", "taken", "Position size at entry", "Exposure", "IS    60 trades",
+    for needle in ("Candidate trades (every signal): 96", "taken", "Position size at entry", "Exposure", "IS    60 trades",
                    "OOS   36 trades", "Correlation, core vs satellite", "NOT the coins listed at the time",
                    "Core at same exposure", "Satellite entries: market", "marked to market"):
         assert needle in text, needle

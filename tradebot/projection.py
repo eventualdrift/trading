@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .backtest.engine import Trade, portfolio_simulation
+from .backtest.engine import Trade, portfolio_simulation, refine_flat_times
 from .backtest.metrics import max_drawdown_pct
 from .backtest.selection import Selection, run_combo
 from .config import BotConfig
@@ -38,11 +38,14 @@ class Projection:
 
 
 def out_of_sample_trades(selection: Selection, datasets_by_tf: dict, cfg: BotConfig, context=None) -> list[Trade]:
+    """Every out-of-sample signal with its trade: the account replay decides which are taken."""
     trades: list[Trade] = []
     for c in selection.selected:
         if c.timeframe in datasets_by_tf:
-            _, oos, _ = run_combo(datasets_by_tf[c.timeframe], c.strategy, c.params, c.timeframe, cfg, context)
-            trades += oos
+            cand: dict = {}
+            run_combo(datasets_by_tf[c.timeframe], c.strategy, c.params, c.timeframe, cfg, context, candidates=cand)
+            trades += cand.get("oos", [])
+    refine_flat_times(trades, datasets_by_tf, cfg.costs.slippage_rate)
     return trades
 
 

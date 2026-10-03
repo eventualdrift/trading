@@ -126,3 +126,15 @@ def test_research_note_leaves_the_result_unchanged(tmp_path, monkeypatch, capsys
     assert prev["verdict"]["pass"] is False and prev["notes"][0]["note"] == "evaluated on the unsaved 12:40 coin list"
     ledger = [json.loads(x) for x in (tmp_path / "state" / "research" / "ledger.jsonl").read_text().splitlines()]
     assert [e.get("kind") for e in ledger] == [None, "note"]
+
+
+def test_settings_hash_does_not_depend_on_timeframe_order():
+    from tradebot.config import BotConfig
+    from tradebot.provenance import config_hash, config_snapshot
+
+    a, b = BotConfig(), BotConfig()
+    a.timeframes, b.timeframes = ["4h", "1d"], ["1d", "4h", "1d"]
+    assert config_snapshot(b)["timeframes"] == ["4h", "1d"]
+    assert config_hash(config_snapshot(a)) == config_hash(config_snapshot(b))
+    b.timeframes = ["1d"]  # a different set is a different run
+    assert config_hash(config_snapshot(a)) != config_hash(config_snapshot(b))

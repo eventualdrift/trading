@@ -2,7 +2,8 @@
 
 * Core: the BTC/ETH trend-ensemble allocation, simulated day by day with exactly the
   live rules (``core.simulate_core``).
-* Satellite: the selected signal strategies' trades, sized from the satellite's own
+* Satellite: every signal of the selected strategies is a candidate, taken as live takes it
+  (coin not already held, a slot free once a position is flat), sized from the satellite's own
   equity with the live risk rules (same acceptance and sizing as ``portfolio_simulation``),
   and **marked to market every day** - open trades are valued at each daily close, so
   drawdowns and daily-return correlations include losses that were never realised.
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .backtest.engine import Costs, Trade, live_order
+from .backtest.engine import Costs, Trade, flat_at, live_order
 from .backtest.metrics import max_drawdown_pct
 from .config import BotConfig
 from .core import simulate_core_detail
@@ -110,8 +111,8 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
 
     for t in sorted(trades, key=live_order):
         still = []
-        for item in sorted(open_, key=lambda x: x[0].exit_time):
-            if item[0].exit_time <= t.entry_time:
+        for item in sorted(open_, key=lambda x: flat_at(x[0])):
+            if flat_at(item[0]) <= t.entry_time:  # the slot is free only once the position is flat
                 equity += item[2]
             else:
                 still.append(item)
@@ -401,22 +402,27 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
     active = sat.equity.index >= start.floor("D")
     taken, skipped = sat.taken, [t for ts in sat.skipped.values() for t in ts]
     everything = taken + skipped
+    # a coin already held: the same move signalled again, not an opportunity lost to the slot limit
+    held = {id(t) for t in sat.skipped.get("already holding that coin", [])}
+    lost = [t for t in skipped if id(t) not in held]
 
     def exp(ts):
         return f"{np.mean([t.r_multiple for t in ts]):+.3f}R ({len(ts)})" if ts else "- (0)"
 
     out = ["", f"Satellite measurement (from its first trade, {_day(start)}):",
-           f"  Candidate trades: {len(everything)} -> taken {len(taken)} ({len(taken) / len(everything):.0%}), "
-           f"skipped {len(skipped)}" + "".join(f"; {len(v)} {k}" for k, v in sat.skipped.items()),
-           f"  R per trade (trade count): all candidates {exp(everything)} · taken {exp(taken)} · "
-           f"skipped {exp(skipped)}"]
+           f"  Candidate trades (every signal): {len(everything)} -> taken {len(taken)} "
+           f"({len(taken) / len(everything):.0%}), skipped {len(skipped)}"
+           + "".join(f"; {len(v)} {k}" for k, v in sat.skipped.items()),
+           f"  R per trade (trade count): taken {exp(taken)} · skipped for lack of room {exp(lost)}"
+           + (f" · skipped as the coin was already held {exp([t for t in skipped if id(t) in held])}" if held else "")]
     keys = sorted({f"{t.strategy}@{t.timeframe}" for t in everything})
     if len(keys) > 1:  # which strategies got the slots
-        out.append("  By strategy (candidates -> taken; R of taken / skipped):")
+        out.append("  By strategy (signals -> taken; R of taken / skipped for lack of room):")
         for k in keys:
             tk = [t for t in taken if f"{t.strategy}@{t.timeframe}" == k]
-            sk = [t for t in skipped if f"{t.strategy}@{t.timeframe}" == k]
-            out.append(f"    {k:<16} {len(tk) + len(sk):>5} -> {len(tk):>4} ({len(tk) / max(len(tk) + len(sk), 1):.0%}); "
+            sk = [t for t in lost if f"{t.strategy}@{t.timeframe}" == k]
+            n = sum(f"{t.strategy}@{t.timeframe}" == k for t in everything)
+            out.append(f"    {k:<16} {n:>5} -> {len(tk):>4} ({len(tk) / max(n, 1):.0%}); "
                        f"taken {exp(tk)} · skipped {exp(sk)}")
     if sat.skip_detail:
         out.append("  Why slots were full (per skipped strategy): 'same close' = it would have fit but "

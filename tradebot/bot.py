@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from typing import Callable
@@ -39,6 +40,24 @@ HELP = """<b>Commands</b>
 /learn – run the self-learning cycle now"""
 
 Learner = Callable[[SignalModel | None], "tuple[Selection, SignalModel | None, str]"]
+
+
+PAUSE_S = 300  # the main loop not coming round for this long is recorded as a pause
+
+
+def awake_clock() -> Callable[[], float]:
+    """Seconds on a clock that stops while the computer sleeps (macOS: CLOCK_UPTIME_RAW; Linux:
+    CLOCK_MONOTONIC leaves out suspend). Wall time passed minus this clock's = time asleep."""
+    for name in ("CLOCK_UPTIME_RAW", "CLOCK_MONOTONIC"):
+        cid = getattr(time, name, None)
+        if cid is None:
+            continue
+        try:
+            time.clock_gettime(cid)
+        except OSError:
+            continue
+        return lambda: time.clock_gettime(cid)
+    return time.monotonic
 
 
 def code_stamp() -> tuple[int, int]:
@@ -92,6 +111,7 @@ class TradingBot:
         self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
         self._pending_extreme: dict[str, int] = {}
         self._stop = threading.Event()
+        self._stop_why: str | None = None
         self._log_selection()
         if hasattr(broker, "persist"):  # live broker saves order ids BEFORE each order is sent
             broker.persist = self.db.update_position
@@ -353,15 +373,54 @@ class TradingBot:
             self.check_unresolved()
         except Exception as exc:
             self._notify_error(f"start-up reconciliation failed: {exc}")
-        while not self._stop.is_set():
-            try:
-                self.tick(self.market.now_ms())
-            except Exception as exc:
-                log.exception("tick failed")
-                self._notify_error(f"{type(exc).__name__}: {exc}")
-            self._stop.wait(self.cfg.poll_seconds)
+        self._record_start()
+        awake = awake_clock()
+        last_wall, last_awake = time.time(), awake()
+        try:
+            while not self._stop.is_set():
+                wall, now_awake = time.time(), awake()
+                self._note_pause(last_wall, last_awake, wall, now_awake)
+                last_wall, last_awake = wall, now_awake
+                try:
+                    self.tick(self.market.now_ms())
+                except Exception as exc:
+                    log.exception("tick failed")
+                    self._notify_error(f"{type(exc).__name__}: {exc}")
+                self._set("alive_ms", int(time.time() * 1000))
+                self._stop.wait(self.cfg.poll_seconds)
+        finally:
+            self._record_stop(self._stop_why or "interrupted (Ctrl+C)")
 
-    def stop(self) -> None:
+    # ---------------------------------------- when the bot ran (reconciliation: why it was down)
+    def _record_start(self) -> None:
+        from .provenance import code_version
+
+        prev_alive, was_running = self._get("alive_ms"), self._get("running", False)
+        self._log("start", {"pid": os.getpid(), "code": code_version(), "prev_alive_ms": prev_alive,
+                            # the previous run never recorded a stop: it crashed, was killed or lost power
+                            "prev_clean_stop": None if prev_alive is None else not was_running},
+                  int(time.time() * 1000))
+        self._set("running", True)
+
+    def _record_stop(self, why: str) -> None:
+        try:
+            self._log("stop", {"pid": os.getpid(), "why": why}, int(time.time() * 1000))
+            self._set("running", False)
+        except Exception as exc:
+            log.debug("recording the stop failed: %s", exc)
+
+    def _note_pause(self, last_wall: float, last_awake: float, wall: float, now_awake: float) -> None:
+        """The loop didn't come round for a while: was the computer asleep, or the bot stuck?"""
+        gap = wall - last_wall
+        if gap < PAUSE_S:
+            return
+        asleep = max(0.0, min(gap, gap - (now_awake - last_awake)))
+        log.info("main loop paused %.0f min (%.0f min of it asleep)", gap / 60, asleep / 60)
+        self._log("pause", {"from": int(last_wall * 1000), "to": int(wall * 1000), "gap_s": round(gap),
+                            "asleep_s": round(asleep)}, int(wall * 1000))
+
+    def stop(self, why: str = "stop requested") -> None:
+        self._stop_why = self._stop_why or why
         self._stop.set()
         if self._dashboard_server is not None:
             self._dashboard_server.shutdown()
@@ -387,6 +446,7 @@ class TradingBot:
                     self.on_candle_close(tf, now_ms, candle)
                 else:
                     log.info("skipping stale %s candle (bot started late)", tf)
+                    self._log("scan_skipped", {"tf": tf, "candle": candle, "age_s": round(age / 1000)}, now_ms)
                 self._set(f"last_scan:{tf}", candle)
             self._maybe_daily_summary(now_ms, equity)
         self._check_code_version(now_ms)
@@ -402,6 +462,9 @@ class TradingBot:
             log.warning("scan: %s", err)
         if res.errors:
             self._log("scan_errors", {"tf": tf, "candle": candle_open_ms, "errors": res.errors[:50]}, now_ms)
+        self._log("scan", {"tf": tf, "candle": candle_open_ms, "symbols": len(symbols),
+                           "signals": len(res.accepted) + len(res.filtered), "errors": len(res.errors),
+                           "lag_s": round((now_ms - candle_open_ms - tf_ms(tf)) / 1000)}, now_ms)
         for pid, reason in res.exits.items():
             pos = self.db.get_position(pid)
             if pos and pos.status == "open":
