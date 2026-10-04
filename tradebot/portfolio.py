@@ -363,6 +363,11 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
             made = u.get("selection_created")
             made_txt = f" (selected by learn on {pd.Timestamp(made, unit='s', tz='UTC'):%Y-%m-%d %H:%M} UTC)" if made else ""
             out.append(f"    Strategies: {', '.join(u['selection_now'])}{made_txt}")
+            if u.get("frozen") and u.get("selection_source"):
+                out.append(f"    Strategy selection used: {u['selection_source']}")
+                today = u.get("selection_today") or []
+                if today and sorted(today) != sorted(u["selection_now"]):
+                    out.append(f"    (today's selection is {', '.join(today)}; --current-selection reruns with it)")
         if u.get("data_end_ms"):
             out.append(f"    Data to {pd.Timestamp(u['data_end_ms'], unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC"
                        + (" (frozen: from the universe file)" if u.get("frozen") else ""))

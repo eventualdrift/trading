@@ -138,3 +138,64 @@ def test_settings_hash_does_not_depend_on_timeframe_order():
     assert config_hash(config_snapshot(a)) == config_hash(config_snapshot(b))
     b.timeframes = ["1d"]  # a different set is a different run
     assert config_hash(config_snapshot(a)) != config_hash(config_snapshot(b))
+
+
+def test_frozen_rerun_uses_the_saved_selection(tmp_path, monkeypatch, capsys):
+    import json
+
+    from tradebot.backtest.selection import ComboResult, Selection
+    from tradebot.learning import SELECTION_FILE
+    from tradebot.universe import selection_payload
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    Selection(0.0, [ComboResult("breakout", "1d", {}, {}, {}, 1, 1.0, True)]).save(state / SELECTION_FILE)  # today's
+    saved = Selection(1_700_000_000.0, [ComboResult("momentum", "1d", {"btc_filter": True}, {}, {}, 1, 1.0, True),
+                                        ComboResult("trend", "1d", {}, {}, {}, 1, 1.0, False)])
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"state_dir: {state}\ntimeframes: [1d]\nuniverse:\n  top_n: 4\nml:\n  enabled: false\n"
+                    "data:\n  history_days: {1d: 600}\n")
+    ufile = tmp_path / "universe-x.json"
+    ufile.write_text(json.dumps({"symbols": ["BTC/USDT", "SOL/USDT"], "data_end_ms": 1_748_736_000_000,
+                                 "source": "saved run", "selection": ["momentum@1d"],
+                                 "selection_full": selection_payload(saved)}))
+    args = ["--config", str(conf), "--env", str(tmp_path / "none.env"), "portfolio-backtest", "--synthetic",
+            "--days", "600", "--since", "", "--universe-file", str(ufile)]
+    main(args)
+    out = capsys.readouterr().out
+    assert "Strategies: momentum@1d" in out and "Strategy selection used: saved with the run" in out
+    assert "today's selection is breakout@1d; --current-selection reruns with it" in out
+    assert "differs from the saved run's" not in out
+    stamped = json.loads(next(tmp_path.glob("universe-x@*.json")).read_text())
+    assert stamped["selection_full"]["combos"][0]["params"] == {"btc_filter": True}  # filters and parameters kept
+    main(args + ["--current-selection"])
+    out = capsys.readouterr().out
+    assert "Strategies: breakout@1d" in out and "differs from the saved run's" in out
+
+
+def test_an_older_universe_files_selection_is_recovered_from_the_activity_log(cfg):
+    from tradebot.db import Database
+    from tradebot.universe import saved_selection
+
+    frozen = {"selection": ["momentum@4h", "trend@1d"], "data_end_ms": 1_759_000_000_000}
+    assert saved_selection(frozen, cfg) is None  # no activity log: nothing to recover
+    db = Database(cfg.state_path / "tradebot.db")
+    combos = [{"strategy": "trend", "timeframe": "1d", "params": {"fast": 20}},
+              {"strategy": "momentum", "timeframe": "4h", "params": {}}]
+    db.log_bot(1, "paper", "selection", {"combos": combos[:1], "created_at": 1_758_000_000.0, "ml": False})
+    db.log_bot(2, "paper", "selection", {"combos": combos, "created_at": 1_758_500_000.0, "ml": False})
+    db.log_bot(3, "paper", "selection", {"combos": combos, "created_at": 1_759_500_000.0, "ml": False})  # after the run
+    sel, source = saved_selection(frozen, cfg)
+    assert sel.created_at == 1_758_500_000.0 and source.startswith("recovered from the bot's activity log")
+    assert {(c.key, tuple(c.params.items())) for c in sel.selected} == {("trend@1d", (("fast", 20),)),
+                                                                         ("momentum@4h", ())}
+
+
+def test_code_version_inside_a_docker_image(monkeypatch):
+    from tradebot.provenance import code_version
+
+    monkeypatch.setenv("TRADEBOT_COMMIT", "abc1234")
+    assert code_version() == "abc1234"
+    monkeypatch.setenv("TRADEBOT_COMMIT", "unknown")  # built without the commit: fall back to git
+    assert code_version() != "unknown"

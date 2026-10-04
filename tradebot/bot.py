@@ -43,6 +43,7 @@ Learner = Callable[[SignalModel | None], "tuple[Selection, SignalModel | None, s
 
 
 PAUSE_S = 300  # the main loop not coming round for this long is recorded as a pause
+LEARN_RETRY_MS = 3_600_000  # a failed learning cycle is retried this much later
 
 
 def awake_clock() -> Callable[[], float]:
@@ -944,8 +945,9 @@ class TradingBot:
     def _maybe_learn(self, now_ms: int, force: bool = False) -> bool:
         if self.learner is None or (self._learn_thread and self._learn_thread.is_alive()):
             return False
+        every = self.cfg.learning.retrain_every_hours * 3_600_000
         last = self.db.kv_get("last_learn_ms", 0)
-        if not force and now_ms - last < self.cfg.learning.retrain_every_hours * 3_600_000:
+        if not force and now_ms - last < every:
             return False
         self.db.kv_set("last_learn_ms", now_ms)
 
@@ -959,7 +961,9 @@ class TradingBot:
                 self.notify("🧠 <b>Self-learning cycle complete</b>\n" + fmt.esc(summary))
             except Exception as exc:
                 log.exception("learning cycle failed")
-                self._notify_error(f"learning cycle failed: {exc}")
+                # try again in an hour, not at the next weekly slot (e.g. the computer slept mid-download)
+                self.db.kv_set("last_learn_ms", now_ms - every + LEARN_RETRY_MS)
+                self._notify_error(f"learning cycle failed: {exc} - retrying in an hour")
 
         self._learn_thread = threading.Thread(target=work, name="learning", daemon=True)
         self._learn_thread.start()

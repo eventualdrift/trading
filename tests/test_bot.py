@@ -630,3 +630,22 @@ def test_scans_and_stale_candles_are_recorded(sim):
     assert [d["tf"] for d in scans] == ["1h"] and scans[0]["symbols"] == 4 and scans[0]["lag_s"] == 30
     (_, skipped), = db.botlog("paper", "scan_skipped")
     assert skipped == {"tf": "4h", "candle": now - 30_000 - 2 * 3_600_000 - four, "age_s": 7230}
+
+
+def test_a_failed_learn_is_retried_an_hour_later(sim):
+    market, db, broker, notes, bot = sim
+    calls = []
+
+    def failing(model):
+        calls.append(1)
+        raise RuntimeError("network down")
+
+    bot.learner = failing
+    now = market.start_ms + 60 * DAY
+    assert bot._maybe_learn(now)
+    bot._learn_thread.join()
+    assert any("retrying in an hour" in m for m in notes.messages)
+    assert not bot._maybe_learn(now + 59 * 60_000)  # not straight away
+    assert bot._maybe_learn(now + 61 * 60_000)  # an hour later, not a week
+    bot._learn_thread.join()
+    assert len(calls) == 2

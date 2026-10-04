@@ -65,9 +65,58 @@ def describe_universe(cfg: BotConfig, date: str) -> str:
     return f"today's top {u.top_n} {cfg.exchange.quote} pairs by 24h volume{age} ({date})"
 
 
+def selection_payload(selection) -> dict | None:
+    """The whole selection (every combination with its strategy, timeframe, parameters and filters,
+    and when learn made it), as saved in a universe file."""
+    from dataclasses import asdict
+
+    if selection is None:
+        return None
+    return {"created_at": selection.created_at, "combos": [asdict(c) for c in selection.combos]}
+
+
+def saved_selection(frozen: dict, cfg: BotConfig):
+    """The strategy selection a saved run used -> (Selection, where it came from), or None.
+
+    Saved with the run when the file has it. Older files recorded only the strategy names: the
+    selection is then recovered from the bot's activity log - the last one learn made before the
+    run's data end with exactly those names."""
+    import pandas as pd
+
+    from .backtest.selection import ComboResult, Selection
+
+    full = frozen.get("selection_full")
+    if full and full.get("combos"):
+        sel = Selection(created_at=full["created_at"], combos=[ComboResult(**c) for c in full["combos"]])
+        return sel, "saved with the run"
+    names = sorted(frozen.get("selection") or [])
+    db_path = cfg.state_path / "tradebot.db"
+    if not names or not db_path.exists():
+        return None
+    from .db import Database
+
+    found = None
+    for _, d in Database(db_path).botlog(cfg.mode, "selection"):
+        made = d.get("created_at")
+        combos = d.get("combos") or []
+        if made is None or made * 1000 > frozen["data_end_ms"]:
+            continue
+        if sorted(f"{c['strategy']}@{c['timeframe']}" for c in combos) == names:
+            found = (made, combos)
+    if found is None:
+        return None
+    made, combos = found
+    sel = Selection(created_at=made, combos=[ComboResult(c["strategy"], c["timeframe"], c.get("params") or {}, {}, {},
+                                                         0, 0.0, True) for c in combos])
+    when = pd.Timestamp(made, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M")
+    return sel, f"recovered from the bot's activity log (learn of {when} UTC; the file saved only the strategy names)"
+
+
 def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selection_keys: list[str],
-                  cfg: BotConfig, code: str | None = None, config: dict | None = None) -> str:
-    """Freeze a run's coin list and data end date so it can be reproduced (--universe-file)."""
+                  cfg: BotConfig, code: str | None = None, config: dict | None = None,
+                  selection=None) -> str:
+    """Freeze a run's coin list, data end date and strategy selection so it can be reproduced
+    (--universe-file)."""
     import json
     import time
     from pathlib import Path
@@ -84,6 +133,7 @@ def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selec
         "source": source,
         "symbols": list(symbols),
         "selection": list(selection_keys),
+        "selection_full": selection_payload(selection),  # strategies, timeframes, parameters, filters
         "rules": {"top_n": u.top_n, "min_quote_volume": u.min_quote_volume,
                   "min_history_days": u.min_history_days, "whitelist": u.whitelist, "blacklist": u.blacklist},
         "code": code,  # git commit of the code that produced the run

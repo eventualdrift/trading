@@ -283,22 +283,32 @@ def cmd_research(args, cfg):
 
 
 def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file: str | None = None,
-                      save_dir: str | None = "reports") -> dict:
+                      save_dir: str | None = "reports", current_selection: bool = False) -> dict:
     """Everything the whole-account backtests need: core closes, satellite candidate trades,
     daily closes to value them, per-strategy split stats and the universe used.
 
-    ``universe_file``: rerun on a saved coin list AND its data end date (reproducible). Without it
-    the universe is today's, and it is saved to ``save_dir`` so the run can be reproduced later."""
+    ``universe_file``: rerun on a saved coin list, data end date AND strategy selection
+    (reproducible); ``current_selection`` reruns it with today's selection instead. Without it the
+    universe is today's, and it is saved to ``save_dir`` so the run can be reproduced later."""
     from .backtest.engine import refine_flat_times
     from .backtest.selection import run_combo
     from .learning import load_context, load_datasets, load_frame
     from .portfolio import combo_split_stats
     from .provenance import code_version, config_differences, config_hash, config_snapshot
-    from .universe import load_universe, save_universe
+    from .universe import load_universe, save_universe, saved_selection
 
     market = _market(cfg, synthetic)
     store = _store(cfg, market)
     frozen = load_universe(universe_file) if universe_file else None
+    today = selection
+    selection_source = "today's (learn's latest)"
+    if frozen and not current_selection:
+        saved = saved_selection(frozen, cfg)
+        if saved is not None:
+            selection, selection_source = saved
+        elif frozen.get("selection"):
+            selection_source = ("today's - the saved run's selection could not be recovered (the file saved only "
+                                "the strategy names)")
     end = frozen["data_end_ms"] if frozen else None
     data_end = end or market.now_ms()
     core_closes = {}
@@ -310,7 +320,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
         if frozen:
             symbols = list(frozen["symbols"])
             if frozen.get("selection") and sorted(frozen["selection"]) != sorted(keys):
-                print(f"WARNING: the strategies selected now ({', '.join(keys)}) differ from the saved run's "
+                print(f"WARNING: the strategies used ({', '.join(keys)}) differ from the saved run's "
                       f"({', '.join(frozen['selection'])}) - results will differ for that reason.")
         else:
             symbols = select_universe(market, cfg)
@@ -336,23 +346,28 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
         if not frozen and save_dir and not synthetic:
             stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(data_end / 1000))
             path = save_universe(Path(save_dir) / f"universe-{stamp}.json", symbols, data_end, source, keys, cfg,
-                                 code=code, config=snap)
+                                 code=code, config=snap, selection=selection)
         universe = {"source": source, "symbols": symbols, "first": first, "data_end_ms": data_end,
                     "file": path, "frozen": bool(frozen), "code": code, "config": snap,
                     "config_hash": config_hash(snap), "selection_now": keys,
                     "selection_created": selection.created_at,
-                    "selection_saved": (frozen or {}).get("selection")}
+                    "selection_saved": (frozen or {}).get("selection"),
+                    "selection_source": selection_source,
+                    "selection_today": [c.key for c in today.selected] if today else []}
         if frozen:
             universe["saved_code"] = frozen.get("code")
             saved_cfg = frozen.get("config")
             universe["saved_config_hash"] = config_hash(saved_cfg) if saved_cfg else None
             universe["config_diffs"] = config_differences(saved_cfg, snap) if saved_cfg else None
-            if (frozen.get("code"), universe["saved_config_hash"]) != (code, universe["config_hash"]):
-                # same coins and data end, stamped with THIS run's code and settings: a complete reference
+            outdated = ((frozen.get("code"), universe["saved_config_hash"]) != (code, universe["config_hash"])
+                        or not frozen.get("selection_full"))
+            if outdated and not current_selection:
+                # same coins, data end and selection, stamped with THIS run's code and settings: a complete reference
                 base = Path(universe_file).stem.split("@")[0]  # the original run's name, without an older stamp
                 stamped = Path(universe_file).with_name(f"{base}@{code.split('+')[0]}-{universe['config_hash']}.json")
-                if not stamped.exists():
-                    save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap)
+                if not stamped.exists() or not load_universe(stamped).get("selection_full"):
+                    save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap,
+                                  selection=selection)
                 universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
             "universe": universe}
@@ -464,7 +479,8 @@ def cmd_portfolio_backtest(args, cfg):
     selection, _ = load_brain(cfg)
     fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
     cfg.core.fraction = fraction  # recorded with the run: the split it actually used
-    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
+    x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file,
+                          current_selection=args.current_selection)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since=args.since or None, sat_closes=x["sat_closes"], combos=x["combos"],
                              universe=x["universe"])
@@ -524,31 +540,32 @@ def cmd_config_set(args, cfg):
         print(f"  {line}")
 
 
-def cmd_reconcile(args, cfg):
+def _reconcile_run(cfg, since_ms: int | None, end_ms: int | None, synthetic: bool = False):
+    """Paper vs backtest over [since, end] on frozen candles -> (Reconciliation, report text).
+    ``since_ms`` None: from the first paper record; ``end_ms`` None: the last full hour.
+    Raises ValueError when there is nothing to reconcile."""
     import pandas as pd
 
     from .db import Database
     from .learning import load_brain, load_context, load_datasets, load_frame
     from .provenance import code_version, config_hash, config_snapshot
-    from .reconcile import format_reconciliation, reconcile, write_csv
+    from .reconcile import format_reconciliation, reconcile
     from .timeframes import last_closed_open_ms, tf_ms
 
     db = Database(cfg.state_path / "tradebot.db")
     mode = cfg.mode
-    market = _market(cfg, args.synthetic)
+    market = _market(cfg, synthetic)
     store = _store(cfg, market)
     # frozen candles: nothing in the cache changes and --end reproduces the run
-    end = (int(pd.Timestamp(args.end, tz="UTC").value // 1_000_000) if args.end
-           else last_closed_open_ms(market.now_ms(), "1h") + 3_600_000)
-    if args.since:
-        since = int(pd.Timestamp(args.since, tz="UTC").value // 1_000_000)
-    else:  # the paper period: from the first signal or equity snapshot
+    end = end_ms if end_ms is not None else last_closed_open_ms(market.now_ms(), "1h") + 3_600_000
+    since = since_ms
+    if since is None:  # the paper period: from the first signal or equity snapshot
         firsts = [s.created_at for s in db.signals_since(0)[:1]]
         snaps = db.snapshots(mode)
         if len(snaps):
             firsts.append(int(snaps.index[0].value // 1_000_000))
         if not firsts:
-            sys.exit("no paper history yet (no signals or equity snapshots)")
+            raise ValueError("no paper history yet (no signals or equity snapshots)")
         since = min(firsts)
     selection, _ = load_brain(cfg)
     logged = db.botlog(mode, "universe")
@@ -563,7 +580,7 @@ def cmd_reconcile(args, cfg):
     for _, d in db.botlog(mode, "selection"):
         tfs |= {c["timeframe"] for c in d.get("combos", [])}
     if not tfs:
-        sys.exit("no strategies selected - nothing to reconcile")
+        raise ValueError("no strategies selected - nothing to reconcile")
     cfg.timeframes = sorted(tfs, key=tf_ms)
     print(f"Loading candles for {len(symbols)} coins ({', '.join(cfg.timeframes)}) to "
           f"{pd.Timestamp(end, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC ...", file=sys.stderr)
@@ -574,14 +591,121 @@ def cmd_reconcile(args, cfg):
             if cfg.core.fraction > 0 else {})
     rec = reconcile(db, cfg, datasets, context, core, since, end, selection, fallback)
     fmt_t = "%Y-%m-%d %H:%M"
+    rec.reproduce = (f"tradebot reconcile --since \"{pd.Timestamp(since, unit='ms', tz='UTC'):{fmt_t}}\" "
+                     f"--end \"{pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}}\"")
     rec.header = [f"  Candles frozen at {pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}} UTC · code {code_version()} "
                   f"· settings {config_hash(config_snapshot(cfg))} (timeframes {', '.join(cfg.timeframes)})",
-                  f"  Reproduce: tradebot reconcile --since \"{pd.Timestamp(since, unit='ms', tz='UTC'):{fmt_t}}\" "
-                  f"--end \"{pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}}\""]
-    print(format_reconciliation(rec, cfg))
+                  f"  Reproduce: {rec.reproduce}"]
+    return rec, format_reconciliation(rec, cfg)
+
+
+def cmd_reconcile(args, cfg):
+    import pandas as pd
+
+    from .reconcile import write_csv
+
+    def ms(text):
+        return int(pd.Timestamp(text, tz="UTC").value // 1_000_000) if text else None
+
+    try:
+        rec, text = _reconcile_run(cfg, ms(args.since), ms(args.end), args.synthetic)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print(text)
     if args.csv:
         write_csv(rec, args.csv)
         print(f"\nevery signal row written to {args.csv}")
+
+
+def cmd_weekly(args, cfg):
+    """Weekly check-in: reconcile the last week, rerun the reference backtest on frozen data,
+    summarise uptime, append a STATUS.md entry. Reporting only."""
+    import copy
+
+    import pandas as pd
+
+    from . import weekly as wk
+    from .learning import load_brain
+    from .portfolio import format_portfolio_backtest, portfolio_backtest
+    from .provenance import code_version, config_differences, config_hash, config_snapshot
+    from .reconcile import write_csv
+    from .timeframes import last_closed_open_ms
+
+    state = wk.load_state(cfg.state_path)
+    reference = args.reference or state.get("reference")
+    if not reference:
+        sys.exit("Pass --reference reports/universe-<run>.json once: the frozen backtest to rerun every week "
+                 "(it is remembered in state/research/weekly.json).")
+    if not Path(reference).exists():
+        sys.exit(f"reference universe file not found: {reference}")
+    market = _market(cfg, args.synthetic)
+    end = (int(pd.Timestamp(args.end, tz="UTC").value // 1_000_000) if args.end
+           else last_closed_open_ms(market.now_ms(), "1h") + 3_600_000)
+    since = end - args.days * 86_400_000
+    out_dir = Path(args.out_dir) / pd.Timestamp(end, unit="ms", tz="UTC").strftime("%Y-%m-%d-%H%M")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    code, snap = code_version(), config_snapshot(cfg)
+    numbers, reproduce, nums = [], [], {"reference": reference}
+
+    try:  # 1) paper vs backtest over the week, with uptime
+        rec, text = _reconcile_run(copy.deepcopy(cfg), since, end, args.synthetic)
+        (out_dir / "reconcile.txt").write_text(text + "\n")
+        write_csv(rec, out_dir / "reconcile.csv")
+        up_lines, nums["uptime"] = wk.uptime_summary(rec)
+        rc_lines, nums["reconcile"] = wk.reconcile_summary(rec)
+        numbers += up_lines + rc_lines
+        reproduce.append(rec.reproduce)
+    except ValueError as exc:
+        numbers.append(f"- Reconcile: {exc}")
+
+    try:  # 2) the reference backtest, frozen: coins, data end and strategy selection as saved
+        pcfg = copy.deepcopy(cfg)
+        selection, _ = load_brain(pcfg)
+        fraction = pcfg.core.fraction or 0.65
+        pcfg.core.fraction = fraction
+        x = _portfolio_inputs(pcfg, selection, args.synthetic, 3200, reference)
+        res = portfolio_backtest(x["core_closes"], x["trades"], pcfg, capital=1000.0, fraction=fraction,
+                                 since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
+                                 universe=x["universe"])
+        (out_dir / "portfolio-backtest.txt").write_text(format_portfolio_backtest(res, pcfg.exchange.quote) + "\n")
+        pf_lines, nums["portfolio"] = wk.portfolio_summary(res)
+        u = x["universe"] or {}
+        if u.get("selection_source"):
+            pf_lines.append(f"  Strategy selection: {u['selection_source']}")
+        numbers += pf_lines
+        reproduce.append(f"tradebot portfolio-backtest --core-fraction {fraction:g} --universe-file {reference}")
+    except Exception as exc:  # noqa: BLE001 - the check-in still gets written
+        numbers.append(f"- Frozen reference rerun failed: {type(exc).__name__}: {exc}")
+    numbers.append(f"- Full reports: {out_dir}")
+
+    # what changed since last week
+    today, _ = load_brain(cfg)
+    sel_now = {"keys": sorted(c.key for c in today.selected) if today else [],
+               "created": today.created_at if today else None}
+    changed = []
+    commits = wk.git_log(state.get("code"))
+    if state.get("code") and state["code"] != code:
+        changed.append(f"code {state['code']} -> {code}" + (": " + "; ".join(commits[:8]) if commits else ""))
+    diffs = config_differences(state["settings"], snap) if state.get("settings") else []
+    changed += [f"setting {d}" for d in diffs]
+    prev_sel = state.get("selection")
+    selection_changed = bool(prev_sel) and prev_sel.get("created") != sel_now["created"]
+    if selection_changed:
+        changed.append(f"learn re-selected strategies: {', '.join(prev_sel.get('keys') or []) or 'none'} -> "
+                       f"{', '.join(sel_now['keys']) or 'none'}")
+    if state.get("reference") and state["reference"] != reference:
+        changed.append(f"reference backtest {state['reference']} -> {reference}")
+
+    entry = wk.status_entry(date=wk.today(), code=code, settings=config_hash(snap), changed=changed,
+                            numbers=numbers, reproduce=reproduce,
+                            needs=wk.needs_owner(nums, state, diffs, selection_changed),
+                            next_items=wk.backlog_next(wk.REPO / "BACKLOG.md"))
+    status = Path(args.status_file) if args.status_file else wk.REPO / "STATUS.md"
+    wk.append_status(status, entry)
+    wk.save_state(cfg.state_path, {"reference": reference, "code": code, "settings": snap, "selection": sel_now,
+                                   "numbers": nums, "ran_at": wk.today()})
+    print(entry)
+    print(f"Appended to {status}; full reports in {out_dir}")
 
 
 def cmd_telegram_test(args, cfg):
@@ -639,7 +763,9 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--days", type=int, default=3200, help="daily history for the core (default ~8.8 years)")
     sp.add_argument("--since", default="2022-01-01", help="also report from this date (the test period)")
     sp.add_argument("--universe-file", default=None,
-                    help="rerun on a saved coin list and data end date (reports/universe-*.json)")
+                    help="rerun on a saved coin list, data end date and strategy selection (reports/universe-*.json)")
+    sp.add_argument("--current-selection", action="store_true",
+                    help="with --universe-file: use today's strategy selection instead of the saved run's")
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
     sp.add_argument("topic", choices=["breaker", "sizing", "core", "note", "oos-fetch", "oos-register", "oos-run",
@@ -676,6 +802,15 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--end", default=None, help="freeze the candles at this UTC time (default: the last full hour)")
     sp.add_argument("--csv", default=None, help="also write every signal row to this CSV")
     sp.add_argument("--synthetic", action="store_true")
+    sp = sub.add_parser("weekly", help="weekly check-in: reconcile the last week, rerun the reference backtest "
+                                       "frozen, uptime, and a STATUS.md entry (reporting only)")
+    sp.add_argument("--reference", default=None,
+                    help="universe file of the backtest to rerun each week (needed once; remembered)")
+    sp.add_argument("--days", type=int, default=7, help="reconcile this many days up to the end (default 7)")
+    sp.add_argument("--end", default=None, help="UTC end of the week (default: the last full hour)")
+    sp.add_argument("--status-file", default=None, help="default: STATUS.md in the repository")
+    sp.add_argument("--out-dir", default="reports/weekly", help="where the full reports go")
+    sp.add_argument("--synthetic", action="store_true")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -694,6 +829,7 @@ def main(argv: list[str] | None = None) -> None:
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
         "compare-entries": cmd_compare_entries, "config-set": cmd_config_set, "reconcile": cmd_reconcile,
+        "weekly": cmd_weekly,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

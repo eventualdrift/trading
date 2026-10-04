@@ -84,3 +84,14 @@ def test_open_risk_budget_counts_only_risk_still_at_stake():
     assert rm.entry_block_reason(sig, fresh + protected, 10_000) is None  # 6 open, still allowed
     rm.cfg.max_open_risk_pct = None  # off: the position count applies again
     assert "max open positions" in rm.entry_block_reason(sig, fresh + protected, 10_000)
+
+
+def test_go_live_needs_every_protective_exit_on_the_exchange(monkeypatch):
+    import tradebot.execution.live as live
+    from tradebot.report import exchange_protection_check
+
+    check = exchange_protection_check()
+    assert not check.passed and "breakeven stop, trailing stop, take profit" in check.detail
+    monkeypatch.setattr(live, "EXCHANGE_SIDE_EXITS",
+                        frozenset({"stop_loss", "breakeven_stop", "trailing_stop", "take_profit"}))
+    assert exchange_protection_check().passed

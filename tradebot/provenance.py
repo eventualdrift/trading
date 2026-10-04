@@ -16,15 +16,24 @@ SECTIONS = ("timeframes", "strategies", "allow_short", "universe", "data", "cost
             "context", "guards", "selection", "ml")
 
 
+CODE_PATHS = ("tradebot", "pyproject.toml", "requirements.txt")  # docs and notes (STATUS.md ...) don't count
+
+
 def code_version() -> str:
-    """Short git commit of the running code, '+uncommitted' if tracked files were edited."""
+    """Short git commit of the running code, '+uncommitted' if tracked code files were edited.
+    In a docker image (no git inside) it is the commit the image was built from (TRADEBOT_COMMIT)."""
+    import os
+
+    baked = os.environ.get("TRADEBOT_COMMIT", "").strip()
+    if baked and baked != "unknown":
+        return baked
     repo = Path(__file__).resolve().parent.parent
     try:
         head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True,
                               text=True, timeout=5)
         if head.returncode != 0 or not head.stdout.strip():
             raise RuntimeError(head.stderr)
-        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo,
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "--", *CODE_PATHS], cwd=repo,
                                capture_output=True, text=True, timeout=5)
         return head.stdout.strip() + ("+uncommitted" if dirty.stdout.strip() else "")
     except Exception:

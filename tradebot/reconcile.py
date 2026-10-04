@@ -291,6 +291,7 @@ class Reconciliation:
     core_rule_diffs: list[dict] = field(default_factory=list)
     core_days_missing: list[int] = field(default_factory=list)  # days after logging began with no core check
     header: list[str] = field(default_factory=list)
+    reproduce: str = ""  # the command that reruns this report
 
 
 def _bps(a: float | None, b: float | None, sign: float = 1.0) -> float | None:

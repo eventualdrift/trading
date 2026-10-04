@@ -36,6 +36,9 @@ from .base import Broker, ExecutionError, NotFilled, ProtectionError, SyncIssue,
 log = logging.getLogger(__name__)
 
 FINAL = ("closed", "canceled", "expired", "rejected")
+# exits that rest on the exchange as orders, so they still fire while the bot is down. The
+# go-live checklist (report.readiness) requires every protective exit to be here.
+EXCHANGE_SIDE_EXITS = frozenset({"stop_loss"})
 BOT_PREFIX = "tb"
 
 

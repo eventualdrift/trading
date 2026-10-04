@@ -30,7 +30,23 @@ def readiness(db: Database, cfg: BotConfig, now_ms: int, mode: str = "paper",
         Check("profit factor", m["profit_factor"] >= min_pf, f"{m['profit_factor']:.2f} (need {min_pf})"),
         Check("drawdown within limit", dd < cfg.risk.max_drawdown_pct,
               f"max drawdown {dd:.1f}% (limit {cfg.risk.max_drawdown_pct}%)"),
+        exchange_protection_check(),
     ]
+
+
+PROTECTIVE_EXITS = ("stop_loss", "breakeven_stop", "trailing_stop", "take_profit")
+
+
+def exchange_protection_check() -> Check:
+    """Go-live item: every protective exit must exist on the exchange. An exit the bot manages
+    itself does not fire while the bot is down (asleep, crashed, offline)."""
+    from .execution.live import EXCHANGE_SIDE_EXITS
+
+    missing = [e for e in PROTECTIVE_EXITS if e not in EXCHANGE_SIDE_EXITS]
+    return Check("every protective exit rests on the exchange", not missing,
+                 "stop-loss, breakeven, trailing and take-profit are all exchange orders" if not missing else
+                 f"{', '.join(e.replace('_', ' ') for e in missing)} are managed by the bot and don't fire while it is "
+                 f"down - build and testnet-verify exchange-side orders for them first")
 
 
 def format_readiness(checks: list[Check]) -> str:

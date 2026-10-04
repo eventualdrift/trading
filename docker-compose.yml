@@ -1,11 +1,23 @@
-# Run 24/7 on a VPS:  docker compose up -d --build   ·   logs: docker compose logs -f
+# Always-on box: see DEPLOY.md.  Start / update (only when the owner says so):
+#   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build     logs: docker compose logs -f
 services:
   tradebot:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     restart: unless-stopped
+    # run as the host user so state/ and data/ stay readable by the agent checkout (id -u / id -g)
+    user: "${TRADEBOT_UID:-1000}:${TRADEBOT_GID:-1000}"
     env_file: .env
+    stop_grace_period: 60s  # on SIGTERM the bot finishes its tick and records a clean stop
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./state:/app/state   # database, selected strategies, ML model
-      - ./data:/app/data     # cached price history
+      - ./state:/app/state   # database, selected strategies, ML model, research ledger
+      - ./data:/app/data     # cached price history (and the out-of-sample data)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     command: ["run"]

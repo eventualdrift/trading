@@ -70,6 +70,7 @@ Every trade has an ATR-based stop-loss, a fixed reward:risk take-profit, a break
 
 **The "self-learning" part** is real, but deliberately cautious:
 - *Strategy selection* is re-run weekly on fresh data, so the bot stops trading what stopped working.
+  If a run fails (say, the network drops mid-download), it is retried an hour later, not a week later.
 - *The ML filter* (scikit-learn gradient boosting over ~40 features) estimates the probability that a
   setup wins. It's trained walk-forward with an embargo (no future leakage), its threshold is
   picked on a calibration block, and it replaces the current model only if it's better on a
@@ -145,9 +146,13 @@ never changes the result).
 
 **Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
 backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
-date, and saves both (with the selected strategies) to `reports/universe-<date>.json`. Rerun on
-exactly that coin list and data with `--universe-file reports/universe-<date>.json`. The cached
-candles aren't changed by a frozen run. The file also records the git commit and the settings the
+date, and saves both to `reports/universe-<date>.json`, with the whole strategy selection:
+every strategy with its timeframe, parameters and filters. Rerun on exactly that coin list,
+data and selection with `--universe-file reports/universe-<date>.json`. A later `learn` doesn't
+leak into the rerun. Pass `--current-selection` to rerun with today's selection instead. For
+files saved before the selection was recorded in full, the rerun recovers it from the bot's
+activity log (the last selection learn made before the run's data end, with the same strategy
+names) and says so. The cached candles aren't changed by a frozen run. The file also records the git commit and the settings the
 run used. The report prints both, and a rerun flags any difference: the same coins and data
 under different code or settings can give different numbers. If the file lacks these records,
 or they differ, the rerun saves a copy of the file stamped with its own commit and settings.
@@ -192,7 +197,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 259 tests
+pytest -q              # 266 tests
 ```
 
 ### 1. Configure
@@ -282,7 +287,32 @@ Go-live readiness (paper track record):
   [PASS] positive expectancy: +0.214R per trade
   [PASS] profit factor: 1.46 (need 1.2)
   [PASS] drawdown within limit: max drawdown 6.2% (limit 15.0%)
-  => READY for live trading (start small!)
+  [FAIL] every protective exit rests on the exchange: breakeven stop, trailing stop, take profit are
+         managed by the bot and don't fire while it is down - build and testnet-verify exchange-side
+         orders for them first
+  => NOT ready for live trading - keep paper trading
+```
+
+The last check is about the code, not the track record. It fails until every protective exit
+lives on the exchange as an order, so it still fires while the bot is down (asleep, crashed,
+offline). The other go-live items are in BACKLOG.md.
+
+### Weekly check-in: `tradebot weekly`
+
+One command for the week:
+- the reconciliation over the last 7 days;
+- a frozen rerun of the reference backtest (coins, data end and strategy selection from its
+  universe file);
+- an uptime summary;
+- an entry appended to STATUS.md: what changed (code, settings, strategy selection since last
+  week), what the numbers say (with the commands that reproduce them), what needs you
+  (anything off), and what's next (the top of BACKLOG.md).
+
+The full reports go to `reports/weekly/<date>/`.
+
+```bash
+tradebot weekly --reference reports/universe-<run>.json   # the first time; the reference is remembered
+tradebot weekly                                           # every week after (cron: see DEPLOY.md)
 ```
 
 ### Paper vs backtest, trade by trade: `tradebot reconcile`
@@ -473,7 +503,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot run` | run the bot (paper or live per config) |
 | `tradebot report` | track record + go-live checklist |
 | `tradebot project [--capital 1000]` | range of outcomes for your account at 1-12 months, vs holding BTC |
-| `tradebot portfolio-backtest [--capital 1000] [--core-fraction 0.65] [--since 2022-01-01]` | core + satellite account vs holding BTC |
+| `tradebot portfolio-backtest [--capital 1000] [--core-fraction 0.65] [--since 2022-01-01] [--universe-file f [--current-selection]]` | core + satellite account vs holding BTC |
 | `tradebot research breaker [--ratios 2 2.5 3]` | evaluate the volatility breaker on real data |
 | `tradebot research sizing` | the pre-registered one-time test of the open-risk budget rule |
 | `tradebot research core [--universe-file f]` | core robustness, reporting only: all 30 sleeve-reset phases and the trend lengths scaled 0.8x/1.2x |
@@ -481,6 +511,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
 | `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
 | `tradebot reconcile [--since ...] [--end ...] [--csv file]` | paper vs backtest, trade by trade, on frozen candles (reporting only) |
+| `tradebot weekly [--reference universe-file]` | weekly check-in: last week's reconciliation, the reference backtest rerun frozen, uptime, a STATUS.md entry |
 | `tradebot telegram-test` | Telegram setup helper |
 | `tradebot demo` | offline demo on synthetic data |
 
@@ -490,7 +521,9 @@ another config file and secrets file (for side-by-side instances).
 
 ## Running 24/7
 
-A trading bot has to stay up, so run it on a small VPS (1 vCPU / 1 GB RAM is enough), not a laptop:
+A trading bot has to stay up, so run it on an always-on box, not a laptop. DEPLOY.md is the
+checklist: docker, what to copy from the old machine, basic hardening, the agent's separate
+checkout, Remote Control, the weekly cron and backups. In short:
 
 ```bash
 cp config.example.yaml config.yaml && cp .env.example .env   # edit both
@@ -531,9 +564,13 @@ tradebot/
   research.py     real-data studies of optional rules (volatility breaker)
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
-  reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core)
-tests/            259 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+  reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core, uptime)
+  weekly.py       the weekly check-in and its STATUS.md entry
+tests/            266 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
+CLAUDE.md         rules for the agent working on this repo (hard rules, research discipline, when to ask)
+BACKLOG.md        open work with acceptance criteria; STATUS.md: one entry per session or week
+DEPLOY.md         moving the bot to an always-on Linux box
 ```
 
 ## Limitations and next steps
