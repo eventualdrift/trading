@@ -268,6 +268,9 @@ class Row:
     r_model: float | None = None
     fees_paper_pct: float | None = None
     fees_model_pct: float | None = None
+    r_if_taken: float | None = None  # the backtest trade's R for this signal (complete trades only)
+    ml_probability: float | None = None  # paper's ML score, when the filter was on
+    size_multiplier: float | None = None  # paper's risk multiplier from the ML score (1 = none)
     note: str = ""
 
 
@@ -281,7 +284,8 @@ class Reconciliation:
     approx_universe_until: int | None = None
     approx_selection_until: int | None = None
     scans_logged_from: int | None = None
-    ml_active: bool = False
+    ml_active: bool = False  # the ML filter was on at some point in the window
+    selections: list[dict] = field(default_factory=list)  # in force during the window (activity log)
     core_days: list[dict] = field(default_factory=list)
     core_trades: list[dict] = field(default_factory=list)
     core_expected_missing: list[dict] = field(default_factory=list)
@@ -318,7 +322,13 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
     universes = Timeline(db.botlog(mode, "universe"), fallback_universe)
     rec.approx_selection_until = selections.first
     rec.approx_universe_until = universes.first
-    rec.ml_active = any((d or {}).get("ml") for _, d in selections.entries)
+    in_force = [(ts, d) for ts, d in selections.entries if ts <= since_ms][-1:] + \
+        [(ts, d) for ts, d in selections.entries if since_ms < ts <= end_ms]
+    rec.selections = [{"from": ts, "keys": sorted(f"{c['strategy']}@{c['timeframe']}" for c in (d or {}).get("combos", [])),
+                       "created": (d or {}).get("created_at"), "ml": bool((d or {}).get("ml")),
+                       "ml_threshold": (d or {}).get("ml_threshold"), "ml_trained_until": (d or {}).get("ml_trained_until")}
+                      for ts, d in in_force]
+    rec.ml_active = any(x["ml"] for x in rec.selections)
     scan_errors = {}
     for _, d in db.botlog(mode, "scan_errors", since_ms - DAY_MS):
         for e in d.get("errors", []):
@@ -376,6 +386,23 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         ts = pd.Timestamp(m, unit="ms", tz="UTC")
         return {t.symbol for t in taken if t.entry_time < ts < flat_at(t)}
 
+    def no_backtest_signal(sym: str, tf: str, strat: str, candle: int, close_ms: int) -> str:
+        df = datasets.get(tf, {}).get(sym)
+        if df is None or not len(df):
+            return "no candles for it in the frozen data"
+        opens = index_ms(df.index)
+        if candle > int(opens[-1]):
+            return "the candle is after the frozen data end"
+        i = int(np.searchsorted(opens, candle))
+        if i >= len(opens) or int(opens[i]) != candle:
+            return "the candle is missing from the frozen data"
+        combo = next((v for v in _combos(selections.at(close_ms + SCAN_LAG_MS)).values() if v[:2] == (strat, tf)), None)
+        if combo is None:
+            return "that strategy is not in the selection assumed for that time"
+        if i < make_strategy(combo[0], combo[2]).warmup:
+            return "the coin's history is shorter than the strategy's warm-up"
+        return "the entry condition is false there on the full history (live used its last 1000 candles at most)"
+
     def no_signal_reason(sym: str, tf: str, candle: int, close_ms: int) -> str:
         if (sym, tf, candle) in scan_errors:
             return f"scan error: {scan_errors[(sym, tf, candle)]}"
@@ -411,9 +438,13 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         else:
             row.paper = ps.status + (f": {ps.note}" if ps.note else "")
         # backtest side
+        if ps is not None:
+            row.ml_probability, row.size_multiplier = ps.confidence, ps.risk_multiplier
+        if s is not None and s.trade is not None and s.trade.reason != "end_of_data":
+            row.r_if_taken = s.trade.r_multiple
         if s is None:
-            row.backtest = ("(no signal)" if key not in outside else
-                            "(not replayed: coin outside paper's logged list, or strategy not active then)")
+            row.backtest = (f"(no signal: {no_backtest_signal(sym, tf, strat, candle, close_ms)})" if key not in outside
+                            else "(not replayed: coin outside paper's logged list, or strategy not active then)")
         elif s.trade is None:
             row.backtest = s.no_trade
         else:
@@ -536,7 +567,21 @@ def _reconcile_core(rec: Reconciliation, db: Database, cfg: BotConfig, daily_clo
             bw = weights.get(sym, pd.Series(dtype=float)).get(day)
             bt_targets[sym] = None if bw is None or bw != bw else float(bw)
             paper_w = (d.get("targets") or {}).get(sym)
-            rec.core_days.append({"day": day, "symbol": sym, "paper": paper_w, "backtest": bt_targets[sym]})
+            entry = {"day": day, "symbol": sym, "paper": paper_w, "backtest": bt_targets[sym], "why": ""}
+            if paper_w is None and bt_targets[sym] is not None:
+                entry["why"] = ("the bot had no daily candles at its check (the fetch failed, e.g. right after "
+                                "waking): it left that coin alone that day")
+            elif paper_w is not None and bt_targets[sym] is not None and abs(paper_w - bt_targets[sym]) > 1e-9:
+                used = (d.get("closes") or {}).get(sym)
+                cm = closes_ms.get(sym)
+                bt_close = float(cm[day]) if cm is not None and day in cm.index else None
+                if used:
+                    entry["why"] = (f"the bot computed it from the candle of {_ts(int(used[0]))[:10]}, close "
+                                    f"{used[1]:.6g}; the backtest from {_ts(day)[:10]}, close "
+                                    f"{bt_close:.6g}" if bt_close is not None else "")
+                else:
+                    entry["why"] = "the closes the bot used were not logged then (they are from 2026-10-07)"
+            rec.core_days.append(entry)
         closes = {sym: float(cm[day]) for sym, cm in closes_ms.items() if day in cm.index}
         planned = rule_trades(cfg, bt_targets, closes, float(d.get("cash") or 0.0), d.get("holdings") or {})
         done = {t["symbol"]: t["side"] for t in rec.core_trades if t["day"] == day and t["reason"] == "trend weights"}
@@ -594,6 +639,48 @@ def _stat(xs: list[float], digits: int = 1) -> str:
     return (f"mean {a.mean():{f}}, median {np.median(a):{f}}, largest {a[np.argmax(np.abs(a))]:{f}} (n={len(a)})")
 
 
+def format_selections(rec: Reconciliation) -> list[str]:
+    """The strategy selections in force during the window, from the activity log."""
+    if not rec.selections:
+        return ["Strategies in force: not logged for this window (today's selection assumed)"]
+    lines = ["Strategies in force (activity log):"]
+    for x in rec.selections:
+        made = f"learn of {pd.Timestamp(x['created'], unit='s', tz='UTC'):%Y-%m-%d %H:%M}" if x.get("created") else "learn"
+        ml = "ML filter ON" if x["ml"] else "ML filter off"
+        if x["ml"] and x.get("ml_threshold") is not None:
+            ml += f" (threshold {x['ml_threshold']:.0%}" + (f", trained to {str(x['ml_trained_until'])[:10]}"
+                                                             if x.get("ml_trained_until") else "") + ")"
+        start = "before the window" if x["from"] <= rec.since_ms else _ts(x["from"])
+        lines.append(f"  from {start}: {', '.join(x['keys']) or 'none'} ({made}); {ml}")
+    return lines
+
+
+def format_ml(rec: Reconciliation) -> list[str]:
+    """What the ML filter did to paper's signals, and what the backtest says those signals were worth."""
+    scored = [r for r in rec.rows if r.ml_probability is not None]
+    if not rec.ml_active and not scored:
+        return []
+    filtered = [r for r in scored if r.paper.startswith("filtered")]
+    passed = [r for r in scored if not r.paper.startswith("filtered")]
+    sized = [r for r in scored if (r.size_multiplier or 1.0) > 1.0 + 1e-9]
+
+    def outcome(rs: list[Row]) -> str:
+        r = [x.r_if_taken for x in rs if x.r_if_taken is not None]
+        if not r:
+            return "no complete backtest trades"
+        return (f"backtest trades {sum(v > 0 for v in r)} won / {len(r)}, mean {np.mean(r):+.2f}R, "
+                f"total {np.sum(r):+.1f}R")
+
+    lines = ["", f"ML filter (paper only - the backtest takes every signal): {len(scored)} paper signals scored",
+             f"  filtered out {len(filtered)}: as backtest trades they would have made: {outcome(filtered)}",
+             f"  passed {len(passed)}: {outcome(passed)}"]
+    if sized:
+        m = [r.size_multiplier for r in sized]
+        lines.append(f"  sized up by confidence: {len(sized)} signals, risk x{np.mean(m):.2f} on average "
+                     f"(x{max(m):.2f} at most) - the backtest sizes every trade at 1x")
+    return lines
+
+
 def format_uptime(rec: Reconciliation) -> list[str]:
     up = rec.uptime
     lines = [f"Uptime: the bot was running {rec.uptime_share:.0%} of the window (from its 15-minute equity snapshots)"]
@@ -630,9 +717,7 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
     if rec.scans_logged_from is None or rec.scans_logged_from > rec.since_ms:
         lines.append(f"  ! Scans logged from {_ts(rec.scans_logged_from) if rec.scans_logged_from else '(not yet)'}: "
                      f"before that a missing paper signal can only be put down to downtime or scan errors")
-    if rec.ml_active:
-        lines.append("  ! The ML filter was active: paper filters signals the backtest cannot reproduce")
-    lines += [""] + format_uptime(rec)
+    lines += [""] + format_selections(rec) + [""] + format_uptime(rec)
 
     both = [r for r in rows if not r.paper.startswith("(no signal") and not r.backtest.startswith("(")]
     bt_only = [r for r in rows if r.paper.startswith("(no signal")]
@@ -645,10 +730,10 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
         for k, n in reasons.items():
             lines.append(f"    {n:>3}  {k}")
     if paper_only:
-        none = sum(r.backtest == "(no signal)" for r in paper_only)
-        lines.append(f"  Paper only: {len(paper_only)}: {none} the backtest had no signal on that candle"
-                     + (f", {len(paper_only) - none} on a coin outside paper's logged list or a strategy not active "
-                        f"then (not replayed)" if len(paper_only) > none else ""))
+        reasons = pd.Series([r.backtest[1:-1].replace("no signal: ", "no backtest signal: ") for r in paper_only])
+        lines.append("  Paper only:")
+        for k, n in reasons.value_counts().items():
+            lines.append(f"    {n:>3}  {k}")
     agree = [r for r in both if not r.cause]
     disagree = [r for r in both if r.cause]
     if both:
@@ -661,6 +746,7 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
         for r in first[:limit]:
             lines.append(f"    ! {r.time} {r.symbol} {r.setup}: paper {r.paper}; backtest {r.backtest} - "
                          f"{r.cause[len('first difference: '):]}")
+    lines += format_ml(rec)
     fills = [r for r in rows if r.entry_bps is not None]
     closed = [r for r in fills if r.exit_paper and r.exit_paper != "still open"]
     if fills:
@@ -705,7 +791,8 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
                 and abs(d["paper"] - d["backtest"]) < 1e-9]
         lines.append(f"  Daily target weights: {len(same)} of {len(days)} coin-days match the backtest")
         for d in [d for d in days if not any(d is x for x in same)][:limit]:
-            lines.append(f"    ! {_ts(d['day'])[:10]} {d['symbol']}: paper {d['paper']} vs backtest {d['backtest']}")
+            lines.append(f"    ! {_ts(d['day'])[:10]} {d['symbol']}: paper {d['paper']} vs backtest {d['backtest']}"
+                         + (f" - {d['why']}" if d.get("why") else ""))
     if rec.core_rule_days:
         lines.append(f"  Rebalance rule replayed from paper's own state on {rec.core_rule_days} logged days "
                      f"(backtest targets, daily closes): {len(rec.core_rule_diffs)} coin-days trade differently")

@@ -376,7 +376,13 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
         if u.get("code"):
             from .provenance import config_summary
 
-            out.append(f"    Code: {u['code']} · settings {u.get('config_hash')}: {config_summary(u.get('config') or {})}")
+            used = (f" · this run: timeframes {', '.join(u['timeframes_used'])}, core {u['core_fraction_used']:g}"
+                    if u.get("timeframes_used") else "")
+            out.append(f"    Code: {u['code']} · settings {u.get('config_hash')}{used}: "
+                       f"{config_summary(u.get('config') or {})}")
+            if u.get("legacy_settings"):
+                out.append("    (the saved run recorded its settings with the timeframes it used, the older format: "
+                           "compared here without the timeframes)")
         if u.get("stamped_file"):
             out.append(f"    Same coins and data end with this code and settings: --universe-file {u['stamped_file']}")
         if u.get("frozen"):

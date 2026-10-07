@@ -55,6 +55,7 @@ class CoreTrade:
 class CoreSleeve:
     def __init__(self, db, cfg: CoreConfig, costs: Costs, mode: str, market):
         self.db, self.cfg, self.costs, self.mode, self.market = db, cfg, costs, mode, market
+        self.last_closes: dict[str, tuple[int, float]] = {}  # the daily candle each target came from (logged)
 
     # ------------------------------------------------------------- state
     def _k(self, key: str) -> str:
@@ -140,10 +141,13 @@ class CoreSleeve:
 
     def target_weights(self, now_ms: int) -> dict[str, float | None]:
         out = {}
+        self.last_closes = {}
         for sym in self.cfg.symbols:
             try:
                 d = drop_unclosed(self.market.fetch_ohlcv_df(sym, "1d", limit=max(self.cfg.sma_days) + 20), "1d", now_ms)
                 out[sym] = trend_weight(d["close"], self.cfg.sma_days)
+                if len(d):
+                    self.last_closes[sym] = (int(d.index[-1].value // 1_000_000), float(d["close"].iloc[-1]))
             except Exception as exc:
                 log.warning("core: no daily data for %s: %s", sym, exc)
                 out[sym] = None

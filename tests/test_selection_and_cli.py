@@ -199,3 +199,42 @@ def test_code_version_inside_a_docker_image(monkeypatch):
     assert code_version() == "abc1234"
     monkeypatch.setenv("TRADEBOT_COMMIT", "unknown")  # built without the commit: fall back to git
     assert code_version() != "unknown"
+
+
+def test_an_observer_config_reads_the_bot_and_never_runs_it(tmp_path, monkeypatch, capsys):
+    import pytest
+
+    from tradebot.cli import _bot_db
+    from tradebot.config import load_config
+    from tradebot.db import Database
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    (tmp_path / "bot").mkdir()
+    Database(tmp_path / "bot" / "tradebot.db")  # the running bot's
+    conf = tmp_path / "agent.yaml"
+    conf.write_text(f"state_dir: {tmp_path / 'agent'}\nobserve_state_dir: {tmp_path / 'bot'}\n"
+                    f"learning:\n  follow_state_dir: {tmp_path / 'bot'}\n")
+    cfg = load_config(conf, env_file=None)
+    db = _bot_db(cfg)
+    assert db.readonly and db.path == str(tmp_path / "bot" / "tradebot.db")
+    with pytest.raises(SystemExit, match="never runs a bot"):
+        main(["--config", str(conf), "--env", str(tmp_path / "none.env"), "run"])
+    with pytest.raises(SystemExit, match="uses the strategies in"):
+        main(["--config", str(conf), "--env", str(tmp_path / "none.env"), "learn"])  # learn refuses too
+
+
+def test_report_says_which_ml_model_is_in_force(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from tradebot.cli import ml_status
+
+    rep = tmp_path / "model_report.json"
+    rep.write_text(json.dumps({"trained_at": 1_791_049_200, "promoted": False, "reason": "worse than current model"}))
+    model = SimpleNamespace(threshold=0.55, report=SimpleNamespace(trained_at=1_790_444_400,
+                                                                   trained_until="2026-09-20T00:00:00",
+                                                                   confidence_scaling=True))
+    text = ml_status(model, rep)
+    assert "ML filter: ACTIVE - model trained 2026-09-26" in text and "threshold 55%" in text
+    assert "Last learn's ML training (2026-10-03 17:40 UTC): not deployed - worse than current model" in text
+    assert "not active" in ml_status(None, tmp_path / "none.json")

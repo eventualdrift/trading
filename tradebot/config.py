@@ -182,6 +182,9 @@ class BotConfig:
     poll_seconds: float = 30
     candle_close_delay_seconds: float = 15
     state_dir: str = "state"
+    # an agent's checkout reporting on a running bot: read that bot's database (read-only) from
+    # here, while everything this config writes goes to its own state_dir and data.dir
+    observe_state_dir: str | None = None
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     data: DataConfig = field(default_factory=DataConfig)
@@ -204,6 +207,11 @@ class BotConfig:
         p = Path(self.state_dir)
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    @property
+    def bot_db_path(self) -> Path:
+        """The database of the bot this config reports on: the observed bot's, else its own."""
+        return Path(self.observe_state_dir) / "tradebot.db" if self.observe_state_dir else self.state_path / "tradebot.db"
 
     @property
     def brain_path(self) -> Path:
@@ -294,6 +302,8 @@ class BotConfig:
         follow = self.learning.follow_state_dir
         if follow and Path(follow).resolve() == Path(self.state_dir).resolve():
             errors.append("learning.follow_state_dir must be another instance's state_dir, not this one's")
+        if self.observe_state_dir and Path(self.observe_state_dir).resolve() == Path(self.state_dir).resolve():
+            errors.append("observe_state_dir must be the observed bot's state_dir, not this config's own")
         if not 0.3 <= self.selection.in_sample_fraction <= 0.9:
             errors.append("selection.in_sample_fraction must be in [0.3, 0.9]")
         if errors:
@@ -359,4 +369,7 @@ def load_config(path: str | Path | None = "config.yaml", env_file: str | None = 
     if os.getenv("TRADEBOT_MODE"):
         cfg.mode = os.environ["TRADEBOT_MODE"]
     cfg.validate()
+    from .provenance import config_snapshot
+
+    cfg.__dict__["_settings_at_load"] = config_snapshot(cfg)  # what every report hashes (provenance)
     return cfg

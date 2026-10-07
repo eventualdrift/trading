@@ -90,13 +90,13 @@ def saved_selection(frozen: dict, cfg: BotConfig):
         sel = Selection(created_at=full["created_at"], combos=[ComboResult(**c) for c in full["combos"]])
         return sel, "saved with the run"
     names = sorted(frozen.get("selection") or [])
-    db_path = cfg.state_path / "tradebot.db"
+    db_path = cfg.bot_db_path
     if not names or not db_path.exists():
         return None
     from .db import Database
 
     found = None
-    for _, d in Database(db_path).botlog(cfg.mode, "selection"):
+    for _, d in Database(db_path, readonly=bool(cfg.observe_state_dir)).botlog(cfg.mode, "selection"):
         made = d.get("created_at")
         combos = d.get("combos") or []
         if made is None or made * 1000 > frozen["data_end_ms"]:
@@ -114,7 +114,7 @@ def saved_selection(frozen: dict, cfg: BotConfig):
 
 def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selection_keys: list[str],
                   cfg: BotConfig, code: str | None = None, config: dict | None = None,
-                  selection=None) -> str:
+                  selection=None, run: dict | None = None) -> str:
     """Freeze a run's coin list, data end date and strategy selection so it can be reproduced
     (--universe-file)."""
     import json
@@ -137,7 +137,8 @@ def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selec
         "rules": {"top_n": u.top_n, "min_quote_volume": u.min_quote_volume,
                   "min_history_days": u.min_history_days, "whitelist": u.whitelist, "blacklist": u.blacklist},
         "code": code,  # git commit of the code that produced the run
-        "config": config,  # the settings it used (provenance.config_snapshot)
+        "config": config,  # the config file's settings, as loaded (provenance.settings_snapshot)
+        **(run or {}),  # what the run itself used: timeframes_used, core_fraction_used
     }, indent=2, default=str))
     return str(path)
 

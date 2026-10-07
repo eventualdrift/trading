@@ -72,3 +72,20 @@ def test_bot_activity_log(tmp_path):
     assert db.botlog("paper", "universe", since_ms=150) == [(200, ["BTC/USDT", "ETH/USDT"])]
     assert db.last_botlog("paper", "universe") == (200, ["BTC/USDT", "ETH/USDT"])
     assert db.botlog("paper", "core_day")[0][1]["targets"] == {"BTC/USDT": 0.75}
+
+
+def test_an_observed_bots_database_is_opened_read_only(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    bot = Database(tmp_path / "bot.db")
+    bot.insert_signal(Signal("A/USDT", "1h", "trend", "long", 1, 0.9, 1.2, 0, 0, 0, 0))
+    bot.log_bot(1, "paper", "universe", ["A/USDT"])
+    seen = Database(tmp_path / "bot.db", readonly=True)
+    assert seen.recent_signals(1)[0].symbol == "A/USDT" and seen.botlog("paper", "universe") == [(1, ["A/USDT"])]
+    with pytest.raises(sqlite3.OperationalError):
+        seen.log_bot(2, "paper", "universe", ["B/USDT"])  # it can't write to the bot's state
+    with pytest.raises(FileNotFoundError):
+        Database(tmp_path / "missing.db", readonly=True)  # nor create one
+    assert not (tmp_path / "missing.db").exists()

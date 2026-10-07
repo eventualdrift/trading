@@ -104,6 +104,17 @@ def reconcile_summary(rec) -> tuple[list[str], dict]:
              f"({len(first)} first differences, {len(knock)} knock-on)"]
     if len(reasons):
         lines.append("  Backtest only: " + ", ".join(f"{n} {k}" for k, n in reasons.items()))
+    if paper_only:
+        why = pd.Series([r.backtest[1:-1].split(" (live")[0] for r in paper_only]).value_counts()
+        lines.append("  Paper only: " + ", ".join(f"{n} {k}" for k, n in why.items()))
+    scored = [r for r in rows if r.ml_probability is not None]
+    if rec.ml_active or scored:
+        filtered = [r for r in scored if r.paper.startswith("filtered")]
+        won = [r.r_if_taken for r in filtered if r.r_if_taken is not None]
+        sized = sum((r.size_multiplier or 1.0) > 1.0 + 1e-9 for r in scored)
+        lines.append(f"- ML filter on: {len(filtered)} of {len(scored)} scored signals filtered out"
+                     + (f" (as backtest trades: {sum(v > 0 for v in won)} won of {len(won)}, total {sum(won):+.1f}R)"
+                        if won else "") + (f"; {sized} sized up by confidence" if sized else ""))
     for r in first[:3]:
         lines.append(f"  First difference {r.time} {r.symbol} {r.setup}: {r.cause[len('first difference: '):]}")
     if fills:
@@ -126,7 +137,7 @@ def reconcile_summary(rec) -> tuple[list[str], dict]:
     unexplained = int(sum(n for k, n in reasons.items() if k.startswith(("no scan recorded", "scanned"))))
     return lines, {"first_differences": len(first), "core_target_mismatch": len(days) - same,
                    "core_rule_diffs": len(rec.core_rule_diffs), "late_exits": len(late),
-                   "signal_data_differences": unexplained, "shared": len(both)}
+                   "signal_data_differences": unexplained, "shared": len(both), "ml_active": bool(rec.ml_active)}
 
 
 def portfolio_summary(res) -> tuple[list[str], dict]:
@@ -150,6 +161,26 @@ def portfolio_summary(res) -> tuple[list[str], dict]:
 
 
 # --------------------------------------------------------------------- the entry
+def selection_changes(rec) -> list[str]:
+    """Learn's changes during the week, from the activity log: strategies added or dropped, the ML
+    filter switched on or off."""
+    out, prev = [], None
+    for x in rec.selections:
+        if prev is not None:
+            added, dropped = sorted(set(x["keys"]) - set(prev["keys"])), sorted(set(prev["keys"]) - set(x["keys"]))
+            parts = ([f"added {', '.join(added)}"] if added else []) + ([f"dropped {', '.join(dropped)}"] if dropped else [])
+            if x["ml"] != prev["ml"]:
+                parts.append("ML filter switched " + ("on" if x["ml"] else "off"))
+            elif x["ml"] and x.get("ml_trained_until") != prev.get("ml_trained_until"):
+                parts.append("a new ML model")
+            made = (f"learn of {pd.Timestamp(x['created'], unit='s', tz='UTC'):%Y-%m-%d %H:%M}"
+                    if x.get("created") else "a new selection")
+            when = pd.Timestamp(x["from"], unit="ms", tz="UTC").strftime("%m-%d %H:%M")
+            out.append(f"{made} (in force from {when}): " + ("; ".join(parts) or "same strategies"))
+        prev = x
+    return out
+
+
 def needs_owner(now: dict, prev: dict, settings_diffs: list[str], selection_changed: bool) -> list[str]:
     out = []
     r = now.get("reconcile") or {}
@@ -163,6 +194,8 @@ def needs_owner(now: dict, prev: dict, settings_diffs: list[str], selection_chan
     if r.get("signal_data_differences"):
         out.append(f"{r['signal_data_differences']} backtest signal(s) live didn't see although it scanned "
                    f"(live candles differ, or a scan was not recorded)")
+    if r.get("ml_active"):
+        out.append("The ML filter is on: paper filters and sizes signals the backtest doesn't model (your decision)")
     if r.get("core_target_mismatch") or r.get("core_rule_diffs"):
         out.append("The core differs from its backtest (targets or rebalances)")
     if settings_diffs:

@@ -23,12 +23,23 @@ def _base_type(hint) -> type:
 
 
 class Database:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, readonly: bool = False):
+        """``readonly``: another process's database (a running bot observed from an agent's
+        checkout) - opened read-only, its tables never created or migrated from here."""
         self.path = str(path)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self.readonly = readonly
+        if readonly:
+            if not Path(path).exists():
+                raise FileNotFoundError(f"no bot database at {path}")
+            self._conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+                                         check_same_thread=False, isolation_level=None)
+        else:
+            self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._types = {cls: {k: _base_type(v) for k, v in get_type_hints(cls).items()} for cls in (Signal, Position)}
+        if readonly:
+            return
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._ensure_table("signals", Signal)

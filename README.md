@@ -152,8 +152,8 @@ data and selection with `--universe-file reports/universe-<date>.json`. A later 
 leak into the rerun. Pass `--current-selection` to rerun with today's selection instead. For
 files saved before the selection was recorded in full, the rerun recovers it from the bot's
 activity log (the last selection learn made before the run's data end, with the same strategy
-names) and says so. The cached candles aren't changed by a frozen run. The file also records the git commit and the settings the
-run used. The report prints both, and a rerun flags any difference: the same coins and data
+names) and says so. The cached candles aren't changed by a frozen run. The file also records the git commit, the settings and what the run
+used. The settings hash covers the config file as loaded, the same in every report; the timeframes and core fraction a run used are printed beside it. The report prints them, and a rerun flags any difference: the same coins and data
 under different code or settings can give different numbers. If the file lacks these records,
 or they differ, the rerun saves a copy of the file stamped with its own commit and settings.
 A pre-registered research test can name such a file, so its coins and data end date are fixed
@@ -197,7 +197,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 266 tests
+pytest -q              # 274 tests
 ```
 
 ### 1. Configure
@@ -326,10 +326,17 @@ not changed; the report prints the `--since`/`--end` that reproduce it) and comp
   with its cause: the computer was asleep, the bot was running but not looping (a hang or a very
   slow call), it was stopped (and why: SIGTERM from launchd/docker, Ctrl+C), or it ended without
   a clean stop (a crash, a kill or a power loss) and when it was last alive.
-- **Signals** (coin, strategy, candle): which each side saw, and why the other didn't: the bot
-  was not running at the close, the candle was skipped as stale (the bot reached it more than an
-  hour after the close), a scan error, live scanned but found no signal (its candles differ),
-  or the coin list is approximated.
+- **Strategies in force**: each selection learn made that was in force during the window, from
+  the activity log, with the ML filter on or off (and, from 2026-10-07, the model's threshold
+  and training end).
+- **Signals** (coin, strategy, candle): which each side saw, and why the other didn't. For a
+  signal only the backtest has: the bot was not running at the close, the candle was skipped as
+  stale (the bot reached it more than an hour after the close), a scan error, live scanned but
+  found no signal (its candles differ), or the coin list is approximated. For one only paper has:
+  no candles or the candle missing from the frozen data, history shorter than the warm-up, the
+  strategy not in the selection for that time, or the entry condition false on the full history.
+- **The ML filter**, while it is on: the signals it blocked and what the backtest says they were
+  worth, the ones it passed, and the trades it sized up. The backtest takes every signal at 1x.
 - **Taken vs skipped**: the backtest's account replay, starting from the paper positions open
   when the window begins, against what paper did. A disagreement is a **first difference** when
   both sides held the same coins before that close (the report names the cause: a live-only
@@ -338,9 +345,11 @@ not changed; the report prints the `--since`/`--end` that reproduce it) and comp
 - **Fills**, for trades both sides entered: entry and exit price against the modelled fill (in
   basis points), exit reason and candle, R, fees, and for each exit how much later paper exited
   and why (the bot was down, or a bot-managed exit sold at the price when it looked).
-- **The core**: daily target weights against the backtest's; the rebalance rule replayed from
-  paper's own logged state (cash and holdings before each rebalance, backtest targets, daily
-  closes) to see if the same coins trade; fills against the daily close +/- slippage, and fees.
+- **The core**: daily target weights against the backtest's, each mismatch with its cause (no
+  daily candles at the bot's check, or the candle and close the bot used against the
+  backtest's); the rebalance rule replayed from paper's own logged state (cash and holdings
+  before each rebalance, backtest targets, daily closes) to see if the same coins trade; fills
+  against the daily close +/- slippage, and fees.
 
 What the bot was working with (coin list, active strategies, core targets and state, every scan
 and stale-candle skip, scan errors, sleeve moves, starts, stops and pauses) comes from its
@@ -566,7 +575,7 @@ tradebot/
   compare.py      market vs limit entries across two instances, per signal
   reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core, uptime)
   weekly.py       the weekly check-in and its STATUS.md entry
-tests/            266 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            274 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 CLAUDE.md         rules for the agent working on this repo (hard rules, research discipline, when to ask)
 BACKLOG.md        open work with acceptance criteria; STATUS.md: one entry per session or week

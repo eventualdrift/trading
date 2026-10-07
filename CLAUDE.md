@@ -16,6 +16,12 @@ and report. When in doubt, stop and ask (below).
   restart in the bot's checkout or container. Work in the agent checkout.
 - Never run `tradebot run` or `tradebot learn` against the running bot's state. Never commit
   `.env`, `config*.yaml`, `state/`, `data/` or `reports/`.
+- **From the agent checkout, only frozen runs touch the bot's data and state.** Anything that
+  writes (learn, unfrozen backtests, data updates) uses the agent's own copy of `data/` and
+  `state/`. `config-agent.yaml` does this: its own `state_dir` and `data.dir`, the bot's database
+  read-only through `observe_state_dir`, the bot's strategies through `learning.follow_state_dir`
+  (with it, `learn` refuses to run).
+- **The ledger changes only through `tradebot research` commands**, never by hand.
 
 ## What you may do unasked
 
@@ -43,6 +49,8 @@ can't show that, it's a stop-and-ask.
 - **Trials are counted**: every variant tried goes in the ledger, failures included, and results
   are reported with the number of trials.
 - Never pick the best variant out of a sensitivity or robustness report.
+- **Swings of about 0.1 Sharpe have come from implementation details alone** (the replay fixes
+  moved results by that much). A smaller difference is not a finding.
 
 ## Stop and ask
 
@@ -53,7 +61,8 @@ anything else on the backlog:
 - a result that changes a conclusion (for example, a frozen rerun moves a recorded finding);
 - a go-live item (see `tradebot report`: the checklist, and the backlog's go-live section);
 - anything that might be tuning: choosing strategies, parameters, thresholds or splits because
-  of results.
+  of results;
+- any edit to the hard rules or to this stop-and-ask list.
 
 ## Output rule
 
@@ -75,10 +84,12 @@ of the commit. Push only when all three pass. Don't put model names in commits. 
   flat times), `portfolio.py` (account replay, whole-account backtest), `reconcile.py` (paper vs
   backtest), `weekly.py`, `bot.py` (the live loop; its activity log goes in the `botlog` table),
   `research.py` / `oos.py` (registered tests), `universe.py` (universe files).
-- The running bot's state: `state/tradebot.db` (signals, positions, snapshots, `botlog`),
-  `state/research/ledger.jsonl` (registered tests, results and notes; append-only),
+- The running bot's state: `state/tradebot.db` (signals, positions, snapshots, `botlog`).
+  Research state, in the state_dir of whoever runs the research commands (the agent's on the
+  box): `state/research/ledger.jsonl` (registered tests, results and notes; append-only) and
   `state/research/weekly.json` (the weekly reference and last week's numbers).
 - Reports: `reports/` (universe files `universe-*.json`; weekly reports in `reports/weekly/`).
 - On the always-on box (DEPLOY.md), the bot runs from `~/tradebot` in docker. You work in
-  `~/tradebot-agent` with `--config config-agent.yaml`, which reads the bot's state and price
-  cache.
+  `~/tradebot-agent` with `--config config-agent.yaml`: the bot's database read-only, its
+  strategies read-only, and your own `state/` (the research ledger and `weekly.json` live here)
+  and `data/` (candle cache) for everything that writes.

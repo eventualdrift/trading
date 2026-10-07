@@ -154,6 +154,10 @@ class TradingBot:
         data = {"combos": [{"strategy": c.strategy, "timeframe": c.timeframe, "params": c.params}
                            for c in (sel.selected if sel else [])],
                 "created_at": sel.created_at if sel else None, "ml": self.model is not None}
+        if self.model is not None:  # which model: its threshold, training end and size scaling
+            rep = getattr(self.model, "report", None)
+            data.update(ml_threshold=self.scanner.threshold, ml_trained_until=getattr(rep, "trained_until", None),
+                        ml_scaling=bool(getattr(rep, "confidence_scaling", False)))
         try:
             last = self.db.last_botlog(self.mode, "selection")
             if last is not None and last[1] == json.loads(json.dumps(data, default=str)):
@@ -297,8 +301,8 @@ class TradingBot:
         targets = self.core.target_weights(now_ms)
         before = {"cash": self.core.cash, "holdings": self.core.holdings}  # the state the rebalance started from
         trades = self.core.rebalance(now_ms, prices, targets)
-        self._log("core_day", {"day": day, "targets": targets, "prices": prices, **before, "trades": len(trades)},
-                  now_ms)
+        self._log("core_day", {"day": day, "targets": targets, "closes": dict(self.core.last_closes), "prices": prices,
+                               **before, "trades": len(trades)}, now_ms)
         if trades:
             self.notify(fmt.format_core_rebalance(trades, self.core.weights, self.core.equity(prices), quote))
 

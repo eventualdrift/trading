@@ -58,6 +58,23 @@ def _tf_order(tf: str) -> tuple:
         return (float("inf"), tf)
 
 
+def settings_snapshot(cfg: BotConfig) -> dict:
+    """The settings as loaded from the config file. Every report hashes these, whatever a command
+    then adjusts for its run (the timeframes a selection uses, a --core-fraction): one hash for
+    one config file. Reports print the run's own timeframes and core fraction beside it."""
+    return cfg.__dict__.get("_settings_at_load") or config_snapshot(cfg)
+
+
+def settings_hash(cfg: BotConfig) -> str:
+    return config_hash(settings_snapshot(cfg))
+
+
+def without_timeframes(snapshot: dict | None) -> dict | None:
+    """Universe files saved before 2026-10-07 recorded the timeframes their run used in place of
+    the config file's: compare those without them."""
+    return None if snapshot is None else {k: v for k, v in snapshot.items() if k != "timeframes"}
+
+
 def config_hash(snapshot: dict) -> str:
     return hashlib.sha1(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()[:10]
 
@@ -88,4 +105,4 @@ def config_summary(snapshot: dict) -> str:
             f"core {core.get('fraction')} of {'+'.join(s.split('/')[0] for s in core.get('symbols', []))}, "
             f"reset every {core.get('rebalance_sleeves_days')} days; btc_filter {sel.get('btc_filter')}; "
             f"universe top {u.get('top_n')}, listed >= {u.get('min_history_days')} days; "
-            f"timeframes {', '.join(snapshot.get('timeframes', []))}")
+            f"learn's timeframes {', '.join(snapshot.get('timeframes', []))}")

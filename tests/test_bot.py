@@ -649,3 +649,22 @@ def test_a_failed_learn_is_retried_an_hour_later(sim):
     assert bot._maybe_learn(now + 61 * 60_000)  # an hour later, not a week
     bot._learn_thread.join()
     assert len(calls) == 2
+
+
+def test_the_selection_log_names_the_ml_model(sim):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    market, db, broker, notes, bot = sim
+
+    class Model:
+        threshold = 0.55
+        report = SimpleNamespace(trained_until="2026-09-26T00:00:00", confidence_scaling=True)
+
+        def predict_proba(self, X):
+            return np.full(len(X), 0.9)
+
+    bot.set_brain(bot.selection, Model())
+    _, d = db.last_botlog("paper", "selection")
+    assert d["ml"] and d["ml_threshold"] == 0.55 and d["ml_trained_until"] == "2026-09-26T00:00:00" and d["ml_scaling"]

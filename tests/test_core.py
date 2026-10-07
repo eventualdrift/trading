@@ -151,3 +151,12 @@ def test_first_day_moves_capital_before_sizing_signals_or_recording(cfg):
     assert seen[0][1] is True and seen[0][2] == pytest.approx(350.0)  # sized from the satellite's 350
     snaps = db.snapshots("paper")
     assert snaps["core"].iloc[0] > 600  # no "core $0" first snapshot
+
+
+def test_the_core_day_log_records_the_candle_behind_each_target(core_bot):
+    market, db, broker, notes, bot = core_bot
+    run_days(market, bot, 205, 2)
+    _, d = db.botlog("paper", "core_day")[-1]
+    for sym in ("BTC/USDT", "ETH/USDT"):
+        candle, close = d["closes"][sym]
+        assert candle == d["day"] and close > 0  # the daily candle that just closed

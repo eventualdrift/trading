@@ -37,6 +37,13 @@ def _market(cfg: BotConfig, synthetic: bool = False, authenticated: bool = False
     return ExchangeClient(cfg.exchange.data_exchange_id, market_type=cfg.exchange.market_type)
 
 
+def _bot_db(cfg: BotConfig):
+    """The database to report on: an observed bot's (read-only), else this config's own."""
+    from .db import Database
+
+    return Database(cfg.bot_db_path, readonly=bool(cfg.observe_state_dir))
+
+
 def _store(cfg: BotConfig, market):
     from .data import OHLCVStore
 
@@ -147,6 +154,8 @@ def cmd_run(args, cfg):
     from .learning import learning_cycle, load_brain
     from .report import format_readiness, readiness
 
+    if cfg.observe_state_dir:
+        sys.exit("This config observes another bot (observe_state_dir): it reports, it never runs a bot.")
     db = Database(cfg.state_path / "tradebot.db")
     live = cfg.mode == "live"
     if live:
@@ -199,13 +208,36 @@ def cmd_run(args, cfg):
         print("stopped")
 
 
+def ml_status(model, report_path) -> str:
+    """Which ML model filters paper's signals now, and what the last learn's training decided (a
+    learn that doesn't promote a new model leaves the previous one in force)."""
+    import json
+
+    import pandas as pd
+
+    def when(t):
+        return pd.Timestamp(t, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M") if t else "?"
+
+    if model is None:
+        lines = ["ML filter: not active (no promoted model) - paper takes every signal, like the backtest"]
+    else:
+        r = model.report
+        lines = [f"ML filter: ACTIVE - model trained {when(r.trained_at)} UTC on data to {str(r.trained_until)[:10]}, "
+                 f"threshold {model.threshold:.0%}, confidence sizing {'on' if r.confidence_scaling else 'off'}. "
+                 f"Paper filters and sizes signals with it; the backtest does not."]
+    if report_path.exists():
+        last = json.loads(report_path.read_text())
+        lines.append(f"  Last learn's ML training ({when(last.get('trained_at'))} UTC): "
+                     + ("PROMOTED" if last.get("promoted") else f"not deployed - {last.get('reason', '')}"))
+    return "\n".join(lines)
+
+
 def cmd_report(args, cfg):
-    from .db import Database
     from .learning import MODEL_REPORT_FILE, load_brain
     from .notify import formatting as fmt
     from .report import format_readiness, readiness, sleeve_summary
 
-    db = Database(cfg.state_path / "tradebot.db")
+    db = _bot_db(cfg)
     summary = sleeve_summary(db, cfg, cfg.mode)
     if summary:
         print(summary + "\n")
@@ -217,8 +249,7 @@ def cmd_report(args, cfg):
     selection, model = load_brain(cfg)
     if selection:
         print("Selected strategies:", ", ".join(c.key for c in selection.selected) or "none")
-    rep = cfg.brain_path / MODEL_REPORT_FILE
-    print("ML filter:", "active" if model else "not active", f"(last training report: {rep})" if rep.exists() else "")
+    print(ml_status(model, cfg.brain_path / MODEL_REPORT_FILE))
     print("\nGo-live readiness (paper track record):")
     print(format_readiness(readiness(db, cfg, int(time.time() * 1000))))
 
@@ -294,7 +325,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
     from .backtest.selection import run_combo
     from .learning import load_context, load_datasets, load_frame
     from .portfolio import combo_split_stats
-    from .provenance import code_version, config_differences, config_hash, config_snapshot
+    from .provenance import code_version, config_differences, config_hash, settings_snapshot, without_timeframes
     from .universe import load_universe, save_universe, saved_selection
 
     market = _market(cfg, synthetic)
@@ -341,15 +372,16 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                     sat_closes[sym] = df["close"] if tf == "1d" else df["close"].resample("1D").last().dropna()
                 first[sym] = min(first.get(sym, df.index[0]), df.index[0])
         source = frozen["source"] if frozen else describe_universe(cfg, time.strftime("%Y-%m-%d"))
-        code, snap = code_version(), config_snapshot(cfg)  # after cfg.timeframes was set: what the run used
+        code, snap = code_version(), settings_snapshot(cfg)  # the config file's settings, as loaded
+        run = {"timeframes_used": list(cfg.timeframes), "core_fraction_used": cfg.core.fraction}
         path = universe_file
         if not frozen and save_dir and not synthetic:
             stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(data_end / 1000))
             path = save_universe(Path(save_dir) / f"universe-{stamp}.json", symbols, data_end, source, keys, cfg,
-                                 code=code, config=snap, selection=selection)
+                                 code=code, config=snap, selection=selection, run=run)
         universe = {"source": source, "symbols": symbols, "first": first, "data_end_ms": data_end,
                     "file": path, "frozen": bool(frozen), "code": code, "config": snap,
-                    "config_hash": config_hash(snap), "selection_now": keys,
+                    "config_hash": config_hash(snap), **run, "selection_now": keys,
                     "selection_created": selection.created_at,
                     "selection_saved": (frozen or {}).get("selection"),
                     "selection_source": selection_source,
@@ -358,7 +390,10 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
             universe["saved_code"] = frozen.get("code")
             saved_cfg = frozen.get("config")
             universe["saved_config_hash"] = config_hash(saved_cfg) if saved_cfg else None
-            universe["config_diffs"] = config_differences(saved_cfg, snap) if saved_cfg else None
+            legacy = saved_cfg is not None and "timeframes_used" not in frozen  # its settings hold the run's timeframes
+            universe["legacy_settings"] = legacy
+            universe["config_diffs"] = (config_differences(*(without_timeframes(x) for x in (saved_cfg, snap))) if legacy
+                                        else config_differences(saved_cfg, snap)) if saved_cfg else None
             outdated = ((frozen.get("code"), universe["saved_config_hash"]) != (code, universe["config_hash"])
                         or not frozen.get("selection_full"))
             if outdated and not current_selection:
@@ -367,7 +402,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                 stamped = Path(universe_file).with_name(f"{base}@{code.split('+')[0]}-{universe['config_hash']}.json")
                 if not stamped.exists() or not load_universe(stamped).get("selection_full"):
                     save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap,
-                                  selection=selection)
+                                  selection=selection, run=run)
                 universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
             "universe": universe}
@@ -489,9 +524,8 @@ def cmd_portfolio_backtest(args, cfg):
 
 def cmd_dashboard(args, cfg):
     from .dashboard import serve_dashboard, write_dashboard
-    from .db import Database
 
-    db = Database(cfg.state_path / "tradebot.db")
+    db = _bot_db(cfg)
     if not args.serve:
         path = write_dashboard(db, cfg, args.out)
         print(f"dashboard written to {path.resolve()} - open it in a browser")
@@ -546,13 +580,12 @@ def _reconcile_run(cfg, since_ms: int | None, end_ms: int | None, synthetic: boo
     Raises ValueError when there is nothing to reconcile."""
     import pandas as pd
 
-    from .db import Database
     from .learning import load_brain, load_context, load_datasets, load_frame
-    from .provenance import code_version, config_hash, config_snapshot
+    from .provenance import code_version, settings_hash
     from .reconcile import format_reconciliation, reconcile
     from .timeframes import last_closed_open_ms, tf_ms
 
-    db = Database(cfg.state_path / "tradebot.db")
+    db = _bot_db(cfg)
     mode = cfg.mode
     market = _market(cfg, synthetic)
     store = _store(cfg, market)
@@ -594,7 +627,7 @@ def _reconcile_run(cfg, since_ms: int | None, end_ms: int | None, synthetic: boo
     rec.reproduce = (f"tradebot reconcile --since \"{pd.Timestamp(since, unit='ms', tz='UTC'):{fmt_t}}\" "
                      f"--end \"{pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}}\"")
     rec.header = [f"  Candles frozen at {pd.Timestamp(end, unit='ms', tz='UTC'):{fmt_t}} UTC · code {code_version()} "
-                  f"· settings {config_hash(config_snapshot(cfg))} (timeframes {', '.join(cfg.timeframes)})",
+                  f"· settings {settings_hash(cfg)} · timeframes replayed {', '.join(cfg.timeframes)}",
                   f"  Reproduce: {rec.reproduce}"]
     return rec, format_reconciliation(rec, cfg)
 
@@ -627,7 +660,7 @@ def cmd_weekly(args, cfg):
     from . import weekly as wk
     from .learning import load_brain
     from .portfolio import format_portfolio_backtest, portfolio_backtest
-    from .provenance import code_version, config_differences, config_hash, config_snapshot
+    from .provenance import code_version, config_differences, config_hash, settings_snapshot
     from .reconcile import write_csv
     from .timeframes import last_closed_open_ms
 
@@ -644,9 +677,10 @@ def cmd_weekly(args, cfg):
     since = end - args.days * 86_400_000
     out_dir = Path(args.out_dir) / pd.Timestamp(end, unit="ms", tz="UTC").strftime("%Y-%m-%d-%H%M")
     out_dir.mkdir(parents=True, exist_ok=True)
-    code, snap = code_version(), config_snapshot(cfg)
+    code, snap = code_version(), settings_snapshot(cfg)
     numbers, reproduce, nums = [], [], {"reference": reference}
 
+    rec = None
     try:  # 1) paper vs backtest over the week, with uptime
         rec, text = _reconcile_run(copy.deepcopy(cfg), since, end, args.synthetic)
         (out_dir / "reconcile.txt").write_text(text + "\n")
@@ -688,9 +722,11 @@ def cmd_weekly(args, cfg):
         changed.append(f"code {state['code']} -> {code}" + (": " + "; ".join(commits[:8]) if commits else ""))
     diffs = config_differences(state["settings"], snap) if state.get("settings") else []
     changed += [f"setting {d}" for d in diffs]
+    logged = wk.selection_changes(rec) if rec is not None else []
+    changed += logged  # learn's changes during the week, from the bot's activity log
     prev_sel = state.get("selection")
-    selection_changed = bool(prev_sel) and prev_sel.get("created") != sel_now["created"]
-    if selection_changed:
+    selection_changed = bool(logged) or (bool(prev_sel) and prev_sel.get("created") != sel_now["created"])
+    if selection_changed and not logged:
         changed.append(f"learn re-selected strategies: {', '.join(prev_sel.get('keys') or []) or 'none'} -> "
                        f"{', '.join(sel_now['keys']) or 'none'}")
     if state.get("reference") and state["reference"] != reference:

@@ -55,7 +55,7 @@ cd ~/tradebot && rsync -av state data reports config.yaml .env tradebot@BOX:trad
 ```
 
 `state/` holds the database (signals, positions, the activity log), the selected strategies and
-the research ledger (`state/research/`). `data/` holds the price cache and the out-of-sample
+the research ledger (`state/research/`; it moves to the agent's checkout in step 6). `data/` holds the price cache and the out-of-sample
 data. `reports/` holds the universe files. Then on the box:
 
 ```bash
@@ -76,20 +76,30 @@ It restarts by itself after a crash or a reboot (`restart: unless-stopped`), and
 
 ## 6. The agent checkout
 
+The agent writes only to its own copies. It reads the bot's database read-only and the bot's
+strategies read-only (CLAUDE.md, hard rules):
+
 ```bash
 cd ~/tradebot-agent && python3 -m venv .venv && .venv/bin/pip install -q -e ".[dev]" && .venv/bin/pytest -q
-cat > config-agent.yaml <<EOF
+mkdir -p state && rsync -a ~/tradebot/data/ data/ && rsync -a ~/tradebot/reports/ reports/   # its own copies
+mv ~/tradebot/state/research state/research   # the research ledger moves here: research commands run from this checkout
+cat > config-agent.yaml <<END
 extends: $HOME/tradebot/config.yaml
-state_dir: $HOME/tradebot/state
+state_dir: $HOME/tradebot-agent/state        # the agent's own: research ledger, weekly state
 data:
-  dir: $HOME/tradebot/data
-EOF
+  dir: $HOME/tradebot-agent/data             # the agent's own candle cache: unfrozen runs write here
+observe_state_dir: $HOME/tradebot/state      # the running bot's database, opened read-only
+learning:
+  follow_state_dir: $HOME/tradebot/state     # the bot's strategies, read-only; learn refuses with this config
+END
 git config user.name "tradebot agent" && git config user.email "you@example.com"
-.venv/bin/tradebot --config config-agent.yaml report     # the running bot's track record, read from its state
+.venv/bin/tradebot --config config-agent.yaml report     # the running bot's track record, read from its database
 ```
 
-`config-agent.yaml` is git-ignored. The agent runs the reporting commands with it. It never
-runs `run` or `learn` with it (CLAUDE.md).
+`config-agent.yaml` is git-ignored. With it, `run` and `learn` refuse to start, and the bot's
+database can't be written: it is opened read-only, and its tables are never created or migrated
+from here. Frozen runs read the agent's own candle copy, and fetch (without saving) anything
+newer than it.
 
 ## 7. Claude Code with Remote Control
 
@@ -111,14 +121,14 @@ Set the reference backtest once (the stamped universe file with the full selecti
 first item of BACKLOG.md):
 
 ```bash
-cd ~/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml weekly --reference $HOME/tradebot/reports/<universe file>.json
+cd ~/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml weekly --reference reports/universe-20260927-1513@ae152bd-178b23c9a0.json
 ```
 
 Then `crontab -e` and add the weekly run, which pushes STATUS.md, and a nightly backup:
 
 ```
 15 6 * * 1 cd $HOME/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml weekly >> $HOME/weekly.log 2>&1 && git add STATUS.md && git commit -qm "Weekly check-in $(date -u +\%F)" && git pull -q --rebase --autostash && git push -q
-30 3 * * * mkdir -p $HOME/backups && sqlite3 $HOME/tradebot/state/tradebot.db ".backup '$HOME/backups/tradebot-$(date -u +\%F).db'" && tar -czf $HOME/backups/research-$(date -u +\%F).tgz -C $HOME/tradebot/state research && find $HOME/backups -mtime +14 -delete
+30 3 * * * mkdir -p $HOME/backups && sqlite3 $HOME/tradebot/state/tradebot.db ".backup '$HOME/backups/tradebot-$(date -u +\%F).db'" && tar -czf $HOME/backups/research-$(date -u +\%F).tgz -C $HOME/tradebot-agent/state research && find $HOME/backups -mtime +14 -delete
 ```
 
 Every Monday, STATUS.md on GitHub gets the week: uptime, paper vs backtest, the frozen

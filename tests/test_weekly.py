@@ -53,3 +53,35 @@ def test_backlog_and_entry_helpers(tmp_path):
     e = status_entry(date="2026-10-04", code="abc", settings="123", changed=[], numbers=["- n"], reproduce=["cmd"],
                      needs=[], next_items=[])
     assert "nothing since last week's check-in" in e and "- nothing" in e and "    cmd" in e
+
+
+def test_one_settings_hash_in_every_report(tmp_path, monkeypatch, capsys):
+    import re
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    sel = Selection(1_700_000_000.0, [ComboResult("momentum", "1d", {}, {}, {}, 1, 1.0, True)])
+    sel.save(state / SELECTION_FILE)
+    conf = tmp_path / "c.yaml"  # learn's timeframes (1h, 4h, 1d) differ from the run's (1d)
+    conf.write_text(f"state_dir: {state}\ntimeframes: [1h, 4h, 1d]\nuniverse:\n  top_n: 3\nml:\n  enabled: false\n"
+                    "data:\n  history_days: {1h: 60, 4h: 200, 1d: 600}\n")
+    from tradebot.config import load_config
+    from tradebot.provenance import config_snapshot
+
+    legacy = {**config_snapshot(load_config(conf, env_file=None)), "timeframes": ["1d"]}
+    ref = tmp_path / "universe-old.json"  # the older format: settings recorded with the run's timeframes
+    ref.write_text(json.dumps({"symbols": ["BTC/USDT", "SOL/USDT"], "data_end_ms": 1_748_736_000_000,
+                               "source": "saved run", "selection": ["momentum@1d"],
+                               "selection_full": selection_payload(sel), "code": "389af86", "config": legacy}))
+    status = tmp_path / "STATUS.md"
+    main(["--config", str(conf), "--env", str(tmp_path / "none.env"), "weekly", "--synthetic", "--reference", str(ref),
+          "--status-file", str(status), "--out-dir", str(tmp_path / "weekly")])
+    capsys.readouterr()
+    folder = next((tmp_path / "weekly").iterdir())
+    hashes = {re.search(r"settings ([0-9a-f]{10})", t).group(1) for t in
+              (status.read_text(), (folder / "reconcile.txt").read_text(), (folder / "portfolio-backtest.txt").read_text())}
+    assert len(hashes) == 1
+    pb = (folder / "portfolio-backtest.txt").read_text()
+    assert "this run: timeframes 1d, core 0.65" in pb and "older format" in pb
+    assert "Setting changed" not in pb  # the run's timeframes in the old file are not a settings change
