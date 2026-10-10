@@ -486,7 +486,9 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
     w, nw = _corr(core, satc, "W")
     btc = res.curves.get("Hold BTC")
     b, _ = _corr(btc[active], satc) if btc is not None else (None, 0)
-    fmt = (lambda v: f"{v:+.2f}" if v is not None else "n/a")
+    def fmt(v):
+        return f"{v:+.2f}" if v is not None else "n/a"
+
     out.append(f"  Correlation, core vs satellite returns (both active): daily {fmt(d)} ({nd} days), "
                f"weekly {fmt(w)} ({nw} weeks); satellite vs BTC daily {fmt(b)}")
     out += _universe_lines(res)

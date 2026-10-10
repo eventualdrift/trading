@@ -160,3 +160,55 @@ def test_the_core_day_log_records_the_candle_behind_each_target(core_bot):
     for sym in ("BTC/USDT", "ETH/USDT"):
         candle, close = d["closes"][sym]
         assert candle == d["day"] and close > 0  # the daily candle that just closed
+
+
+def _stale_daily_feed(market, until_ms):
+    """The exchange hasn't published the daily candle that just closed until ``until_ms``."""
+    real = market.fetch_ohlcv_df
+
+    def fetch(symbol, tf, *a, **k):
+        df = real(symbol, tf, *a, **k)
+        now = market.now_ms()
+        if tf == "1d" and now < until_ms:
+            df = df[df.index < pd.Timestamp(now - now % DAY - DAY, unit="ms", tz="UTC")]
+        return df
+
+    market.fetch_ohlcv_df = fetch
+
+
+def test_the_core_waits_for_the_days_candle_and_then_rebalances_on_it(core_bot):
+    market, db, broker, notes, bot = core_bot
+    run_days(market, bot, 205, 3)
+    day_open = market.start_ms + 207 * DAY  # the candle that closes at day 208
+    close = day_open + DAY
+    _stale_daily_feed(market, until_ms=close + 2 * 3_600_000)  # published two hours late
+    trades_before = len(db.core_trades("paper", 10_000))
+    for minutes in (0.5, 3, 7, 60):
+        market.set_now(close + int(minutes * 60_000))
+        bot.tick(market.now_ms())
+    assert len(db.botlog("paper", "core_day")) == 3  # nothing decided on yesterday's candle
+    assert len(db.core_trades("paper", 10_000)) == trades_before
+    retries = db.botlog("paper", "core_retry")
+    assert len(retries) == 1 and retries[0][1]["day"] == day_open  # logged once, not every attempt
+    assert retries[0][1]["missing"] == ["BTC/USDT daily close", "ETH/USDT daily close"]
+    market.set_now(close + 2 * 3_600_000 + 60_000)
+    bot.tick(market.now_ms())
+    _, d = db.botlog("paper", "core_day")[-1]
+    assert d["day"] == day_open and all(d["closes"][s][0] == day_open for s in ("BTC/USDT", "ETH/USDT"))
+    assert "incomplete" not in d
+
+
+def test_after_six_hours_the_core_goes_ahead_with_what_it_has(core_bot):
+    market, db, broker, notes, bot = core_bot
+    run_days(market, bot, 205, 3)
+    close = market.start_ms + 208 * DAY
+    _stale_daily_feed(market, until_ms=close + 10 * 3_600_000)
+    for hours in (0.01, 3, 5.9):
+        market.set_now(close + int(hours * 3_600_000))
+        bot.tick(market.now_ms())
+    assert len(db.botlog("paper", "core_day")) == 3
+    market.set_now(close + 6 * 3_600_000 + 60_000)
+    bot.tick(market.now_ms())
+    _, d = db.botlog("paper", "core_day")[-1]
+    assert d["day"] == close - DAY and d["incomplete"] == ["BTC/USDT daily close", "ETH/USDT daily close"]
+    assert any("core rebalanced 6h after the close" in m for m in notes.messages)

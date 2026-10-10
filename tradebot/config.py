@@ -102,9 +102,16 @@ class SelectionConfig:
     min_symbol_win_fraction: float = 0.5
 
 
+# Paper runs only what the backtest models (CLAUDE.md). The account replay doesn't reproduce the
+# ML trade filter or its confidence sizing, so both are off whatever ``ml.enabled`` says: live loads
+# no model, learn trains none. They come back only when the replay models them walk-forward
+# (BACKLOG a2) and a registered test that passed sets this to True.
+ML_IN_REPLAY = False
+
+
 @dataclass
 class MLConfig:
-    enabled: bool = True
+    enabled: bool = True  # in force only while ML_IN_REPLAY is True (see above)
     min_candidates: int = 400
     min_test_trades: int = 30
     min_improvement_r: float = 0.02  # filtered expectancy must beat unfiltered by this much
@@ -113,6 +120,11 @@ class MLConfig:
         default_factory=lambda: [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
     )
     min_probability: float | None = None  # override the learned threshold
+
+    @property
+    def active(self) -> bool:
+        """The ML filter is used (live) and trained (learn) only when the replay models it."""
+        return self.enabled and ML_IN_REPLAY
 
 
 @dataclass

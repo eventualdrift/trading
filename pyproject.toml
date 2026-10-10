@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.5"]
 
 [project.scripts]
 tradebot = "tradebot.cli:main"
@@ -28,5 +28,16 @@ tradebot = "tradebot.cli:main"
 [tool.setuptools.packages.find]
 include = ["tradebot*"]
 
+[tool.setuptools.package-data]
+"tradebot.gates" = ["golden.json", "data/*.csv.gz"]  # the same-trades check's fixed dataset and golden orders
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# ruff's long-standing default rule set, pinned so every ruff version lints the same way
+# (the deploy gate runs `python -m ruff check tradebot tests`)
+select = ["E4", "E7", "E9", "F"]

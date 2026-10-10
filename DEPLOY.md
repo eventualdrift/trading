@@ -2,7 +2,7 @@
 
 The bot runs in docker from one checkout (`~/tradebot`). Claude Code works in a second checkout
 (`~/tradebot-agent`), reads the bot's state and price cache, and reports in STATUS.md. Code
-reaches the running bot only when the owner deploys it (step 9).
+reaches the running bot only through the deploy gate (step 9, CLAUDE.md gate 1).
 
 Commands below assume Ubuntu 24.04 LTS and a user called `tradebot`. Replace `BOX` with the
 box's address.
@@ -93,7 +93,9 @@ learning:
   follow_state_dir: $HOME/tradebot/state     # the bot's strategies, read-only; learn refuses with this config
 END
 git config user.name "tradebot agent" && git config user.email "you@example.com"
+grep -E "^TELEGRAM_(BOT_TOKEN|CHAT_ID)=" ~/tradebot/.env > .env && chmod 600 .env   # `tradebot notify` only
 .venv/bin/tradebot --config config-agent.yaml report     # the running bot's track record, read from its database
+.venv/bin/tradebot --config config-agent.yaml notify --text "agent checkout ready"   # arrives on Telegram
 ```
 
 `config-agent.yaml` is git-ignored. With it, `run` and `learn` refuse to start, and the bot's
@@ -115,34 +117,41 @@ cd ~/tradebot-agent && claude remote-control
 The session shows up in the Claude Code app, and you can work with it from there. It reads
 CLAUDE.md for its rules and BACKLOG.md for its work, and writes STATUS.md.
 
-## 8. The weekly check-in
+## 8. The weekly check-in, the drawdown gate and backups
 
-Set the reference backtest once (the stamped universe file with the full selection; see the
-first item of BACKLOG.md):
+Set the reference backtest once (the stamped universe file with the full selection), then the
+drawdown limits, once, from the same reference, watching paper from the first deploy with the
+ML filter off (step 9; until then paper ran a component the backtest doesn't model):
 
 ```bash
-cd ~/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml weekly --reference reports/universe-20260927-1513@ae152bd-178b23c9a0.json
+cd ~/tradebot-agent && TB=".venv/bin/tradebot --config config-agent.yaml"
+REF=reports/universe-20260927-1513@ae152bd-178b23c9a0.json
+$TB weekly --reference $REF
+$TB gate drawdown --set-limits --reference $REF --paper-from "<UTC time of that deploy>"
+scripts/install-cron.sh          # Monday weekly + Telegram summary + STATUS.md push; daily drawdown gate; backups
 ```
 
-Then `crontab -e` and add the weekly run, which pushes STATUS.md, and a nightly backup:
-
-```
-15 6 * * 1 cd $HOME/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml weekly >> $HOME/weekly.log 2>&1 && git add STATUS.md && git commit -qm "Weekly check-in $(date -u +\%F)" && git pull -q --rebase --autostash && git push -q
-30 3 * * * mkdir -p $HOME/backups && sqlite3 $HOME/tradebot/state/tradebot.db ".backup '$HOME/backups/tradebot-$(date -u +\%F).db'" && tar -czf $HOME/backups/research-$(date -u +\%F).tgz -C $HOME/tradebot-agent/state research && find $HOME/backups -mtime +14 -delete
-```
-
-Every Monday, STATUS.md on GitHub gets the week: uptime, paper vs backtest, the frozen
-reference rerun, what needs you. Copy the backups off the box now and then, e.g.
+`crontab -l` then shows the three `# tradebot-agent` lines; running the script again replaces
+them. Every Monday, STATUS.md on GitHub and Telegram get the week: uptime, paper vs backtest,
+the frozen reference rerun, the drawdown gate, what needs you. Logs: `reports/weekly/cron-*.log`
+and `reports/drawdown-cron.log`. Copy the backups off the box now and then, e.g.
 `rsync -av tradebot@BOX:backups ~/tradebot-backups` from the Mac.
 
-## 9. Deploying a new version (only when the owner says so)
+## 9. Deploying a new version: the deploy gate
+
+From the agent checkout, with the commit to deploy checked out and committed:
 
 ```bash
-cd ~/tradebot && git pull && TRADEBOT_UID=$(id -u) TRADEBOT_GID=$(id -g) GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
+cd ~/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml gate deploy --dry-run   # every check, bot untouched
+cd ~/tradebot-agent && .venv/bin/tradebot --config config-agent.yaml gate deploy
 ```
 
-Docker sends SIGTERM. The bot finishes its tick and records a clean stop; the new container
-records the start. The tests ran before the push (CLAUDE.md), so this is the only step.
+It runs lint, the suite, the suite in a fresh clone, and the same-trades check; compares the
+golden orders with those of the commit the bot runs; then fast-forwards `~/tradebot` to the
+commit (fetched straight from the agent checkout), rebuilds and restarts the container and checks
+it runs. Each deploy is appended to `state/deploys.jsonl`. Docker sends SIGTERM: the bot finishes
+its tick and records a clean stop; the new container records the start. Never `git pull` or
+edit files in `~/tradebot` by hand: the gate refuses a bot checkout with local changes.
 
 ## 10. After the move
 

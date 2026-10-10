@@ -31,7 +31,7 @@ FEATURE_COLUMNS = MARKET_COLUMNS + SIGNAL_COLUMNS
 
 
 def market_features(df: pd.DataFrame, context=None, tf: str | None = None) -> pd.DataFrame:
-    o, h, l, c, v = (df[k] for k in ("open", "high", "low", "close", "volume"))
+    o, h, lows, c, v = (df[k] for k in ("open", "high", "low", "close", "volume"))
     f = pd.DataFrame(index=df.index)
     logc = np.log(c)
     lr = logc.diff()
@@ -57,12 +57,12 @@ def market_features(df: pd.DataFrame, context=None, tf: str | None = None) -> pd
     f["bb_pctb"] = (c - lo) / width - 0.5
     f["bb_width"] = width / mid
     f["vol_z"] = ta.zscore(np.log1p(v), 48)
-    hi48, lo48 = h.rolling(48).max(), l.rolling(48).min()
+    hi48, lo48 = h.rolling(48).max(), lows.rolling(48).min()
     f["range_pos"] = (c - lo48) / (hi48 - lo48).replace(0.0, np.nan) - 0.5
-    rng = (h - l).replace(0.0, np.nan)
+    rng = (h - lows).replace(0.0, np.nan)
     f["body_frac"] = (c - o) / rng
     f["upper_wick"] = (h - np.maximum(o, c)) / rng
-    f["lower_wick"] = (np.minimum(o, c) - l) / rng
+    f["lower_wick"] = (np.minimum(o, c) - lows) / rng
     hours = df.index.hour + df.index.minute / 60.0
     f["hour_sin"] = np.sin(2 * np.pi * hours / 24.0)
     f["hour_cos"] = np.cos(2 * np.pi * hours / 24.0)

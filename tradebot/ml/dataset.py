@@ -34,7 +34,7 @@ def candidates_for(
     pop = strategy.populate(df, context, timeframe)
     mkt = market_features(df, context, timeframe) if mkt is None else mkt
     costs = cfg.costs_model()
-    o, h, l, c = (pop[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
+    o, h, lows, c = (pop[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
     rows = []
     sides = [("long", "enter_long", "exit_long", "long_sl", "long_tp")]
     if cfg.allow_short:
@@ -50,7 +50,7 @@ def candidates_for(
             if reward_risk(side, c[i], sls[i], tps[i]) < cfg.risk.min_reward_risk:
                 continue
             out = simulate_trade(
-                o, h, l, c, exits, i, side, sls[i], tps[i], strategy.max_hold_bars,
+                o, h, lows, c, exits, i, side, sls[i], tps[i], strategy.max_hold_bars,
                 costs, cfg.risk.breakeven_at_r, trails[i],
             )
             if out is None or not out.complete:

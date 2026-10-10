@@ -29,7 +29,7 @@ class LearningResult:
 def load_brain(cfg: BotConfig) -> tuple[Selection | None, SignalModel | None]:
     return (
         Selection.load(cfg.brain_path / SELECTION_FILE),
-        SignalModel.load(cfg.brain_path / MODEL_FILE) if cfg.ml.enabled else None,
+        SignalModel.load(cfg.brain_path / MODEL_FILE) if cfg.ml.active else None,
     )
 
 
@@ -112,7 +112,7 @@ def learning_cycle(cfg: BotConfig, market, *, store=None, db=None, current_model
     selection.save(cfg.state_path / SELECTION_FILE)
 
     model, report = None, None
-    if cfg.ml.enabled:
+    if cfg.ml.active:
         log_fn("Training ML trade filter (walk-forward)...")
         chosen = {(c.strategy, c.timeframe): c.params for c in selection.combos}
         cands = build_candidates(datasets, cfg, context, params_for=chosen)

@@ -44,6 +44,8 @@ Learner = Callable[[SignalModel | None], "tuple[Selection, SignalModel | None, s
 
 PAUSE_S = 300  # the main loop not coming round for this long is recorded as a pause
 LEARN_RETRY_MS = 3_600_000  # a failed learning cycle is retried this much later
+CORE_RETRY_HOURS = 6  # the core waits up to this long after the daily close for that day's data
+CORE_RETRY_EVERY_MS = 5 * 60_000  # ...asking again this often
 
 
 def awake_clock() -> Callable[[], float]:
@@ -91,8 +93,8 @@ class TradingBot:
         self.risk = RiskManager(cfg.risk)
         self.learner = learner
         self.selection = selection
-        self.model = model
-        self.scanner = Scanner(market, cfg, selection, model)
+        self.model = model if cfg.ml.active else None  # off until the replay models it (config.ML_IN_REPLAY)
+        self.scanner = Scanner(market, cfg, selection, self.model)
         self._symbols: list[str] = []
         self._symbols_at = 0
         self._lock = threading.RLock()
@@ -109,6 +111,7 @@ class TradingBot:
         self._last_code_check = 0
         self._code_notified = False
         self._last_orphan_sweep = 0
+        self._core_retry_at = 0  # the core's next attempt while the day's data is incomplete
         self._ref_price: dict[str, tuple[float, int]] = {}  # last completed 1m close + its time (guard)
         self._pending_extreme: dict[str, int] = {}
         self._stop = threading.Event()
@@ -137,7 +140,7 @@ class TradingBot:
         with self._lock:
             if selection is not None:
                 self.selection = selection
-            if model is not None:
+            if model is not None and self.cfg.ml.active:
                 self.model = model
             self.scanner = Scanner(self.market, self.cfg, self.selection, self.model)
             self._log_selection()
@@ -274,17 +277,31 @@ class TradingBot:
                 self._set(key, float(v) + delta)
 
     def _maybe_core_day(self, now_ms: int) -> None:
+        """The core's daily rebalance. It fetches first - every coin's price and the daily candle that
+        just closed - and moves nothing until it has them all, asking again every few minutes for up
+        to CORE_RETRY_HOURS after the close (the backtest rebalances on that day's close). After that
+        it goes ahead with what it has: coins without data are left alone, as before."""
         delay = int(self.cfg.candle_close_delay_seconds * 1000)
         day = last_closed_open_ms(now_ms - delay, "1d")
-        if day <= self._get("core_last_day", 0):
+        if day <= self._get("core_last_day", 0) or now_ms < self._core_retry_at:
             return
-        self._set("core_last_day", day)
         c = self.cfg.core
         prices = {}
         for s in c.symbols:
             px = self._guarded_price(s, now_ms)
             if px is not None:
                 prices[s] = px
+        targets = self.core.target_weights(now_ms)
+        missing = ([f"{s} price" for s in c.symbols if s not in prices]
+                   + [f"{s} daily close" for s in c.symbols if (self.core.last_closes.get(s) or (None,))[0] != day])
+        if missing and now_ms - (day + 86_400_000) < CORE_RETRY_HOURS * 3_600_000:
+            self._core_retry_at = now_ms + CORE_RETRY_EVERY_MS
+            if self._get("core_retry_day") != day:  # once a day in the activity log, not every attempt
+                self._set("core_retry_day", day)
+                self._log("core_retry", {"day": day, "missing": missing}, now_ms)
+            return
+        self._core_retry_at = 0
+        self._set("core_last_day", day)
         quote = self.cfg.exchange.quote
         if not self.core.initialized:
             sat, _ = self.equity()
@@ -298,11 +315,14 @@ class TradingBot:
                         f"BTC/ETH trend allocation; {sat - amount:,.2f} {quote} stays with the signal strategies.")
         elif c.rebalance_sleeves_days > 0 and now_ms - self._get("sleeves_last_ms", 0) >= c.rebalance_sleeves_days * 86_400_000:
             self._rebalance_sleeves(now_ms, prices)
-        targets = self.core.target_weights(now_ms)
         before = {"cash": self.core.cash, "holdings": self.core.holdings}  # the state the rebalance started from
         trades = self.core.rebalance(now_ms, prices, targets)
         self._log("core_day", {"day": day, "targets": targets, "closes": dict(self.core.last_closes), "prices": prices,
-                               **before, "trades": len(trades)}, now_ms)
+                               **before, "trades": len(trades), **({"incomplete": missing} if missing else {})},
+                  now_ms)
+        if missing:
+            self._notify_error(f"core rebalanced {CORE_RETRY_HOURS}h after the close without "
+                               f"{', '.join(missing)}: those coins were left alone today", key="core-data")
         if trades:
             self.notify(fmt.format_core_rebalance(trades, self.core.weights, self.core.equity(prices), quote))
 
@@ -663,8 +683,8 @@ class TradingBot:
                 opens = index_ms(bars.index)
                 bars = bars[(opens >= pos.last_checked_ms) & (opens + bar_ms <= now_ms)
                             & (opens < pos.limit_until)]
-                for ts, h, l in zip(index_ms(bars.index), bars["high"].to_numpy(), bars["low"].to_numpy()):
-                    if (l < pos.entry_price) if long else (h > pos.entry_price):
+                for ts, h, bar_low in zip(index_ms(bars.index), bars["high"].to_numpy(), bars["low"].to_numpy()):
+                    if (bar_low < pos.entry_price) if long else (h > pos.entry_price):
                         filled_bar = int(ts)
                         break
                 if filled_bar is None and len(bars):
@@ -759,20 +779,20 @@ class TradingBot:
                 caught_up = True
                 break
             self._ref_price[pos.symbol] = (float(bars["close"].iloc[-1]), int(index_ms(bars.index)[-1]) + bar_ms)
-            for ts, o, h, l in zip(index_ms(bars.index), bars["open"].to_numpy(), bars["high"].to_numpy(),
+            for ts, o, h, bar_low in zip(index_ms(bars.index), bars["open"].to_numpy(), bars["high"].to_numpy(),
                                    bars["low"].to_numpy()):
                 pos.last_checked_ms = int(ts) + bar_ms
-                if (l <= pos.stop_loss) if long else (h >= pos.stop_loss):
+                if (bar_low <= pos.stop_loss) if long else (h >= pos.stop_loss):
                     if pos.breakeven_moved:
                         reason = self._managed_stop_reason(pos)  # bot-managed: sells at the current price
                     else:
                         gapped = o < pos.stop_loss if long else o > pos.stop_loss
                         reason, price = "stop_loss", (o if gapped else pos.stop_loss)
                     break
-                if be_r > 0 and not pos.breakeven_moved and pos.r_at(h if long else l) >= be_r:
+                if be_r > 0 and not pos.breakeven_moved and pos.r_at(h if long else bar_low) >= be_r:
                     self._move_to_breakeven(pos)
                 if pos.breakeven_moved and pos.trail_distance:
-                    self._trail(pos, h if long else l)
+                    self._trail(pos, h if long else bar_low)
         if reason is None and not caught_up:
             # a very long backlog: keep replaying next poll before trusting the live price
             log.warning("#%s %s: still replaying price history", pos.id, pos.symbol)

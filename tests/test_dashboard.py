@@ -8,7 +8,7 @@ import pytest
 from tradebot.backtest.engine import Costs
 from tradebot.backtest.selection import Selection
 from tradebot.bot import TradingBot
-from tradebot.dashboard import build_data, render, serve_dashboard, strip_html, write_dashboard
+from tradebot.dashboard import build_data, render, serve_dashboard, strip_html
 from tradebot.data import SyntheticMarket
 from tradebot.db import Database
 from tradebot.execution import PaperBroker

@@ -104,7 +104,7 @@ def net_return(side: str, entry: float, exit_: float, fee: float, entry_fee: flo
 def simulate_trade(
     o: np.ndarray,
     h: np.ndarray,
-    l: np.ndarray,
+    lows: np.ndarray,
     c: np.ndarray,
     exit_flags: np.ndarray | None,
     signal_idx: int,
@@ -126,7 +126,7 @@ def simulate_trade(
 
     if costs.limit_entry:
         limit = c[signal_idx]
-        if not ((l[e] < limit) if long else (h[e] > limit)):
+        if not ((lows[e] < limit) if long else (h[e] > limit)):
             return None  # the price never traded through the limit: no fill
         entry = limit
     else:
@@ -155,7 +155,7 @@ def simulate_trade(
             if j > e and o[j] <= stop:
                 exit_idx, exit_price, reason, exit_at = j, o[j] * (1 - slip), stop_reason, "open"
                 break
-            if l[j] <= stop:
+            if lows[j] <= stop:
                 exit_idx, exit_price, reason, exit_at = j, stop * (1 - slip), stop_reason, "intrabar"
                 break
             if c[j] >= tp:
@@ -176,12 +176,12 @@ def simulate_trade(
             break
         moved = False
         if be_level is not None and not at_breakeven:
-            if (long and h[j] >= be_level) or (not long and l[j] <= be_level):
+            if (long and h[j] >= be_level) or (not long and lows[j] <= be_level):
                 stop = entry  # intrabar checks apply from the next bar on
                 at_breakeven = moved = True
                 protected_idx = j
         if at_breakeven and trail:
-            new = max(stop, h[j] - trail) if long else min(stop, l[j] + trail)
+            new = max(stop, h[j] - trail) if long else min(stop, lows[j] + trail)
             moved = moved or new != stop
             stop = new
         if moved and ((c[j] <= stop) if long else (c[j] >= stop)):  # the close comes after the high

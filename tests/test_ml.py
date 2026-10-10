@@ -55,10 +55,11 @@ def test_model_promoted_when_it_has_edge(tmp_path):
     assert np.allclose(loaded.predict_proba(cands.iloc[:10]), model.predict_proba(cands.iloc[:10]))
 
 
-def test_confidence_scaling_only_when_confidence_pays():
+def test_confidence_scaling_only_when_confidence_pays(monkeypatch):
     from tradebot.config import BotConfig
     from tradebot.scanner import Scanner
 
+    monkeypatch.setattr("tradebot.config.ML_IN_REPLAY", True)  # the ML filter is off in paper (config.py)
     model, rep = train_model(_fake_candidates(4000, informative=True), MLConfig())
     assert rep.confidence_edge_r is not None
     cfg = BotConfig()
@@ -129,3 +130,38 @@ def test_training_survives_a_feature_with_no_values():
     cands["btc_uptrend"] = np.nan  # e.g. BTC context unavailable
     model, rep = train_model(cands, MLConfig())
     assert model is not None and np.isfinite(model.predict_proba(cands.iloc[:5])).all()
+
+
+def test_the_ml_filter_is_off_until_the_replay_models_it(tmp_path, monkeypatch):
+    """Paper runs only what the backtest models (CLAUDE.md): ml.enabled alone doesn't switch it on."""
+    from types import SimpleNamespace
+
+    from tradebot.backtest.selection import Selection
+    from tradebot.bot import TradingBot
+    from tradebot.cli import ml_status
+    from tradebot.config import BotConfig
+    from tradebot.data import SyntheticMarket
+    from tradebot.db import Database
+    from tradebot.execution import PaperBroker
+    from tradebot.learning import MODEL_FILE, load_brain
+    from tradebot.notify import MemoryNotifier
+    from tradebot.scanner import Scanner
+
+    cfg = BotConfig(state_dir=str(tmp_path / "state"))
+    assert cfg.ml.enabled and not cfg.ml.active
+    model, _ = train_model(_fake_candidates(4000, informative=True), MLConfig())
+    model.save(cfg.state_path / MODEL_FILE)
+    assert load_brain(cfg)[1] is None  # live loads no model
+    assert Scanner(None, cfg, None, model).model is None and Scanner(None, cfg, None, model).risk_multiplier(1.0) == 1.0
+    market = SyntheticMarket(2, days=30, seed=1)
+    db = Database(cfg.state_path / "t.db")
+    bot = TradingBot(cfg, market, PaperBroker(db, cfg.costs_model(), 1000.0, market), db, MemoryNotifier(),
+                     selection=Selection(0.0, []), model=model)
+    bot.set_brain(None, model)
+    assert bot.model is None and not bot.ml_active and db.last_botlog("paper", "selection")[1]["ml"] is False
+    assert "ML filter: OFF - switched off until the account replay models it" in ml_status(None, tmp_path / "x.json",
+                                                                                          switched_off=True)
+    monkeypatch.setattr("tradebot.config.ML_IN_REPLAY", True)  # what a passed registered test would do
+    assert cfg.ml.active and load_brain(cfg)[1] is not None
+    cfg.ml.enabled = False
+    assert not cfg.ml.active and SimpleNamespace(m=Scanner(None, cfg, None, model).model).m is None

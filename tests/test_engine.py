@@ -13,9 +13,9 @@ COSTS = Costs(fee_rate=0.001, slippage_rate=0.0005)
 
 def run(rows, side="long", sl=95.0, tp=110.0, max_hold=10, exits=None, be=0.0, trail=0.0):
     df = bars(rows)
-    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    o, h, lows, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     ex = None if exits is None else np.asarray(exits, dtype=bool)
-    return simulate_trade(o, h, l, c, ex, 0, side, sl, tp, max_hold, COSTS, be, trail)
+    return simulate_trade(o, h, lows, c, ex, 0, side, sl, tp, max_hold, COSTS, be, trail)
 
 
 BASE = [(100, 101, 99, 100), (100, 102, 99, 101)]
@@ -169,14 +169,14 @@ def test_trailing_close_check_on_the_moving_bar():
 def test_limit_entry_fills_only_when_price_trades_through():
     costs = Costs(fee_rate=0.001, slippage_rate=0.0005, maker_fee_rate=0.00075, limit_entry=True)
     df = bars([(100, 101, 99, 100), (100.5, 102, 99.9, 101), (101, 111, 100.5, 110)])
-    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
-    out = simulate_trade(o, h, l, c, None, 0, "long", 95.0, 110.0, 10, costs)
+    o, h, lows, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    out = simulate_trade(o, h, lows, c, None, 0, "long", 95.0, 110.0, 10, costs)
     assert out.entry_price == 100.0  # the limit itself: no slippage
     net = (110 * (1 - 0.0005) * (1 - 0.001) - 100 * (1 + 0.00075)) / 100  # maker in, taker out
     assert out.return_pct == pytest.approx(net)
     touch = bars([(100, 101, 99, 100), (100.5, 102, 100.0, 101)])  # only touches 100: no fill
-    o, h, l, c = (touch[k].to_numpy() for k in ("open", "high", "low", "close"))
-    assert simulate_trade(o, h, l, c, None, 0, "long", 95.0, 110.0, 10, costs) is None
+    o, h, lows, c = (touch[k].to_numpy() for k in ("open", "high", "low", "close"))
+    assert simulate_trade(o, h, lows, c, None, 0, "long", 95.0, 110.0, 10, costs) is None
 
 
 def test_protection_is_recorded_when_the_stop_reaches_entry():

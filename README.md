@@ -2,7 +2,8 @@
 
 A crypto trading bot that scans the market for opportunities and either **sends you signals**
 (entry, stop-loss, take-profit and when to sell) on Telegram or **trades your exchange account
-for you**. It re-validates its strategies and retrains its ML filter on its own every week.
+for you**. It re-validates its strategies on its own every week. (Its ML filter is switched off
+for now: paper runs only what the backtest models. See "The ML filter" below.)
 
 ```
 🟢 BUY SIGNAL — SOL/USDT (4h)
@@ -78,6 +79,10 @@ Every trade has an ATR-based stop-loss, a fixed reward:risk take-profit, a break
   more than luck would (a Welch t-test, t ≥ 2.5). Without that check, about half of models
   trained on pure noise got through; with it, about 1 in 60 do. The bot's own closed trades are
   added to the training data.
+  **Switched off for now**: the whole-account replay that judges the bot doesn't model the filter
+  or its confidence sizing yet, so live loads no model and learn trains none, whatever
+  `ml.enabled` says (`ML_IN_REPLAY` in `tradebot/config.py`). It comes back only when the replay
+  models it walk-forward and a registered test on untouched data passes.
 
 **BTC market context.** Every strategy can optionally trade only while BTC is above its 200-day
 average. With `selection.btc_filter: auto` the learning cycle tests each strategy both ways and
@@ -197,7 +202,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 tradebot demo          # offline end-to-end run on synthetic data (≈1–2 min)
-pytest -q              # 274 tests
+pytest -q              # 293 tests
 ```
 
 ### 1. Configure
@@ -314,6 +319,23 @@ The full reports go to `reports/weekly/<date>/`.
 tradebot weekly --reference reports/universe-<run>.json   # the first time; the reference is remembered
 tradebot weekly                                           # every week after (cron: see DEPLOY.md)
 ```
+
+### The gates: hands-free changes
+
+The agent working on this repo (CLAUDE.md) changes the bot through gates, not approvals:
+- **deploy** (`tradebot gate deploy`): a commit reaches the running bot only when lint, the
+  suite, the suite in a fresh clone and the **same-trades check** pass. The same-trades check
+  runs the live path (scanner, risk, entries, exits, core rebalance) through the real bot on a
+  fixed dataset kept in the repository and compares every order with a stored golden file.
+  Identical orders: the change doesn't affect trades. Different orders: only for a change that
+  passed a registered test.
+- **research** (`tradebot research register / run / record`): a test is registered from a fixed
+  template before it runs, runs once, is recorded once, and counts as a trial.
+- **drawdown** (`tradebot gate drawdown`): limits set in advance from the reference backtest
+  (worst dips x 1.5, the longest losing run). A hit triggers a reconciliation and a range check
+  against the backtest, never a retrain.
+- **reporting**: STATUS.md, a Telegram summary every Monday (`weekly --notify`), and `tradebot
+  notify` when a gate fails in a way the agent can't resolve.
 
 ### Paper vs backtest, trade by trade: `tradebot reconcile`
 
@@ -489,7 +511,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | max single position | 30% of equity |
 | max total exposure | 100% of equity (no leverage) |
 | minimum reward:risk | 1.5 |
-| bigger bets on the strongest setups | up to 1.5x risk, only if the ML proved on unseen data that its most confident picks really earn more |
+| bigger bets on the strongest setups | up to 1.5x risk, only if the ML proved on unseen data that its most confident picks really earn more (off with the ML filter for now) |
 | trailing stop (momentum strategy) | once +1R, stop follows 3 ATR behind the best price; never loosened |
 | daily loss limit → no new trades until 00:00 UTC | 3% |
 | drawdown from peak → halt until `/resume` | 15% |
@@ -520,7 +542,13 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot dashboard [--serve] [--port 8765] [--out file.html]` | write or serve the dashboard |
 | `tradebot compare-entries --other config-b.yaml [--since 2026-10-01] [--csv file]` | market vs limit entries, per signal |
 | `tradebot reconcile [--since ...] [--end ...] [--csv file]` | paper vs backtest, trade by trade, on frozen candles (reporting only) |
-| `tradebot weekly [--reference universe-file]` | weekly check-in: last week's reconciliation, the reference backtest rerun frozen, uptime, a STATUS.md entry |
+| `tradebot weekly [--reference universe-file] [--notify]` | weekly check-in: last week's reconciliation, the reference backtest rerun frozen, uptime, the drawdown gate, a STATUS.md entry (and a Telegram summary) |
+| `tradebot gate same-trades [--accept id]` | replay the live path on the fixed dataset and compare its orders with the golden file (`--accept`: rewrite it for a change that passed that registered test) |
+| `tradebot gate deploy [--dry-run] [--bot-dir ~/tradebot]` | lint, suite, fresh-clone suite, same-trades; then fast-forward the bot's checkout and restart its container |
+| `tradebot gate drawdown [--set-limits --reference f --paper-from t] [--notify]` | the drawdown limits (set once) and the daily check: on a hit, reconcile and range check |
+| `tradebot research register --file p.yaml` → `run --id` → `record --id --verdict --numbers` | a registered test from the CLAUDE.md template: registered, run and recorded once each |
+| `tradebot research protocols` | every test in the ledger, with the trial count |
+| `tradebot notify --text "..."` (or `--file`) | a Telegram message to the owner |
 | `tradebot telegram-test` | Telegram setup helper |
 | `tradebot demo` | offline demo on synthetic data |
 
@@ -532,7 +560,8 @@ another config file and secrets file (for side-by-side instances).
 
 A trading bot has to stay up, so run it on an always-on box, not a laptop. DEPLOY.md is the
 checklist: docker, what to copy from the old machine, basic hardening, the agent's separate
-checkout, Remote Control, the weekly cron and backups. In short:
+checkout, Remote Control, the cron jobs (`scripts/install-cron.sh`), backups, and deploying
+through the deploy gate. In short:
 
 ```bash
 cp config.example.yaml config.yaml && cp .env.example .env   # edit both
@@ -542,7 +571,8 @@ docker compose logs -f
 
 State (database, strategy selection, ML model) lives in `./state`; price history in `./data`.
 
-**Updating.** After every `git pull`, install, test and **restart** the bot. A running bot keeps
+**Updating.** On the always-on box, updates go through the deploy gate only (`tradebot gate
+deploy`, DEPLOY.md step 9). Elsewhere: after every `git pull`, install, test and **restart** the bot. A running bot keeps
 its old code in memory while other commands use the new code on the same database. If you
 forget, it warns you on Telegram ("New bot code is on disk"). A strategy selection written by
 a manual `tradebot learn` is picked up within 5 minutes without a restart.
@@ -574,10 +604,13 @@ tradebot/
   dashboard.py    HTML dashboard (file or 127.0.0.1 server)
   compare.py      market vs limit entries across two instances, per signal
   reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core, uptime)
-  weekly.py       the weekly check-in and its STATUS.md entry
-tests/            274 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+  weekly.py       the weekly check-in, its STATUS.md entry and Telegram summary
+  protocols.py    registered tests: template check, register, run once, record once, trial counts
+  gates/          same-trades replay (fixed dataset + golden orders), deploy gate, drawdown gate
+scripts/          weekly.sh (Monday), daily.sh (drawdown gate), install-cron.sh
+tests/            293 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
-CLAUDE.md         rules for the agent working on this repo (hard rules, research discipline, when to ask)
+CLAUDE.md         rules for the agent working on this repo (hard rules, the gates, protocol template, when to ask)
 BACKLOG.md        open work with acceptance criteria; STATUS.md: one entry per session or week
 DEPLOY.md         moving the bot to an always-on Linux box
 ```

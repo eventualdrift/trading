@@ -651,12 +651,13 @@ def test_a_failed_learn_is_retried_an_hour_later(sim):
     assert len(calls) == 2
 
 
-def test_the_selection_log_names_the_ml_model(sim):
+def test_the_selection_log_names_the_ml_model(sim, monkeypatch):
     from types import SimpleNamespace
 
     import numpy as np
 
     market, db, broker, notes, bot = sim
+    monkeypatch.setattr("tradebot.config.ML_IN_REPLAY", True)  # the ML filter is off in paper (config.py)
 
     class Model:
         threshold = 0.55

@@ -32,7 +32,7 @@ class Scanner:
     def __init__(self, market, cfg: BotConfig, selection: Selection | None, model: SignalModel | None):
         self.market = market
         self.cfg = cfg
-        self.model = model if cfg.ml.enabled else None
+        self.model = model if cfg.ml.active else None
         self._ctx_key = None
         self._ctx = None
         self.combos: dict[str, list[Strategy]] = {}

@@ -208,9 +208,10 @@ def cmd_run(args, cfg):
         print("stopped")
 
 
-def ml_status(model, report_path) -> str:
+def ml_status(model, report_path, switched_off: bool = False) -> str:
     """Which ML model filters paper's signals now, and what the last learn's training decided (a
-    learn that doesn't promote a new model leaves the previous one in force)."""
+    learn that doesn't promote a new model leaves the previous one in force). ``switched_off``: the
+    config asks for it, but it stays off until the account replay models it (config.ML_IN_REPLAY)."""
     import json
 
     import pandas as pd
@@ -218,7 +219,11 @@ def ml_status(model, report_path) -> str:
     def when(t):
         return pd.Timestamp(t, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M") if t else "?"
 
-    if model is None:
+    if switched_off:
+        lines = ["ML filter: OFF - switched off until the account replay models it (paper runs only what the "
+                 "backtest models; BACKLOG a2, then a registered test decides). Paper takes every signal at 1x "
+                 "size, like the backtest"]
+    elif model is None:
         lines = ["ML filter: not active (no promoted model) - paper takes every signal, like the backtest"]
     else:
         r = model.report
@@ -249,7 +254,7 @@ def cmd_report(args, cfg):
     selection, model = load_brain(cfg)
     if selection:
         print("Selected strategies:", ", ".join(c.key for c in selection.selected) or "none")
-    print(ml_status(model, cfg.brain_path / MODEL_REPORT_FILE))
+    print(ml_status(model, cfg.brain_path / MODEL_REPORT_FILE, switched_off=cfg.ml.enabled and not cfg.ml.active))
     print("\nGo-live readiness (paper track record):")
     print(format_readiness(readiness(db, cfg, int(time.time() * 1000))))
 
@@ -281,6 +286,8 @@ def cmd_research(args, cfg):
 
     if args.topic.startswith("oos-"):
         return _research_oos(args, cfg)
+    if args.topic in ("register", "protocols", "run", "record"):
+        return _research_protocols(args, cfg)
     if args.topic == "note":
         if not args.id or not args.text:
             sys.exit("usage: tradebot research note --id <test id> --text \"...\"")
@@ -650,6 +657,137 @@ def cmd_reconcile(args, cfg):
         print(f"\nevery signal row written to {args.csv}")
 
 
+def _reference_backtest(cfg, reference: str, synthetic: bool = False):
+    """The frozen reference backtest: coins, data end and strategy selection from its universe file."""
+    import copy
+
+    from .learning import load_brain
+    from .portfolio import portfolio_backtest
+
+    pcfg = copy.deepcopy(cfg)
+    selection, _ = load_brain(pcfg)
+    fraction = pcfg.core.fraction or 0.65
+    pcfg.core.fraction = fraction
+    x = _portfolio_inputs(pcfg, selection, synthetic, 3200, reference)
+    res = portfolio_backtest(x["core_closes"], x["trades"], pcfg, capital=1000.0, fraction=fraction,
+                             since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
+                             universe=x["universe"])
+    return res, x, pcfg, fraction
+
+
+def _telegram_send(cfg, text: str) -> str | None:
+    """Send a plain-text Telegram message; returns the error, or None when it was sent."""
+    from .notify.telegram import TelegramNotifier, _chunks
+
+    s = cfg.secrets
+    if not (s.telegram_token and s.telegram_chat_id):
+        return "Telegram is not configured (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the --env file)"
+    tg = TelegramNotifier(s.telegram_token, s.telegram_chat_id)
+    prefix = f"[{cfg.name}] " if cfg.name else ""
+    try:
+        for chunk in _chunks(prefix + text, 4000):
+            tg._call("sendMessage", chat_id=s.telegram_chat_id, text=chunk, disable_web_page_preview=True)
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        return f"Telegram send failed: {exc}"
+    return None
+
+
+def cmd_notify(args, cfg):
+    """Gate 4: a Telegram message to the owner (the weekly summary, or a gate that can't resolve)."""
+    text = args.text if args.text is not None else Path(args.file).read_text() if args.file else ""
+    if not text.strip():
+        sys.exit("usage: tradebot notify --text \"...\" (or --file path)")
+    err = _telegram_send(cfg, text)
+    if err:
+        sys.exit(err)
+    print("sent")
+
+
+def _gate_drawdown(args, cfg):
+    """Gate 3: limits set in advance; on a hit, reconcile the period and check the range."""
+    import copy
+    import time as _time
+
+    import pandas as pd
+
+    from . import weekly as wk
+    from .gates import drawdown as dd
+    from .provenance import code_version, settings_hash
+
+    state_dir = cfg.state_path
+    if args.set_limits:
+        ref = args.reference or wk.load_state(state_dir).get("reference")
+        if not ref:
+            sys.exit("--set-limits needs --reference <universe file> (or a weekly reference)")
+        res, _, _, _ = _reference_backtest(cfg, ref, args.synthetic)
+        dist = dd.backtest_distribution(res)
+        since = (int(pd.Timestamp(args.paper_from, tz="UTC").value // 1_000_000) if args.paper_from
+                 else int(_time.time() * 1000))
+        try:
+            data = dd.set_limits(state_dir, dist, reference=ref, code=code_version(), settings=settings_hash(cfg),
+                                 paper_from_ms=since)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        lim = data["limits"]
+        print(f"Drawdown limits set ({data['rule']}), watching paper from "
+              f"{pd.Timestamp(since, unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC:\n"
+              f"  account drawdown {lim['account_dd_pct']:.1f}% (backtest worst {dist['combined_dip_pct']:.1f}%)\n"
+              f"  satellite drawdown {lim['satellite_dd_pct']:.1f}% (backtest worst {dist['satellite_dip_pct']:.1f}%)\n"
+              f"  losing run {lim['losing_run']} trades (the backtest's longest, over {dist['trades']} trades)")
+        return
+    limits = dd.load_limits(state_dir)
+    if not limits:
+        sys.exit("No drawdown limits yet: tradebot gate drawdown --set-limits --reference <universe file>")
+    db = _bot_db(cfg)
+    st = dd.paper_state(db, cfg.mode, limits["paper_from_ms"])
+    print(dd.status_line(limits, st))
+    which = dd.hits(limits, st)
+    if not which:
+        return
+    key = {"which": which, "account_peak_ms": st["account_peak_ms"], "satellite_peak_ms": st["satellite_peak_ms"],
+           "run_start_ms": st["run_start_ms"]}
+    for ev in reversed(dd.events(state_dir)):  # a hit is handled once: the same dip is not re-reported daily
+        if ev.get("key") == key:
+            print(f"Already handled at {ev['at']}: {ev['outcome']} (see drawdown-events.jsonl)")
+            sys.exit({"in range": 10, "outside range": 11}.get(ev["outcome"], 12))
+    starts = [t for t in (st["account_peak_ms"] if "account" in which else None,
+                          st["satellite_peak_ms"] if "satellite" in which else None,
+                          st["run_start_ms"] if "losing_run" in which else None) if t]
+    since = max(min(starts) if starts else limits["paper_from_ms"], limits["paper_from_ms"])
+    try:
+        rec, text = _reconcile_run(copy.deepcopy(cfg), since, None, args.synthetic)
+        _, up = wk.uptime_summary(rec)
+        _, rc = wk.reconcile_summary(rec)
+        mechanics_ok = (not rc.get("first_differences") and not rc.get("core_rule_diffs")
+                        and not rc.get("core_target_mismatch") and up.get("uptime", 0.0) >= 0.95)
+        reproduce = rec.reproduce
+    except ValueError as exc:
+        text, up, rc, mechanics_ok, reproduce = str(exc), {}, {}, False, ""
+    ranges = dd.range_check(limits, st, which)
+    result = dd.outcome(ranges, mechanics_ok)
+    out_dir = Path("reports")
+    out_dir.mkdir(exist_ok=True)
+    report = out_dir / f"drawdown-{_time.strftime('%Y-%m-%d-%H%M', _time.gmtime())}.txt"
+    report.write_text(text + "\n")
+    event = {"at": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()), "key": key, "state": st, "ranges": ranges,
+             "mechanics_ok": mechanics_ok, "reconcile": {**rc, **up}, "outcome": result, "report": str(report),
+             "reproduce": reproduce}
+    dd.record_event(state_dir, event)
+    next_step = {"in range": "recorded as in range; trading continues",
+                 "outside range": "outside the backtest's range with correct mechanics: register a test (gate 2)",
+                 "mechanics differ": "paper's mechanics differ from the backtest's: fix them (see the report)"}[result]
+    msg = (f"Drawdown gate hit ({', '.join(which)}): {dd.status_line(limits, st)}.\n"
+           + "".join(f"Range check {w}: the backtest does this badly {r['p']:.0%} of the time "
+                     f"({'in' if r['in_range'] else 'outside'} range).\n" for w, r in ranges.items())
+           + f"Outcome: {result} - {next_step}. Reconcile: {report}")
+    print(msg)
+    if args.notify and result != "in range":  # in range is recorded and shows in the weekly summary
+        err = _telegram_send(cfg, msg)
+        if err:
+            print(err)
+    sys.exit({"in range": 10, "outside range": 11, "mechanics differ": 12}[result])
+
+
 def cmd_weekly(args, cfg):
     """Weekly check-in: reconcile the last week, rerun the reference backtest on frozen data,
     summarise uptime, append a STATUS.md entry. Reporting only."""
@@ -659,7 +797,7 @@ def cmd_weekly(args, cfg):
 
     from . import weekly as wk
     from .learning import load_brain
-    from .portfolio import format_portfolio_backtest, portfolio_backtest
+    from .portfolio import format_portfolio_backtest
     from .provenance import code_version, config_differences, config_hash, settings_snapshot
     from .reconcile import write_csv
     from .timeframes import last_closed_open_ms
@@ -693,14 +831,7 @@ def cmd_weekly(args, cfg):
         numbers.append(f"- Reconcile: {exc}")
 
     try:  # 2) the reference backtest, frozen: coins, data end and strategy selection as saved
-        pcfg = copy.deepcopy(cfg)
-        selection, _ = load_brain(pcfg)
-        fraction = pcfg.core.fraction or 0.65
-        pcfg.core.fraction = fraction
-        x = _portfolio_inputs(pcfg, selection, args.synthetic, 3200, reference)
-        res = portfolio_backtest(x["core_closes"], x["trades"], pcfg, capital=1000.0, fraction=fraction,
-                                 since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
-                                 universe=x["universe"])
+        res, x, pcfg, fraction = _reference_backtest(cfg, reference, args.synthetic)
         (out_dir / "portfolio-backtest.txt").write_text(format_portfolio_backtest(res, pcfg.exchange.quote) + "\n")
         pf_lines, nums["portfolio"] = wk.portfolio_summary(res)
         u = x["universe"] or {}
@@ -710,6 +841,20 @@ def cmd_weekly(args, cfg):
         reproduce.append(f"tradebot portfolio-backtest --core-fraction {fraction:g} --universe-file {reference}")
     except Exception as exc:  # noqa: BLE001 - the check-in still gets written
         numbers.append(f"- Frozen reference rerun failed: {type(exc).__name__}: {exc}")
+    try:  # 3) the drawdown gate's state (the gate itself runs daily: scripts/daily.sh)
+        from .gates import drawdown as dd
+
+        limits = dd.load_limits(cfg.state_path)
+        dd_state = dd.paper_state(_bot_db(cfg), cfg.mode, limits["paper_from_ms"]) if limits else None
+        numbers.append("- " + dd.status_line(limits, dd_state))
+        week = [e for e in dd.events(cfg.state_path) if pd.Timestamp(e["at"], tz="UTC").value // 1_000_000 >= since]
+        if week:
+            numbers.append("  Hits this week: " + "; ".join(f"{e['at'][:10]} {', '.join(e['key']['which'])}: "
+                                                            f"{e['outcome']}" for e in week))
+        nums["drawdown"] = {"hits": dd.hits(limits, dd_state) if limits else [],
+                            "events": [e["outcome"] for e in week]}
+    except Exception as exc:  # noqa: BLE001 - the check-in still gets written
+        numbers.append(f"- Drawdown gate: could not read paper's state ({exc})")
     numbers.append(f"- Full reports: {out_dir}")
 
     # what changed since last week
@@ -732,9 +877,9 @@ def cmd_weekly(args, cfg):
     if state.get("reference") and state["reference"] != reference:
         changed.append(f"reference backtest {state['reference']} -> {reference}")
 
+    needs = wk.needs_owner(nums, state, diffs, selection_changed)
     entry = wk.status_entry(date=wk.today(), code=code, settings=config_hash(snap), changed=changed,
-                            numbers=numbers, reproduce=reproduce,
-                            needs=wk.needs_owner(nums, state, diffs, selection_changed),
+                            numbers=numbers, reproduce=reproduce, needs=needs,
                             next_items=wk.backlog_next(wk.REPO / "BACKLOG.md"))
     status = Path(args.status_file) if args.status_file else wk.REPO / "STATUS.md"
     wk.append_status(status, entry)
@@ -742,6 +887,94 @@ def cmd_weekly(args, cfg):
                                    "numbers": nums, "ran_at": wk.today()})
     print(entry)
     print(f"Appended to {status}; full reports in {out_dir}")
+    if args.notify:
+        err = _telegram_send(cfg, wk.telegram_summary(wk.today(), code, numbers, needs))
+        print(err or "Telegram summary sent")
+
+
+def _research_protocols(args, cfg):
+    """Gate 2: register a protocol, run it once, record its verdict once; list them all."""
+    import json
+
+    import yaml
+
+    from . import protocols
+
+    state = cfg.state_path
+    if args.topic == "protocols":
+        print(protocols.format_status(state))
+        return
+    try:
+        if args.topic == "register":
+            if not args.file:
+                sys.exit("usage: tradebot research register --file protocol.yaml")
+            entry = protocols.register(state, yaml.safe_load(Path(args.file).read_text()))
+            print(f"Registered {entry['id']} (trial {entry['trial']} overall, {entry['family_trial']} in its family; "
+                  f"sha256 {entry['sha256'][:12]}). Run it once: tradebot research run --id {entry['id']}")
+        elif args.topic == "run":
+            code, out = protocols.run(state, args.id or "", cwd=str(Path.cwd()))
+            print(out)
+            print(f"\nRan {args.id} (exit {code}); output kept in {protocols.folder(state) / (args.id + '.out')}. "
+                  f"Apply the registered pass rule, then: tradebot research record --id {args.id} --verdict ...")
+        else:
+            numbers = json.loads(args.numbers) if args.numbers else {}
+            entry = protocols.record(state, args.id or "", args.verdict or "", numbers, args.text or "")
+            print(f"Recorded {args.id}: {entry['verdict'].upper()} ({entry['trials_total']} trials so far, "
+                  f"{entry['trials_in_family']} in this family).")
+    except ValueError as exc:
+        sys.exit(str(exc))
+
+
+def cmd_gate(args, cfg):
+    if args.gate == "same-trades":
+        return _gate_same_trades(args, cfg)
+    if args.gate == "deploy":
+        return _gate_deploy(args, cfg)
+    return _gate_drawdown(args, cfg)
+
+
+def _gate_same_trades(args, cfg):
+    """Gate 1: replay the live path on the fixed dataset and compare its orders with the golden file."""
+    from .gates import same_trades as st
+    from .protocols import passed
+    from .provenance import code_version
+
+    golden = st.load_golden()
+    if golden and golden["dataset_sha256"] != st.dataset_sha256():
+        sys.exit("The stored dataset no longer matches the golden file: it must never change.")
+    orders = st.replay(days=golden["replay"]["days"] if golden else st.REPLAY_DAYS)
+    if args.accept:
+        if not passed(cfg.state_path, args.accept):
+            sys.exit(f"{args.accept} has no passing verdict in the ledger: the golden file stays as it is.")
+        st.write_golden(orders, args.accept, code_version())
+        print(f"Golden file rewritten, accepted by {args.accept}: {st.summary(orders)}")
+        return
+    if golden is None:
+        if not args.init:
+            sys.exit("No golden file yet: --init writes the first one from this code.")
+        st.write_golden(orders, None, code_version())
+        print(f"First golden file written: {st.summary(orders)}")
+        return
+    diffs = st.differences(golden["orders"], orders)
+    if diffs:
+        print("ORDERS DIFFER from the golden file - this change affects what the bot trades:")
+        print("\n".join(diffs))
+        sys.exit(1)
+    print(f"identical to the golden file: {st.summary(orders)}")
+
+
+def _gate_deploy(args, cfg):
+    """Gate 1: lint, suite, fresh-clone suite, same-trades; then deploy to the bot's checkout."""
+    from .gates.deploy import GateFailed, deploy
+
+    agent_dir = Path(__file__).resolve().parent.parent
+    print(f"Deploy gate: {agent_dir} -> {args.bot_dir}" + (" (dry run)" if args.dry_run else ""))
+    try:
+        rec = deploy(agent_dir, Path(args.bot_dir).expanduser(), cfg.state_path, dry_run=args.dry_run)
+    except GateFailed as exc:
+        print(f"GATE FAILED at {exc.step}:\n{exc.detail}")
+        sys.exit(2)
+    print(f"{'Deployed' if rec.get('deployed') else 'All checks passed (dry run)'}: {rec['commit']}")
 
 
 def cmd_telegram_test(args, cfg):
@@ -805,12 +1038,18 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
     sp.add_argument("topic", choices=["breaker", "sizing", "core", "note", "oos-fetch", "oos-register", "oos-run",
-                                      "oos-show"],
+                                      "oos-show", "register", "protocols", "run", "record"],
                     help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget "
                          "test; core: robustness of the core (reset timing, trend lengths) - reporting only; "
                          "note: annotate a recorded test (--id, --text); oos-fetch / oos-register / oos-run / "
-                         "oos-show: the pre-2017 BTC out-of-sample test of the core, in that order")
-    sp.add_argument("--id", default=None, help="note: the test id, e.g. sizing-open-risk-budget-v1")
+                         "oos-show: the pre-2017 BTC out-of-sample test of the core, in that order; "
+                         "register (--file) / run (--id) / record (--id --verdict --numbers): a protocol from the "
+                         "CLAUDE.md template, once each; protocols: every test in the ledger with trial counts")
+    sp.add_argument("--id", default=None, help="the test id, e.g. sizing-open-risk-budget-v1")
+    sp.add_argument("--file", default=None, help="register: the protocol (YAML or JSON, the CLAUDE.md template)")
+    sp.add_argument("--verdict", choices=["pass", "fail", "inconclusive"], default=None,
+                    help="record: the verdict, from the registered pass rule")
+    sp.add_argument("--numbers", default=None, help="record: the metric and supporting numbers, as JSON")
     sp.add_argument("--text", default=None, help="note: the text to add")
     sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])
     sp.add_argument("--capital", type=float, default=1000.0, help="sizing: account size")
@@ -846,7 +1085,25 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--end", default=None, help="UTC end of the week (default: the last full hour)")
     sp.add_argument("--status-file", default=None, help="default: STATUS.md in the repository")
     sp.add_argument("--out-dir", default="reports/weekly", help="where the full reports go")
+    sp.add_argument("--notify", action="store_true", help="also send a Telegram summary")
     sp.add_argument("--synthetic", action="store_true")
+    sp = sub.add_parser("gate", help="the gates that replace approvals (CLAUDE.md): same-trades, deploy, drawdown")
+    sp.add_argument("gate", choices=["same-trades", "deploy", "drawdown"])
+    sp.add_argument("--init", action="store_true", help="same-trades: write the first golden file")
+    sp.add_argument("--accept", default=None,
+                    help="same-trades: rewrite the golden file for a change that passed this registered test")
+    sp.add_argument("--bot-dir", default="~/tradebot", help="deploy: the running bot's checkout")
+    sp.add_argument("--dry-run", action="store_true", help="deploy: every check, but don't touch the bot")
+    sp.add_argument("--set-limits", action="store_true",
+                    help="drawdown: set the limits, once, from the frozen reference backtest")
+    sp.add_argument("--reference", default=None, help="drawdown --set-limits: the reference universe file")
+    sp.add_argument("--paper-from", default=None, help="drawdown --set-limits: watch paper from (UTC; default now)")
+    sp.add_argument("--notify", action="store_true",
+                    help="drawdown: Telegram the owner when a hit needs work (outside range, mechanics differ)")
+    sp.add_argument("--synthetic", action="store_true")
+    sp = sub.add_parser("notify", help="send the owner a Telegram message (weekly summary, unresolved gate)")
+    sp.add_argument("--text", default=None)
+    sp.add_argument("--file", default=None, help="send this file's text")
     sub.add_parser("telegram-test", help="check Telegram setup / find your chat id")
     sp = sub.add_parser("demo", help="offline end-to-end demo on synthetic data")
     sp.add_argument("--days", type=int, default=540, help="history for learning")
@@ -865,7 +1122,7 @@ def main(argv: list[str] | None = None) -> None:
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
         "compare-entries": cmd_compare_entries, "config-set": cmd_config_set, "reconcile": cmd_reconcile,
-        "weekly": cmd_weekly,
+        "weekly": cmd_weekly, "gate": cmd_gate, "notify": cmd_notify,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

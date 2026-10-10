@@ -195,7 +195,11 @@ def needs_owner(now: dict, prev: dict, settings_diffs: list[str], selection_chan
         out.append(f"{r['signal_data_differences']} backtest signal(s) live didn't see although it scanned "
                    f"(live candles differ, or a scan was not recorded)")
     if r.get("ml_active"):
-        out.append("The ML filter is on: paper filters and sizes signals the backtest doesn't model (your decision)")
+        out.append("The ML filter was on in this window: paper filtered and sized signals the backtest doesn't "
+                   "model (it is off in code, config.ML_IN_REPLAY, once that commit is deployed)")
+    for outcome in (now.get("drawdown") or {}).get("events", []):
+        if outcome != "in range":
+            out.append(f"Drawdown gate: {outcome} (state/research/drawdown-events.jsonl; the agent acts on it)")
     if r.get("core_target_mismatch") or r.get("core_rule_diffs"):
         out.append("The core differs from its backtest (targets or rebalances)")
     if settings_diffs:
@@ -235,3 +239,12 @@ def append_status(path: Path, entry: str) -> None:
 
 def today() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def telegram_summary(date: str, code: str, numbers: list[str], needs: list[str]) -> str:
+    """The Monday message: the week's numbers in a few lines, and what needs the owner."""
+    keep = [x for x in numbers if not x.startswith("- Full reports")]
+    lines = [f"Weekly check-in {date} (code {code})"] + [x.replace("**", "") for x in keep]
+    lines += ["", "Needs you: " + ("; ".join(needs) if needs else "nothing")]
+    text = "\n".join(lines)
+    return text if len(text) < 3500 else text[:3500] + "\n... (STATUS.md has the rest)"

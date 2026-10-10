@@ -1,5 +1,5 @@
-# Always-on box: see DEPLOY.md.  Start / update (only when the owner says so):
-#   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build     logs: docker compose logs -f
+# Always-on box: see DEPLOY.md. First start: DEPLOY step 5. Updates: only through the deploy gate,
+#   tradebot --config config-agent.yaml gate deploy   (from ~/tradebot-agent)     logs: docker compose logs -f
 services:
   tradebot:
     build:
