@@ -283,3 +283,75 @@ owner before running anything else.
 2. `tradebot --config config-agent.yaml weekly` once the VM bot has run a few days, then the cron
    (DEPLOY step 8).
 3. The candle-history item, after four weeks with uptime above 95%.
+
+## 2026-10-10 - session: hands-free, the gates that replace approvals
+
+Code 71f9573. The owner's decision of 10-10: the agent runs the project hands-free, and gates
+replace approvals. This cloud session built the gates on the owner's instruction (after the 10-07
+handoff); the VM session runs them from here. `git pull` in `~/tradebot-agent` first.
+
+**What changed** (71f9573)
+- **CLAUDE.md rewritten**: the owner's hard rules, plus three new ones (never tune on results;
+  paper runs only what the backtest models; retraining on the weekly schedule only). Then the
+  four gates, the fixed protocol template with defaults per family, and the shorter stop-and-ask
+  list (the hard rules, a gate that can't resolve). The agent-separation and ledger rules of 10-07
+  are kept, under "Working rules": the owner's restated hard-rule list didn't name them.
+- **Gate 1**: `tradebot gate same-trades` replays the live path through the real `TradingBot` for
+  40 days on a fixed dataset stored in `tradebot/gates/data/`: 4 coins, 300 days of 1h candles,
+  sha256 03ea1f0d. It uses momentum@4h, breakout@1d and breakout@1h at 65/35, and compares every
+  order with `tradebot/gates/golden.json`, generated from 4d523da. `tradebot gate deploy` runs
+  lint, the suite, the fresh-clone suite and same-trades. It compares the golden orders with those
+  of the commit `~/tradebot` runs, then fast-forwards it, rebuilds and checks the container.
+- **Gate 2**: `tradebot research register / run / record / protocols` (`tradebot/protocols.py`).
+- **Gate 3**: `tradebot gate drawdown` (`tradebot/gates/drawdown.py`); `--set-limits` once.
+- **Gate 4**: `tradebot notify`, `weekly --notify`, `scripts/weekly.sh`, `daily.sh`,
+  `install-cron.sh`.
+- **The ML filter and its 1.5x sizing are off in code** (owner's order): `ML_IN_REPLAY = False`
+  in `tradebot/config.py`. Live loads no model and learn trains none, whatever `ml.enabled` says.
+  `report` prints "ML filter: OFF - switched off until the account replay models it".
+- **Core rebalance day** (owner's order): fetch every core price and the day's candle first. Move
+  nothing until all are there, asking again every 5 minutes for up to 6 hours after the close;
+  then go ahead with what's there. The activity log gets `core_retry` (once a day) and
+  `core_day.incomplete`; Telegram gets an error message.
+- **Lint**: the old E741/E731 findings are fixed by renames. Ruff's rule set is pinned in
+  pyproject.toml (E4, E7, E9, F) so every ruff version agrees, and ruff is in the dev extras (the
+  deploy gate runs `python -m ruff`).
+- Tests: 293 pass (repo and clean clone).
+
+**What the numbers say**
+- Same-trades on this code: "identical to the golden file: 51 positions (49 closed), 260 signals,
+  9 core trades". Reproduce: `tradebot --config none.yaml --env none.env gate same-trades`.
+- The lint renames don't affect trades: the golden file came from 4d523da, before them.
+- The core fix leaves the golden orders identical: the replay never fails a fetch. In the tests,
+  a daily feed 2 hours late gives one `core_retry` and no trades until the day's candle arrives.
+  Then the targets come from that candle. A feed more than 6 hours late gives a rebalance with
+  what's there, logged `incomplete`.
+- The ML switch-off also leaves the golden orders identical (the replay never had the filter).
+  It still changes paper's trades whenever a promoted model exists (the 09-27 to 10-03 reconcile
+  found one). It goes in under the owner's order, not as "not trade-affecting".
+- No numbers from the bot's data this session: this container can't reach the VM. BACKLOG a, b
+  and c need the VM session.
+- Choices inside the gates, made now and fixed:
+  - the template's pass rule: at least +0.10 Sharpe (the size of implementation swings), a dip
+    no more than 10% deeper, at least 100 satellite trades or 3 years of days;
+  - the range check: 10-day blocks of the backtest's daily returns, 2000 resamples; in range when
+    the backtest does at least as badly 5% of the time or more;
+  - mechanics are correct when the period's reconcile shows no first differences, no core
+    differences and uptime of 95% or more.
+
+  A drawdown hit goes to Telegram only when the agent has work (outside range, mechanics
+  differ). In-range hits go in the Monday summary.
+
+**What needs you**
+- Nothing to decide. Two things to look at if you want:
+  - the protocol template's defaults (CLAUDE.md, gate 2). They are fixed for every protocol, so
+    any change should come before the first one is registered;
+  - the agent-separation and ledger rules, now working rules. Moving them back under the hard
+    rules is yours to do.
+
+**What's next** (the VM session, in `~/tradebot-agent`)
+1. `git pull`, the verification block of the 10-07 handoff, then BACKLOG "On the box, first":
+   deploy through gate 1, set the drawdown limits from the weekly reference, the agent's `.env`,
+   `scripts/install-cron.sh`.
+2. BACKLOG a, b, c: `report` and the two reconciles on the bot's data, recorded here and ticked.
+3. a2, the ML filter in the replay, then its `ml` protocol.
