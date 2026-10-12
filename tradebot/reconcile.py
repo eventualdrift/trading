@@ -28,6 +28,7 @@ from .config import BotConfig
 from .core import trend_weights_series
 from .db import Database
 from .strategies import make_strategy
+from .bot import CORE_RETRY_HOURS
 from .timeframes import index_ms, last_closed_open_ms, tf_ms
 
 SCAN_LAG_MS = 5 * 60_000  # a candle's scan runs within minutes of its close: what was in force then counts
@@ -282,7 +283,8 @@ class Reconciliation:
     uptime: Uptime = field(default_factory=Uptime)
     uptime_share: float = 0.0
     approx_universe_until: int | None = None
-    approx_selection_until: int | None = None
+    approx_selection_until: int | None = None  # before this, today's selection is assumed
+    selection_logged_from: int | None = None  # the first logged selection (in force from its learn, see above)
     scans_logged_from: int | None = None
     ml_active: bool = False  # the ML filter was on at some point in the window
     selections: list[dict] = field(default_factory=list)  # in force during the window (activity log)
@@ -294,8 +296,19 @@ class Reconciliation:
     core_rule_days: int = 0
     core_rule_diffs: list[dict] = field(default_factory=list)
     core_days_missing: list[int] = field(default_factory=list)  # days after logging began with no core check
+    core_waits: list[dict] = field(default_factory=list)  # days the core waited for the day's data (core_retry)
     header: list[str] = field(default_factory=list)
     reproduce: str = ""  # the command that reruns this report
+
+
+def selection_timeline(entries: list[tuple[int, object]], fallback) -> Timeline:
+    """The selections in force. The first logged one was in force from its learn (``created_at``), not
+    from the restart that logged it: before that learn, today's selection is the fallback."""
+    if entries and isinstance(entries[0][1], dict) and entries[0][1].get("created_at"):
+        made = int(float(entries[0][1]["created_at"]) * 1000)
+        if made < entries[0][0]:
+            entries = [(made, entries[0][1])] + list(entries)
+    return Timeline(entries, fallback)
 
 
 def _bps(a: float | None, b: float | None, sign: float = 1.0) -> float | None:
@@ -318,9 +331,11 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
     # --- what paper was working with
     sel_fallback = {"combos": [{"strategy": c.strategy, "timeframe": c.timeframe, "params": c.params}
                                for c in (current_selection.selected if current_selection else [])]}
-    selections = Timeline(db.botlog(mode, "selection"), sel_fallback)
+    logged_selections = db.botlog(mode, "selection")
+    selections = selection_timeline(logged_selections, sel_fallback)
     universes = Timeline(db.botlog(mode, "universe"), fallback_universe)
     rec.approx_selection_until = selections.first
+    rec.selection_logged_from = logged_selections[0][0] if logged_selections else None
     rec.approx_universe_until = universes.first
     in_force = [(ts, d) for ts, d in selections.entries if ts <= since_ms][-1:] + \
         [(ts, d) for ts, d in selections.entries if since_ms < ts <= end_ms]
@@ -560,15 +575,31 @@ def _reconcile_core(rec: Reconciliation, db: Database, cfg: BotConfig, daily_clo
     # days the bot logged (targets + the state it rebalanced from): same targets? same trades?
     logged = [(ts, d) for ts, d in db.botlog(mode, "core_day", since_ms - DAY_MS) if in_window(int(d["day"]))]
     rec.core_logged_from = min((int(d["day"]) + DAY_MS for _, d in db.botlog(mode, "core_day")), default=None)
-    for _, d in logged:
+    retries = {int(d["day"]): (ts, d) for ts, d in db.botlog(mode, "core_retry", since_ms - DAY_MS)}
+    for ts, d in logged:
         day = int(d["day"])
+        incomplete = list(d.get("incomplete") or [])  # the bot went ahead without these (the wait ran out, or
+        if day in retries or incomplete:  # its first check came too late to wait)
+            first = retries[day][0] if day in retries else ts
+            rec.core_waits.append({"day": day, "waited": day in retries,
+                                   "first_check_h": max(first - (day + DAY_MS), 0) / 3_600_000,
+                                   "waited_h": max(ts - first, 0) / 3_600_000,
+                                   "missing": list((retries[day][1] if day in retries else {}).get("missing") or []),
+                                   "incomplete": incomplete})
         bt_targets = {}
         for sym in c.symbols:
             bw = weights.get(sym, pd.Series(dtype=float)).get(day)
             bt_targets[sym] = None if bw is None or bw != bw else float(bw)
             paper_w = (d.get("targets") or {}).get(sym)
             entry = {"day": day, "symbol": sym, "paper": paper_w, "backtest": bt_targets[sym], "why": ""}
-            if paper_w is None and bt_targets[sym] is not None:
+            without = [x for x in incomplete if x.startswith(sym + " ")]
+            if paper_w is None and bt_targets[sym] is not None and without:
+                w, what = rec.core_waits[-1], " and ".join(x[len(sym) + 1:] for x in without)
+                entry["why"] = (f"the bot waited {w['waited_h']:.1f}h after the close for its {what} and went ahead "
+                                f"without: it left that coin alone that day" if w["waited"] else
+                                f"the bot's first check came {w['first_check_h']:.1f}h after the close, more than "
+                                f"{CORE_RETRY_HOURS}h, with no {what}: it went ahead and left that coin alone that day")
+            elif paper_w is None and bt_targets[sym] is not None:
                 entry["why"] = ("the bot had no daily candles at its check (the fetch failed, e.g. right after "
                                 "waking): it left that coin alone that day")
             elif paper_w is not None and bt_targets[sym] is not None and abs(paper_w - bt_targets[sym]) > 1e-9:
@@ -714,6 +745,9 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
     if rec.approx_selection_until is None or rec.approx_selection_until > rec.since_ms:
         lines.append(f"  ! Active strategies not logged before {_ts(rec.approx_selection_until) if rec.approx_selection_until else 'now'}: "
                      f"today's selection assumed there")
+    elif rec.selection_logged_from is not None and rec.selection_logged_from > rec.since_ms:
+        lines.append(f"  ! Active strategies logged from {_ts(rec.selection_logged_from)}: before that, the selection "
+                     f"logged then is taken as in force from its learn ({_ts(rec.approx_selection_until)})")
     if rec.scans_logged_from is None or rec.scans_logged_from > rec.since_ms:
         lines.append(f"  ! Scans logged from {_ts(rec.scans_logged_from) if rec.scans_logged_from else '(not yet)'}: "
                      f"before that a missing paper signal can only be put down to downtime or scan errors")
@@ -802,6 +836,15 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
     if rec.core_days_missing:
         lines.append(f"  ! {len(rec.core_days_missing)} days with no core check (bot not running at the day change): "
                      + ", ".join(_ts(d)[:10] for d in rec.core_days_missing[:10]))
+    if rec.core_waits:
+        lines.append(f"  {len(rec.core_waits)} days the core's data was late (it waits up to {CORE_RETRY_HOURS}h after "
+                     f"the close; the backtest rebalances on the close):")
+        for w in rec.core_waits[:limit]:
+            lines.append(f"    {_ts(w['day'])[:10]}: first check {w['first_check_h']:.1f}h after the close"
+                         + (f", waited {w['waited_h']:.1f}h" if w["waited"] else
+                            f", no wait (the close was already more than {CORE_RETRY_HOURS}h old)")
+                         + (f", first missing {', '.join(w['missing'])}" if w["missing"] else "")
+                         + (f"; went ahead without {', '.join(w['incomplete'])}" if w["incomplete"] else ""))
     if rec.core_trades:
         steps = [t for t in rec.core_trades if t["reason"] == "trend weights" and t["weight_from"] != t["weight_to"]]
         drift = [t for t in rec.core_trades if t["reason"] == "trend weights" and t["weight_from"] == t["weight_to"]]

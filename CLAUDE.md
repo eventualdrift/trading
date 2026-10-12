@@ -19,6 +19,13 @@ it in STATUS.md and on Telegram. The owner keeps the hard rules and the go-live 
 - **Paper runs only what the backtest models.** Any component live uses that the account replay
   can't reproduce is switched off until it can.
 - **Retraining happens on the weekly schedule only.** A drawdown never triggers a retrain.
+- **The agent writes only to its own state and data.** Only frozen runs touch the bot's: its
+  database is opened read-only (`observe_state_dir`), its strategies read-only
+  (`learning.follow_state_dir`); everything that writes (learn, unfrozen backtests, data
+  updates) uses the agent's own `state/` and `data/` (`config-agent.yaml`).
+- **The ledger changes only through `tradebot research` commands** (and `gate drawdown`, which
+  records its limits and events there), never by hand. Recorded verdicts are never edited or
+  rerun.
 
 ## Switched off until the replay models them
 
@@ -68,20 +75,35 @@ hypothesis: <one sentence: the change, and what it does to the metric>
 change: <the exact change: commit on a branch, made before registering, not yet deployed>
 data: <coins (universe file), timeframes, start and end dates>
 untouched: <why none of this data was used to design or tune the change>
+reserve: <the untouched reserve this protocol spends, e.g. "reference universe, candles
+          2026-09-27 to 2026-12-27": named once; a reserve spent by one protocol is never
+          named by another>
 metric: <one number, how it is computed, the line of the run's output that prints it>
-pass_rule: <the threshold, decided now>
+pass_rule: <the threshold, decided now; it must hold on each half of the untouched period
+            separately as well as overall>
 readings:
   pass: <what is applied and deployed>
   fail: <recorded; nothing changes>
   inconclusive: <recorded; what a new protocol would need>
-run: tradebot <one command that prints the metric for current and changed side by side>
+run: tradebot <one command that prints the metric for current and changed side by side,
+      overall and for each half of the period>
 ```
+
+Three rules the commands enforce: **at most three protocols per quarter** (`register` refuses
+a fourth); **each protocol names the untouched reserve it spends**, and a reserve is spent once
+(`register` refuses a reserve another protocol named, or one containing it; the older
+`core-btc-pre2017-v1` spent "pre-2017 BTC"); **a pass holds on each half separately as well
+as overall** (`record --verdict pass` needs `overall`, `first_half` and `second_half` in
+`--numbers`, each a number at or past the family floor below; the protocol's own stricter rule
+and the dip condition are the agent's to apply). Untouched data is finite: three protocols a
+quarter, each on its own reserve, is the budget.
 
 Fixed defaults per family (a protocol may be stricter, never looser):
 
 - **satellite** (strategies, parameters, filters, sizing, entries, exits, the universe rule) and
   **core** (its rules, the split): data is only candles after the reference universe file's data
-  end, or out-of-sample data never loaded before (e.g. pre-2017 BTC for the core); at least 100
+  end, or out-of-sample data never loaded before (as pre-2017 BTC was, before `core-btc-pre2017-v1`
+  spent it); at least 100
   satellite trades (satellite) or 3 years of days (core). Metric: the combined account's Sharpe,
   changed minus current, same data and costs. Pass: at least +0.10 and the worst dip no more than
   10% deeper (relative). Fail: 0 or less. Inconclusive: in between, or too few trades/days.
@@ -130,12 +152,8 @@ Everything else: do.
 
 ## Working rules
 
-- **The agent checkout.** Work in `~/tradebot-agent` with `--config config-agent.yaml`: the
-  bot's database read-only (`observe_state_dir`), its strategies read-only
-  (`learning.follow_state_dir`; `run` and `learn` refuse), and its own `state/` and `data/` for
-  everything that writes. Code reaches `~/tradebot` only through gate 1; nothing is edited there.
-- **The ledger** (`state/research/ledger.jsonl`) changes only through `tradebot research` and
-  `tradebot gate drawdown`, never by hand. Recorded verdicts are never edited or rerun.
+- **The agent checkout** is `~/tradebot-agent`, with `--config config-agent.yaml` (`run` and
+  `learn` refuse there). Code reaches `~/tradebot` only through gate 1; nothing is edited there.
 - **Fidelity fixes** make the backtest model what live does. Each is followed by a frozen rerun
   on the reference universe file and a ledger note (`research note --id ... --text ...`) on every
   recorded result it affects.

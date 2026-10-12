@@ -74,12 +74,15 @@ def test_the_same_trades_command(tmp_path, monkeypatch, capsys):
     assert new["accepted_by"] == "risk-double-v1" and new["orders"] == changed
     main(base)
     assert "identical" in capsys.readouterr().out.splitlines()[-1]
+    assert any(e.get("kind") == "golden" and e["id"] == "risk-double-v1" for e in protocols.ledger(tmp_path / "state"))
+    with pytest.raises(SystemExit, match="already accepted a golden file"):  # one change per registered test
+        main(base + ["--accept", "risk-double-v1"])
 
 
 def _ledger_pass(state_dir, test_id, family="test"):
     protocols.register(state_dir, _proto(test_id, family, run="tradebot --help"))
     protocols._append(state_dir, {"id": test_id, "kind": "run", "at": "2026-10-10 00:00:00", "command": "x"})
-    protocols.record(state_dir, test_id, "pass", {"metric": 1.0})
+    protocols.record(state_dir, test_id, "pass", {"overall": 0.2, "first_half": 0.15, "second_half": 0.25})
 
 
 # --------------------------------------------------------------------- gate 1: deploy
@@ -103,8 +106,8 @@ def repos(tmp_path, monkeypatch):
     (agent / "README").write_text("a change that doesn't touch trades\n")
     _git(agent, "add", "-A")
     _git(agent, "commit", "-qm", "docs")
-    fake = tmp_path / "docker.py"  # `docker compose up` / `ps`: ps prints a container id
-    fake.write_text("import sys\nprint('c0ffee' if 'ps' in sys.argv else 'built')\n")
+    fake = tmp_path / "docker.py"  # compose build/up print a line, ps a container id, inspect a restart count
+    fake.write_text("import sys\nprint('c0ffee' if 'ps' in sys.argv else '0' if 'inspect' in sys.argv else 'built')\n")
     state = tmp_path / "state"
     state.mkdir()
     return agent, bot, state, (sys.executable, str(fake))
@@ -117,7 +120,7 @@ def _write_golden(repo, positions, accepted_by):
 
 def _deploy(repos, **kw):
     agent, bot, state, docker = repos
-    return dg.deploy(agent, bot, state, run_checks=False, docker=docker, log=lambda *_: None, **kw)
+    return dg.deploy(agent, bot, state, run_checks=False, docker=docker, log=lambda *_: None, settle_s=0, **kw)
 
 
 def test_deploy_fast_forwards_the_bot_and_records_it(repos):
@@ -157,22 +160,48 @@ def test_deploy_of_different_orders_needs_a_passed_registered_test(repos):
     _ledger_pass(state, "change-v1")
     rec = _deploy(repos)
     assert rec["deployed"] and any("accepted by change-v1" in s for s in rec["steps"])
+    _write_golden(agent, [[3]], "change-v1")  # a test accepts one change, not every later one
+    _git(agent, "commit", "-qam", "trades differently again")
+    with pytest.raises(dg.GateFailed, match="already accepted the running commit's orders"):
+        _deploy(repos)
+
+
+def test_deploy_restores_the_bot_checkout_when_the_build_fails(repos, tmp_path):
+    agent, bot, state, (py, fake) = repos
+    before = _git(bot, "rev-parse", "HEAD")
+    broken = tmp_path / "docker-broken.py"
+    broken.write_text("import sys\nsys.exit('build failed' if 'build' in sys.argv else 0)\n")
+    with pytest.raises(dg.GateFailed) as e:
+        dg.deploy(agent, bot, state, run_checks=False, docker=(py, str(broken)), log=lambda *_: None, settle_s=0)
+    assert e.value.step == "docker compose build"
+    assert _git(bot, "rev-parse", "HEAD") == before and not (state / "deploys.jsonl").exists()
+    wrong = tmp_path / "not-a-repo"
+    wrong.mkdir()
+    with pytest.raises(dg.GateFailed) as e:  # a wrong --bot-dir fails at once, dry run included
+        dg.deploy(agent, wrong, state, run_checks=False, docker=(py, fake), log=lambda *_: None, dry_run=True)
+    assert e.value.step == "bot checkout"
 
 
 # --------------------------------------------------------------------- gate 2: protocols
-def _proto(test_id, family="sizing", run="tradebot --help"):
+def _proto(test_id, family="sizing", run="tradebot --help", reserve=None):
     return {"id": test_id, "family": family, "hypothesis": "h", "change": "c", "data": "d", "untouched": "u",
-            "metric": "m", "pass_rule": "p", "readings": {"pass": "a", "fail": "b", "inconclusive": "c"}, "run": run}
+            "reserve": reserve or f"reserve for {test_id}", "metric": "m",
+            "pass_rule": "+0.10 Sharpe overall and on each half of the period",
+            "readings": {"pass": "a", "fail": "b", "inconclusive": "c"}, "run": run}
 
 
 def test_a_protocol_is_registered_run_and_recorded_once_each(tmp_path):
     state = tmp_path / "state"
     bad = _proto("x-v1")
     del bad["untouched"]
+    del bad["reserve"]
     bad["readings"] = {"pass": "a"}
     bad["run"] = "rm -rf /"
+    bad["pass_rule"] = "+0.10 Sharpe"
     problems = protocols.validate(bad)
-    assert "missing 'untouched'" in problems and any("readings" in p for p in problems) and any("run" in p for p in problems)
+    assert "missing 'untouched'" in problems and "missing 'reserve'" in problems
+    assert any("readings" in p for p in problems) and any("run" in p for p in problems)
+    assert any("each half" in p for p in problems)  # the pass rule must hold on each half separately
     with pytest.raises(ValueError, match="not registered"):
         protocols.register(state, bad)
 
@@ -189,12 +218,42 @@ def test_a_protocol_is_registered_run_and_recorded_once_each(tmp_path):
         protocols.run(state, "x-v1")
     with pytest.raises(ValueError, match="verdict must be"):
         protocols.record(state, "x-v1", "maybe", {})
+    with pytest.raises(ValueError, match="each half"):
+        protocols.record(state, "x-v1", "pass", {"overall": 0.2})  # a pass needs both halves
+    with pytest.raises(ValueError, match="each a number"):
+        protocols.record(state, "x-v1", "pass", {"overall": "0.2", "first_half": "", "second_half": False})
+    with pytest.raises(ValueError, match="family floor"):  # sizing is not a family with a floor; satellite is
+        protocols.register(state, _proto("sat-v1", family="satellite"))
+        protocols._append(state, {"id": "sat-v1", "kind": "run", "at": "2026-10-10 00:00:00", "command": "x"})
+        protocols.record(state, "sat-v1", "pass", {"overall": 0.2, "first_half": 0.15, "second_half": 0.05})
+    protocols.record(state, "sat-v1", "pass", {"overall": 0.2, "first_half": 0.15, "second_half": 0.1})
+    assert protocols.passed(state, "sat-v1")
     res = protocols.record(state, "x-v1", "fail", {"sharpe_diff": -0.02})
-    assert res["trials_total"] == 2 and res["trials_in_family"] == 1 and not protocols.passed(state, "x-v1")
+    assert res["trials_total"] == 3 and res["trials_in_family"] == 1 and not protocols.passed(state, "x-v1")  # sat-v1 too
     with pytest.raises(ValueError, match="never edited"):
         protocols.record(state, "x-v1", "pass", {})
     text = protocols.format_status(state)
-    assert "2 trials so far" in text and "sizing-open-risk-budget-v1" in text and "verdict fail" in text
+    assert "3 trials so far" in text and "sizing-open-risk-budget-v1" in text and "verdict fail" in text
+
+
+def test_a_reserve_is_spent_once_and_three_protocols_a_quarter(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setattr(protocols, "_now", lambda: "2026-10-12 00:00:00")  # not the real calendar
+    protocols._append(state, {"id": "core-btc-pre2017-v1", "kind": "registration", "at": "2026-09-28 00:59:53"})
+    protocols.register(state, _proto("a-v1", reserve="reference universe, candles 2026-09-27 to 2026-12-27"))
+    with pytest.raises(ValueError, match="was spent by a-v1"):
+        protocols.register(state, _proto("b-v1", reserve="Reference  universe, candles\n2026-09-27 to 2026-12-27 "))
+    with pytest.raises(ValueError, match="was spent by core-btc-pre2017-v1"):  # an older registration counts too
+        protocols.register(state, _proto("b-v1", reserve="Bitstamp BTC/USD, pre-2017 BTC"))
+    with pytest.raises(ValueError, match="missing 'reserve'"):
+        protocols.register(state, _proto("b-v1", reserve="   "))
+    protocols.register(state, _proto("b-v1", reserve="BTC/USDT 2018, never loaded"))
+    protocols.register(state, _proto("c-v1"))
+    with pytest.raises(ValueError, match="at most 3 per quarter"):
+        protocols.register(state, _proto("d-v1"))
+    monkeypatch.setattr(protocols, "_now", lambda: "2027-01-01 00:00:00")  # next quarter: the budget renews
+    protocols.register(state, _proto("d-v1"))
+    assert protocols.quarter("2026-10-12 19:00:00") == "2026Q4" and protocols.quarter("2026-12-31") == "2026Q4"
 
 
 def test_the_research_commands(tmp_path, capsys):
@@ -305,7 +364,22 @@ def test_the_drawdown_gate_command(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:  # the same dip is handled once
         main(base)
     assert e.value.code == 12 and "Already handled" in capsys.readouterr().out
-    assert len(dd.events(state)) == 1
+    assert len(dd.events(state)) == 1 and dd.events(state)[0]["notified"] is None  # no --notify: not attempted
+
+    # with --notify and no Telegram configured, the message is marked not sent and tried again next time
+    db, t0 = _paper_db(state / "tradebot.db", [(1000, 350), (1100, 380), (700, 250), (600, 200)])
+    db.close()
+    for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(SystemExit):
+        main(base + ["--notify"])
+    assert "Telegram is not configured" in capsys.readouterr().out
+    assert dd.events(state)[-1]["notified"] is False and dd.events(state)[-1]["message"].startswith("Drawdown gate hit")
+    with pytest.raises(SystemExit):
+        main(base + ["--notify"])
+    out = capsys.readouterr().out
+    assert "Already handled" in out and "Telegram is not configured" in out
+    assert len(dd.events(state)) == 3 and dd.events(state)[-1]["resend"] and dd.events(state)[-1]["notified"] is False
 
 
 def test_set_limits_from_the_reference_backtest(tmp_path, monkeypatch, capsys):

@@ -294,17 +294,9 @@ class TradingBot:
         targets = self.core.target_weights(now_ms)
         missing = ([f"{s} price" for s in c.symbols if s not in prices]
                    + [f"{s} daily close" for s in c.symbols if (self.core.last_closes.get(s) or (None,))[0] != day])
-        if missing and now_ms - (day + 86_400_000) < CORE_RETRY_HOURS * 3_600_000:
-            self._core_retry_at = now_ms + CORE_RETRY_EVERY_MS
-            if self._get("core_retry_day") != day:  # once a day in the activity log, not every attempt
-                self._set("core_retry_day", day)
-                self._log("core_retry", {"day": day, "missing": missing}, now_ms)
-            return
-        self._core_retry_at = 0
-        self._set("core_last_day", day)
         quote = self.cfg.exchange.quote
-        if not self.core.initialized:
-            sat, _ = self.equity()
+        if not self.core.initialized:  # the split happens at the first core day whatever the data says, so the
+            sat, _ = self.equity()  # satellite sizes from its own share from this tick on, not after a wait
             amount = sat * c.fraction
             self.broker.transfer(-amount)
             self.core.initialize(amount)
@@ -313,7 +305,16 @@ class TradingBot:
             self._log("core_transfer", {"amount": amount, "why": "core started"}, now_ms)
             self.notify(f"🏛 <b>Core sleeve started</b>: {amount:,.2f} {quote} ({c.fraction:.0%}) moved into the "
                         f"BTC/ETH trend allocation; {sat - amount:,.2f} {quote} stays with the signal strategies.")
-        elif c.rebalance_sleeves_days > 0 and now_ms - self._get("sleeves_last_ms", 0) >= c.rebalance_sleeves_days * 86_400_000:
+        late_h = (now_ms - (day + 86_400_000)) / 3_600_000
+        if missing and late_h < CORE_RETRY_HOURS:
+            self._core_retry_at = now_ms + CORE_RETRY_EVERY_MS
+            if self._get("core_retry_day") != day:  # once a day in the activity log, not every attempt
+                self._set("core_retry_day", day)
+                self._log("core_retry", {"day": day, "missing": missing}, now_ms)
+            return
+        self._core_retry_at = 0
+        self._set("core_last_day", day)
+        if c.rebalance_sleeves_days > 0 and now_ms - self._get("sleeves_last_ms", 0) >= c.rebalance_sleeves_days * 86_400_000:
             self._rebalance_sleeves(now_ms, prices)
         before = {"cash": self.core.cash, "holdings": self.core.holdings}  # the state the rebalance started from
         trades = self.core.rebalance(now_ms, prices, targets)
@@ -321,8 +322,8 @@ class TradingBot:
                                **before, "trades": len(trades), **({"incomplete": missing} if missing else {})},
                   now_ms)
         if missing:
-            self._notify_error(f"core rebalanced {CORE_RETRY_HOURS}h after the close without "
-                               f"{', '.join(missing)}: those coins were left alone today", key="core-data")
+            self._notify_error(f"core rebalanced {late_h:.1f}h after the close without {', '.join(missing)}: those "
+                               f"coins were left alone today", key="core-data")
         if trades:
             self.notify(fmt.format_core_rebalance(trades, self.core.weights, self.core.equity(prices), quote))
 

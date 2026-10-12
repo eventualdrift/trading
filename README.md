@@ -546,7 +546,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot gate same-trades [--accept id]` | replay the live path on the fixed dataset and compare its orders with the golden file (`--accept`: rewrite it for a change that passed that registered test) |
 | `tradebot gate deploy [--dry-run] [--bot-dir ~/tradebot]` | lint, suite, fresh-clone suite, same-trades; then fast-forward the bot's checkout and restart its container |
 | `tradebot gate drawdown [--set-limits --reference f --paper-from t] [--notify]` | the drawdown limits (set once) and the daily check: on a hit, reconcile and range check |
-| `tradebot research register --file p.yaml` → `run --id` → `record --id --verdict --numbers` | a registered test from the CLAUDE.md template: registered, run and recorded once each |
+| `tradebot research register --file p.yaml` → `run --id` → `record --id --verdict --numbers` | a registered test from the CLAUDE.md template: registered, run and recorded once each; three a quarter, each on its own untouched reserve; a pass holds on each half of the period |
 | `tradebot research protocols` | every test in the ledger, with the trial count |
 | `tradebot notify --text "..."` (or `--file`) | a Telegram message to the owner |
 | `tradebot telegram-test` | Telegram setup helper |
@@ -607,7 +607,7 @@ tradebot/
   weekly.py       the weekly check-in, its STATUS.md entry and Telegram summary
   protocols.py    registered tests: template check, register, run once, record once, trial counts
   gates/          same-trades replay (fixed dataset + golden orders), deploy gate, drawdown gate
-scripts/          weekly.sh (Monday), daily.sh (drawdown gate), install-cron.sh
+scripts/          weekly.sh (Monday), daily.sh (drawdown gate), backup.sh (nightly), install-cron.sh
 tests/            293 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 CLAUDE.md         rules for the agent working on this repo (hard rules, the gates, protocol template, when to ask)

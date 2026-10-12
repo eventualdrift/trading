@@ -61,6 +61,29 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
     for up to 6 hours after the close; then it goes ahead with what it has (`core_retry` and
     `core_day.incomplete` in the activity log). Same-trades: identical orders. It reaches paper
     with the deploy above.
+- [ ] **The daily loss limit in the account replay** (fidelity fix, from the 10-04 to 10-12 reconcile:
+  10-08 16:00 OGN momentum@4h, paper "skipped: daily loss limit reached", backtest taken, one knock-on
+  after it). Live stops opening trades for the UTC day after -3% (`risk.daily_loss_limit_pct`); the
+  replay never does. The max-drawdown halt (`risk.max_drawdown_pct`) is the same kind of rule.
+  - Done when: the replay applies both from its own equity path, a test shows a day that trips the
+    limit skips the same signals live would, the frozen reference rerun and ledger notes follow,
+    and the same-trades check stays identical (live is unchanged).
+- [ ] **Reconcile: the coin list at the scan, not at the close.** The six paper-only signals of
+  BACKLOG b were candles closing at 10-04 00:00 and 08:00 scanned 24-36 minutes later with a coin
+  list refreshed on waking (GLMR, STRK, BEAMX had just entered the top 30). The reconcile keys the
+  backtest's list at the candle close plus a lag, so it doesn't replay them ("not replayed").
+  - Done when: a logged scan's own time picks the list (within a minute), the six become shared
+    rows judged by the replay, and the first weekly window's "paper only" count drops to the
+    signals whose strategy was really not in force.
+- [ ] **Extend the same-trades dataset** (owner, 2026-10-12) so the replay exercises what the
+  golden file can't see today: stale candles (a feed that publishes a candle late), fetch
+  failures (a price or candle fetch that errors, then recovers) and an ML model in use (a stored
+  model that filters and sizes signals, so a change to that path shows up as different orders).
+  - Done when: `tradebot/gates/data/` carries a second, stored scenario file for each (never
+    regenerated), the replay runs them through the real bot after the plain one, the golden file
+    records their orders, and `gate same-trades` on this code reports identical orders. The
+    golden file for the new scenarios is written with `--init`-like first-time logic for the new
+    section only; the existing orders stay byte-identical.
 - [ ] **Live vs backtest candle history** - live computes indicators on the last 1000 candles at
   most, the backtest on the full history. Signals reported as "scanned, live found no signal" (and
   paper-only "entry condition false on the full history") measure the difference.

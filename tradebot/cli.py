@@ -233,7 +233,9 @@ def ml_status(model, report_path, switched_off: bool = False) -> str:
     if report_path.exists():
         last = json.loads(report_path.read_text())
         lines.append(f"  Last learn's ML training ({when(last.get('trained_at'))} UTC): "
-                     + ("PROMOTED" if last.get("promoted") else f"not deployed - {last.get('reason', '')}"))
+                     + ("PROMOTED" if last.get("promoted") else f"not deployed - {last.get('reason', '')}")
+                     + (" - from before the switch-off; no model is used and learn trains none now" if switched_off
+                        else ""))
     return "\n".join(lines)
 
 
@@ -749,6 +751,11 @@ def _gate_drawdown(args, cfg):
     for ev in reversed(dd.events(state_dir)):  # a hit is handled once: the same dip is not re-reported daily
         if ev.get("key") == key:
             print(f"Already handled at {ev['at']}: {ev['outcome']} (see drawdown-events.jsonl)")
+            if args.notify and ev.get("notified") is False and ev.get("message"):  # it didn't go out then
+                err = _telegram_send(cfg, ev["message"])
+                dd.record_event(state_dir, {**ev, "at": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()),
+                                            "notified": err is None, "resend": True})
+                print(err or "sent")
             sys.exit({"in range": 10, "outside range": 11}.get(ev["outcome"], 12))
     starts = [t for t in (st["account_peak_ms"] if "account" in which else None,
                           st["satellite_peak_ms"] if "satellite" in which else None,
@@ -769,10 +776,6 @@ def _gate_drawdown(args, cfg):
     out_dir.mkdir(exist_ok=True)
     report = out_dir / f"drawdown-{_time.strftime('%Y-%m-%d-%H%M', _time.gmtime())}.txt"
     report.write_text(text + "\n")
-    event = {"at": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()), "key": key, "state": st, "ranges": ranges,
-             "mechanics_ok": mechanics_ok, "reconcile": {**rc, **up}, "outcome": result, "report": str(report),
-             "reproduce": reproduce}
-    dd.record_event(state_dir, event)
     next_step = {"in range": "recorded as in range; trading continues",
                  "outside range": "outside the backtest's range with correct mechanics: register a test (gate 2)",
                  "mechanics differ": "paper's mechanics differ from the backtest's: fix them (see the report)"}[result]
@@ -781,10 +784,16 @@ def _gate_drawdown(args, cfg):
                      f"({'in' if r['in_range'] else 'outside'} range).\n" for w, r in ranges.items())
            + f"Outcome: {result} - {next_step}. Reconcile: {report}")
     print(msg)
+    notified = None
     if args.notify and result != "in range":  # in range is recorded and shows in the weekly summary
         err = _telegram_send(cfg, msg)
+        notified = err is None
         if err:
             print(err)
+    dd.record_event(state_dir, {"at": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()), "key": key, "state": st,
+                                "ranges": ranges, "mechanics_ok": mechanics_ok, "reconcile": {**rc, **up},
+                                "outcome": result, "report": str(report), "reproduce": reproduce,
+                                "message": msg, "notified": notified})
     sys.exit({"in range": 10, "outside range": 11, "mechanics differ": 12}[result])
 
 
@@ -890,6 +899,8 @@ def cmd_weekly(args, cfg):
     if args.notify:
         err = _telegram_send(cfg, wk.telegram_summary(wk.today(), code, numbers, needs))
         print(err or "Telegram summary sent")
+        if err:
+            sys.exit(3)  # written, not sent: scripts/weekly.sh still commits and pushes
 
 
 def _research_protocols(args, cfg):
@@ -918,6 +929,9 @@ def _research_protocols(args, cfg):
                   f"Apply the registered pass rule, then: tradebot research record --id {args.id} --verdict ...")
         else:
             numbers = json.loads(args.numbers) if args.numbers else {}
+            if not isinstance(numbers, dict):
+                sys.exit("--numbers must be a JSON object, e.g. '{\"overall\": 0.12, \"first_half\": 0.1, "
+                         "\"second_half\": 0.15}'")
             entry = protocols.record(state, args.id or "", args.verdict or "", numbers, args.text or "")
             print(f"Recorded {args.id}: {entry['verdict'].upper()} ({entry['trials_total']} trials so far, "
                   f"{entry['trials_in_family']} in this family).")
@@ -936,7 +950,7 @@ def cmd_gate(args, cfg):
 def _gate_same_trades(args, cfg):
     """Gate 1: replay the live path on the fixed dataset and compare its orders with the golden file."""
     from .gates import same_trades as st
-    from .protocols import passed
+    from .protocols import _append, ledger, passed
     from .provenance import code_version
 
     golden = st.load_golden()
@@ -946,7 +960,18 @@ def _gate_same_trades(args, cfg):
     if args.accept:
         if not passed(cfg.state_path, args.accept):
             sys.exit(f"{args.accept} has no passing verdict in the ledger: the golden file stays as it is.")
+        used = [e for e in ledger(cfg.state_path) if e.get("kind") == "golden" and e.get("id") == args.accept]
+        if used:
+            sys.exit(f"{args.accept} already accepted a golden file ({used[0]['at']}): a registered test accepts one "
+                     f"change. Another change is another protocol.")
+        import hashlib
+        import json
+        import time as _time
+
         st.write_golden(orders, args.accept, code_version())
+        _append(cfg.state_path, {"id": args.accept, "kind": "golden", "at": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()),
+                                 "code": code_version(), "orders_sha256": hashlib.sha256(
+                                     json.dumps(orders, sort_keys=True).encode()).hexdigest()})
         print(f"Golden file rewritten, accepted by {args.accept}: {st.summary(orders)}")
         return
     if golden is None:

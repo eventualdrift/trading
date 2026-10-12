@@ -13,7 +13,7 @@ from tradebot.execution import PaperBroker
 from tradebot.learning import load_context
 from tradebot.notify import MemoryNotifier
 from tradebot.reconcile import (Reconciliation, Timeline, format_reconciliation, format_uptime, reconcile,
-                                uptime, write_csv)
+                                selection_timeline, uptime, write_csv)
 from tradebot.timeframes import drop_unclosed
 
 DAY = 86_400_000
@@ -314,3 +314,44 @@ def test_a_core_target_missing_at_the_bots_check_is_explained(core_run, tmp_path
     missing = [d for d in rec.core_days if d["day"] == int(logged["day"])]
     assert len(missing) == 2 and all("no daily candles at its check" in d["why"] for d in missing)
     assert "no daily candles at its check" in format_reconciliation(rec, cfg)
+
+
+def test_a_core_day_that_waited_for_data_is_explained(core_run, tmp_path):
+    cfg, db, closes, since, end = core_run
+    db2 = copy_db(db, tmp_path / "core-wait.db")
+    days = db2.botlog("paper", "core_day")
+    ts, logged = days[6]  # waited two hours for the candle, then rebalanced on it (same targets as the backtest)
+    day = int(logged["day"])
+    db2.log_bot(day + DAY + 60_000, "paper", "core_retry", {"day": day, "missing": ["BTC/USDT daily close"]})
+    db2._conn.execute("UPDATE botlog SET ts=? WHERE kind='core_day' AND ts=?", (day + DAY + 2 * 3_600_000, ts))
+    ts2, logged2 = days[8]  # the wait ran out: went ahead without ETH's candle, leaving ETH alone that day
+    day2 = int(logged2["day"])
+    logged2["targets"]["ETH/USDT"] = None
+    logged2["incomplete"] = ["ETH/USDT daily close"]
+    db2._conn.execute("UPDATE botlog SET data=?, ts=? WHERE kind='core_day' AND ts=?",
+                      (json.dumps(logged2), day2 + DAY + 6 * 3_600_000 + 60_000, ts2))
+    rec = reconcile(db2, cfg, {}, None, closes, since, end, None, [])
+    waits = {w["day"]: w for w in rec.core_waits}
+    assert waits[day]["waited"] and waits[day]["waited_h"] == pytest.approx(2.0, abs=0.05)
+    assert waits[day]["missing"] == ["BTC/USDT daily close"] and waits[day]["first_check_h"] < 0.1
+    assert waits[day2]["incomplete"] == ["ETH/USDT daily close"] and not waits[day2]["waited"]
+    assert waits[day2]["first_check_h"] > 6  # no core_retry entry: the bot's first check was already too late to wait
+    eth = [d for d in rec.core_days if d["day"] == day2 and d["symbol"] == "ETH/USDT"][0]
+    assert "first check came 6.0h after the close, more than 6h, with no daily close: it went ahead" in eth["why"]
+    text = format_reconciliation(rec, cfg)
+    assert "2 days the core's data was late" in text and "went ahead without ETH/USDT daily close" in text
+    assert "waited 2.0h, first missing BTC/USDT daily close" in text and "no wait (the close was already" in text
+
+
+def test_the_first_logged_selection_is_in_force_from_its_learn():
+    """A restart logs the selection it loaded; that selection was in force since the learn that made it."""
+    t_log = 1_759_157_700_000  # 2026-09-29 14:55: the restart that logged it
+    made = 1_758_969_540.0  # 2026-09-27 10:39: the learn
+    logged = {"combos": [{"strategy": "momentum", "timeframe": "4h", "params": {}}], "created_at": made, "ml": False}
+    today = {"combos": [{"strategy": "momentum", "timeframe": "1h", "params": {}}]}
+    tl = selection_timeline([(t_log, logged)], today)
+    assert tl.first == int(made * 1000)
+    assert tl.at(t_log - DAY) is logged  # between the learn and the restart: the logged one, not today's
+    assert tl.at(int(made * 1000) - 1) is today  # before the learn: today's selection assumed
+    assert selection_timeline([(t_log, {"combos": [], "created_at": None})], today).at(t_log - DAY) is today
+    assert selection_timeline([], today).at(t_log) is today and selection_timeline([], today).first is None

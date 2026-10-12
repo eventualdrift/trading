@@ -133,7 +133,11 @@ def reconcile_summary(rec) -> tuple[list[str], dict]:
     if days or rec.core_trades:
         lines.append(f"- Core: targets match {same} of {len(days)} coin-days; rebalance rule differs on "
                      f"{len(rec.core_rule_diffs)} coin-days; {len(rec.core_trades)} trades"
-                     + (f"; {len(rec.core_days_missing)} days with no core check" if rec.core_days_missing else ""))
+                     + (f"; {len(rec.core_days_missing)} days with no core check" if rec.core_days_missing else "")
+                     + (f"; waited for the day's data on {len(rec.core_waits)} days"
+                        + (f" ({sum(bool(w['incomplete']) for w in rec.core_waits)} went ahead without it)"
+                           if any(w["incomplete"] for w in rec.core_waits) else "")
+                        if getattr(rec, "core_waits", None) else ""))
     unexplained = int(sum(n for k, n in reasons.items() if k.startswith(("no scan recorded", "scanned"))))
     return lines, {"first_differences": len(first), "core_target_mismatch": len(days) - same,
                    "core_rule_diffs": len(rec.core_rule_diffs), "late_exits": len(late),

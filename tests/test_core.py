@@ -211,4 +211,19 @@ def test_after_six_hours_the_core_goes_ahead_with_what_it_has(core_bot):
     bot.tick(market.now_ms())
     _, d = db.botlog("paper", "core_day")[-1]
     assert d["day"] == close - DAY and d["incomplete"] == ["BTC/USDT daily close", "ETH/USDT daily close"]
-    assert any("core rebalanced 6h after the close" in m for m in notes.messages)
+    assert any("core rebalanced 6.0h after the close" in m for m in notes.messages)
+
+
+def test_the_first_core_day_splits_the_account_before_any_wait(core_bot, cfg):
+    """The 65/35 split happens at the first core day even while the day's candle is missing, so the
+    satellite sizes from its share from that tick on; the rebalance itself waits for the data."""
+    market, db, broker, notes, bot = core_bot
+    close = market.start_ms + 206 * DAY
+    _stale_daily_feed(market, until_ms=close + 3 * 3_600_000)
+    market.set_now(close + 30_000)
+    bot.tick(market.now_ms())
+    assert bot.core.initialized and broker.cash == pytest.approx(350.0)
+    assert not db.botlog("paper", "core_day") and len(db.botlog("paper", "core_retry")) == 1
+    market.set_now(close + 3 * 3_600_000 + 60_000)
+    bot.tick(market.now_ms())
+    assert len(db.botlog("paper", "core_day")) == 1 and bot.core.contributed == pytest.approx(650.0)  # once

@@ -16,8 +16,21 @@ import sys
 import time
 from pathlib import Path
 
-REQUIRED = ("id", "family", "hypothesis", "change", "data", "untouched", "metric", "pass_rule", "readings", "run")
+REQUIRED = ("id", "family", "hypothesis", "change", "data", "untouched", "reserve", "metric", "pass_rule", "readings",
+            "run")
 VERDICTS = ("pass", "fail", "inconclusive")
+PER_QUARTER = 3  # at most this many protocols registered in a calendar quarter (CLAUDE.md, gate 2)
+HALVES = ("overall", "first_half", "second_half")  # a pass holds on each half of the untouched period, and overall
+# The family floors from CLAUDE.md (a protocol may be stricter, never looser): the metric, changed minus
+# current, at least +0.10 for satellite / core / ml; the drawdown range check, a share, under 5%.
+FLOORS = {"satellite": ("at least", 0.10), "core": ("at least", 0.10), "ml": ("at least", 0.10),
+          "drawdown": ("under", 0.05)}
+# Registrations from before the template (no reserve field) and the untouched data they judged a change on
+LEGACY_SPENT = {"core-btc-pre2017-v1": "pre-2017 BTC"}
+
+
+def _norm(x) -> str:
+    return " ".join(str(x or "").split()).lower()
 
 
 def folder(state_dir) -> Path:
@@ -54,13 +67,23 @@ def trial_ids(entries: list[dict], family: str | None = None) -> list[str]:
     return ids
 
 
+def quarter(at: str) -> str:
+    """'2026-10-12 ...' -> '2026Q4'."""
+    y, m = int(at[:4]), int(at[5:7])
+    return f"{y}Q{(m - 1) // 3 + 1}"
+
+
 def validate(proto: dict) -> list[str]:
-    problems = [f"missing '{k}'" for k in REQUIRED if not proto.get(k)]
+    problems = [f"missing '{k}'" for k in REQUIRED
+                if not proto.get(k) or (isinstance(proto.get(k), str) and not proto[k].strip())]
     readings = proto.get("readings") or {}
     if not isinstance(readings, dict) or not readings.get("pass") or not readings.get("fail"):
         problems.append("readings needs at least 'pass' and 'fail'")
     if proto.get("run") and not str(proto["run"]).startswith("tradebot "):
         problems.append("run must be a single `tradebot ...` command")
+    if proto.get("pass_rule") and "half" not in str(proto["pass_rule"]).lower():
+        problems.append("pass_rule must say that the pass holds on each half of the untouched period separately as "
+                        "well as overall (the run prints the metric overall and per half)")
     return problems
 
 
@@ -71,8 +94,21 @@ def register(state_dir, proto: dict) -> dict:
     entries = ledger(state_dir)
     if any(e.get("id") == proto["id"] for e in entries):
         raise ValueError(f"{proto['id']} is already in the ledger: a second look needs a new id (and counts as a trial)")
+    mine = _norm(proto["reserve"])
+    for e in entries:  # a reserve is spent once: the same name, or one containing the other, is refused
+        if e.get("kind") != "registration":
+            continue
+        theirs = _norm((e.get("protocol") or {}).get("reserve") or LEGACY_SPENT.get(e.get("id"), ""))
+        if theirs and (theirs == mine or theirs in mine or mine in theirs):
+            raise ValueError(f"the untouched reserve {proto['reserve']!r} was spent by {e['id']} ({theirs!r}): data a "
+                             f"protocol has judged a change on is not untouched any more; name another reserve")
+    now = _now()
+    this_quarter = [e for e in entries if e.get("kind") == "registration" and quarter(str(e.get("at", ""))) == quarter(now)]
+    if len(this_quarter) >= PER_QUARTER:
+        raise ValueError(f"{PER_QUARTER} protocols are already registered in {quarter(now)} "
+                         f"({', '.join(e['id'] for e in this_quarter)}): at most {PER_QUARTER} per quarter")
     canon = json.dumps(proto, sort_keys=True)
-    entry = {"id": proto["id"], "kind": "registration", "at": _now(), "protocol": proto,
+    entry = {"id": proto["id"], "kind": "registration", "at": now, "protocol": proto,
              "sha256": hashlib.sha256(canon.encode()).hexdigest(),
              "trial": len(trial_ids(entries)) + 1,
              "family_trial": len(trial_ids(entries, proto["family"])) + 1}
@@ -111,8 +147,18 @@ def record(state_dir, test_id: str, verdict: str, numbers: dict, note: str = "")
         raise ValueError(f"{test_id} has not run (tradebot research run --id {test_id})")
     if _entries(state_dir, test_id, "result"):
         raise ValueError(f"{test_id} already has a verdict; verdicts are never edited")
-    entries = ledger(state_dir)
     family = reg[-1]["protocol"]["family"]
+    if verdict == "pass":
+        vals = {k: numbers.get(k) for k in HALVES}
+        if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) for v in vals.values()):
+            raise ValueError(f"a pass needs the metric {', '.join(HALVES)} in --numbers, each a number: it must hold on "
+                             f"each half of the untouched period separately as well as overall")
+        side, floor = FLOORS.get(family, (None, None))
+        short = [k for k, v in vals.items() if (side == "at least" and v < floor) or (side == "under" and v >= floor)]
+        if short:
+            raise ValueError(f"not a pass for family {family}: {', '.join(f'{k}={vals[k]}' for k in short)} "
+                             f"({side} {floor} is the family floor, on each half and overall)")
+    entries = ledger(state_dir)
     return _append(state_dir, {"id": test_id, "kind": "result", "at": _now(), "verdict": verdict,
                                "numbers": numbers, "note": note, "trials_total": len(trial_ids(entries)),
                                "trials_in_family": len(trial_ids(entries, family))})
