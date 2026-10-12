@@ -355,3 +355,149 @@ handoff); the VM session runs them from here. `git pull` in `~/tradebot-agent` f
    `scripts/install-cron.sh`.
 2. BACKLOG a, b, c: `report` and the two reconciles on the bot's data, recorded here and ticked.
 3. a2, the ML filter in the replay, then its `ml` protocol.
+
+## 2026-10-12 - weekly check-in (`tradebot weekly`)
+
+Code 391661c · settings 75a58dc389
+
+**What changed**
+- code ae152bd -> 391661c: 391661c Owner's CLAUDE.md edits; review fixes for the gates; late core days explained; a6e31ae CLAUDE.md for the hands-free regime; BACKLOG and STATUS for the gates; 71f9573 Gates that replace approvals; ML filter off; core waits for the day's candle; 4d523da STATUS.md: handoff to the local session on the VM; 95a589f STATUS.md: session entry for 2026-10-07; df433c8 One settings hash; agent reads the bot read-only; ML and mismatch reporting
+- setting data.dir: saved 'data', now '/home/tradebot/tradebot-agent/data'
+- learn of 2026-10-04 01:25 (in force from 10-07 23:29): a new ML model
+- learn of 2026-10-10 18:43 (in force from 10-10 18:43): added momentum@1h; dropped momentum@4h
+
+**What the numbers say**
+- Uptime 79% of the week; 33 gaps: 33 computer asleep (35.8h)
+  Most down: Tue 10-06 24.0h, Wed 10-07 9.8h, Mon 10-05 2.0h
+- Signals: backtest 88, paper 88, both 88; taken vs skipped agree 81 of 88 (1 first differences, 6 knock-on)
+- ML filter on: 68 of 88 scored signals filtered out (as backtest trades: 5 won of 49, total -36.7R); 20 sized up by confidence
+  First difference 10-08 16:00 OGN/USDT momentum@4h: a live-only check (daily loss limit reached)
+- Fills: 4 shared entries, entry +92.5 bps vs modelled; 4 shared exits, exit -831 bps, R paper - backtest +0.56
+- Core: targets match 14 of 14 coin-days; rebalance rule differs on 0 coin-days; 1 trades
+- Frozen reference rerun, from the satellite's first trade (2023-01-14):
+  65%/35%                           +29.4%/yr, worst dip  -24.3%, Sharpe 1.10
+  core only                         +38.9%/yr, worst dip  -30.7%, Sharpe 1.11
+  core at same exposure (77%)       +30.9%/yr, worst dip  -24.3%, Sharpe 1.12
+  satellite only                     +9.8%/yr, worst dip  -21.1%, Sharpe 0.59
+  Strategy selection: saved with the run
+- Drawdown gate: account 0.0% (limit 36.5%), satellite 0.0% (limit 31.7%), losing run 0 (limit 11), over 0.0 days, 0 trades
+- Full reports: reports/weekly/2026-10-12-2200
+
+Reproduce:
+    tradebot reconcile --since "2026-10-05 22:00" --end "2026-10-12 22:00"
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@ae152bd-178b23c9a0.json
+
+**What needs you**
+- Uptime 79% (under 95%): paper can't be compared with the backtest while the bot is down
+- 1 first difference(s) between paper and the backtest's decisions
+- The ML filter was on in this window: paper filtered and sized signals the backtest doesn't model (it is off in code, config.ML_IN_REPLAY, once that commit is deployed)
+- Settings changed since last week: data.dir: saved 'data', now '/home/tradebot/tradebot-agent/data'
+- Learn changed the strategy selection (in-sample: informational, not evidence)
+- The frozen reference rerun moved since last week (combined Sharpe 1.07 -> 1.10, satellite Sharpe 0.50 -> 0.59): check whether a conclusion changes
+
+**What's next** (BACKLOG.md)
+- a. The ML filter: what it did
+- a2. The ML filter in the account replay. The replay takes every signal at 1x; with the
+- b. The 6 paper-only signals after 10-03 12:00 (paper 51, both 45 in the first weekly).
+
+## 2026-10-12 - session: on the box; gates live; BACKLOG a, b, c from the bot's data
+
+Code 391661c (the box's agent checkout; **not on GitHub**: the box has no push credentials, see
+What needs you). The weekly entry above is this Monday's, from the same run that sent the
+Telegram summary.
+
+**What changed** (391661c)
+- **Deployed through gate 1** at 22:18 UTC (`state/deploys.jsonl`): dry run, then the real run;
+  every step passed (lint, suite, fresh-clone suite, same-trades identical: 51 positions, 260
+  signals, 9 core trades); the container was rebuilt from 391661c and stayed up 45 s without a
+  restart. The bot runs with the ML filter off ("ML filter: not active" in its log) and the core
+  fetch-first fix. 4d523da ran before it, since 10-07.
+- **CLAUDE.md, the owner's edits**: the agent writes only to its own state and data, and the
+  ledger changes only through `tradebot research`, are hard rules again. The protocol template
+  names the untouched reserve it spends; a pass holds on each half of the period as well as
+  overall; three protocols a quarter. The commands enforce them: `register` refuses a spent
+  reserve (the older `core-btc-pre2017-v1` spent pre-2017 BTC) and a fourth protocol in a quarter;
+  `record --verdict pass` needs the three numbers at or past the family floor.
+- **Review of the gate code** before the deploy (five lenses, one verified finding and sixteen
+  judged by hand): the deploy gate checks the bot checkout first, reads the running commit from the
+  container, builds before it switches the checkout (a failed build puts it back) and watches the
+  container settle; a registered test accepts one golden file (`--accept` is in the ledger); a
+  drawdown hit whose Telegram message failed is sent again; `weekly` exits 3 when only the summary
+  failed; the cron scripts abort a failed rebase, STATUS.md merges by union, and the backup uses
+  the venv's sqlite (the box has no `sqlite3`; the first backup is in `~/backups`: 853 snapshots,
+  14 positions in the copy).
+- **Core**: the 65/35 split happens at the first core day even while the day's candle is missing
+  (before, the wait delayed it and the satellite sized from the whole account meanwhile); the
+  error message says how late the close was. The reconcile explains the days the core waited or
+  went ahead without data, and takes the first logged selection as in force from its learn, not
+  from the restart that logged it: the pre-09-29 windows now replay the right strategies.
+- **Drawdown limits set** (`drawdown-limits-v1`, in the ledger): account 36.5%, satellite 31.7%,
+  losing run 11 (the reference's like-for-like window from 2023-01-14: worst dips 24.3% and 21.1%
+  x 1.5, longest run over 508 trades); watching paper from 2026-10-12 22:18. The first daily run:
+  0.0% / 0.0% / 0 over 0 days.
+- **Telegram** from the agent's own `.env`: "agent checkout ready" and the weekly summary went out.
+  **Cron** installed: Monday 06:17 weekly, daily 06:47 drawdown gate, daily 03:31 backup.
+- **Ledger notes**: the replay notes on `sizing-open-risk-budget-v1` and `core-robustness` (both
+  judged under the pre-4e812f4 replay; verdicts stand), and the process note and reading on
+  `core-btc-pre2017-v1`.
+- Tests: 298 pass (repo, fresh clone, and the deploy gate's own runs).
+
+**What the numbers say** (from the bot's database, read-only; windows reproduced by the lines below)
+- **a. The ML filter.** The learn of 10-04 01:25 UTC promoted a model (threshold 40%, trained to
+  10-03); the filter was on from 10-04 02:25 until the deploy. The 10-10 learn kept it (t=0.76
+  < 2.5) and re-selected momentum@1h in place of momentum@4h. 09-27 to 10-03 12:00: off, nothing
+  scored. 09-28 to 10-05: 10 signals scored, 6 filtered out, 4 passed, 4 sized up x1.03 on
+  average (their backtest trades were still open at the data end). 10-04 to 10-12: 89 scored,
+  65 filtered out (as backtest trades: 5 won of 32 completed, -21.6R in total), 24 passed (8 won
+  of 15, +10.2R), 24 sized up x1.06 on average, x1.16 at most. Reading: eight days of candidate
+  trades, not evidence either way; the path is a2 (model it in the replay), then an `ml`
+  protocol.
+- **b. The six paper-only signals** (first weekly window, paper 51, both 45): 10-04 00:24 GLMR
+  momentum@1d, GLMR breakout@1d, STRK momentum@1d, STRK breakout@1d, STRK momentum@4h; 10-04
+  12:36 BEAMX momentum@4h. All six are candles that closed at 00:00 / 08:00, scanned 24-36 minutes
+  later with a coin list refreshed on waking: GLMR and STRK entered the top 30 at 00:24, BEAMX at
+  12:36. The reconcile keys the backtest's list at the candle close, so it doesn't replay them
+  ("not replayed"). Not a bot fault; the reconcile refinement is in BACKLOG. The 10-04 learn
+  did not change the selection (the same three combos); the 10-10 learn did.
+- **c. The two core coin-days** (10-04 BTC and ETH, "paper 1.0 vs backtest None"): the backtest
+  side had no 10-04 daily candle in the Mac's run of 10-05 00:00; the same window rerun here
+  gives 12 of 12, 09-27 to 10-03 gives 8 of 8, 10-04 to 10-12 18 of 18, the weekly 14 of 14.
+  Paper's targets were right. The fetch-first fix is deployed regardless: the failed-fetch case it
+  covers is real on any restart.
+- **The frozen reference rerun moved** (weekly: combined Sharpe 1.07 -> 1.10, satellite 0.50 ->
+  0.59). Cause found: ae152bd and 391661c on the box's data give the same numbers to the end
+  value (2,594 and 1,411), so the code didn't move it; the candle cache on the box (copied after
+  the bot's 10-10 learn) differs from the Mac's of 10-05 before the data end. The restated
+  finding stands: 65/35 vs the core at the same exposure, Sharpe 1.10 vs 1.12, worst dip equal,
+  "does not beat it"; the break-even line flipped to yes (0.59 vs 0.52), within the 0.1 that
+  implementation details move. The agent's `data/` is the reference cache from now on; pinning
+  the candles in universe files is in BACKLOG.
+- **This week on the box** (the weekly entry above): uptime 79%, all of it the Mac's last days
+  (10-05 to 10-07); 10-08 to 10-12 have no gaps. One first difference: the daily loss limit, a
+  live rule the replay doesn't model (BACKLOG, fidelity).
+- Reproduce (from `~/tradebot-agent`, `--config config-agent.yaml`):
+    tradebot reconcile --since "2026-09-27 00:00" --end "2026-10-03 12:00"
+    tradebot reconcile --since "2026-09-28 00:00" --end "2026-10-05 00:00"
+    tradebot reconcile --since "2026-10-04 00:00" --end "2026-10-12 00:00"
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@ae152bd-178b23c9a0.json
+    tradebot gate same-trades
+    tradebot gate drawdown
+
+**What needs you**
+- **Push credentials on the box** (gate 4 can't resolve this): `~/tradebot-agent` has an https
+  remote and no deploy key, credential helper or `gh` login, so nothing pushes from here: not
+  this session's commits (391661c and the STATUS commit), not Monday's STATUS.md. DEPLOY.md step
+  3 (a deploy key with write access, the `github-tradebot` host alias, the remote switched to it)
+  fixes it. Until then GitHub is at a6e31ae and the box is ahead.
+- **The daily loss limit and the max-drawdown halt** (hard rule: paper runs only what the backtest
+  models). Both are live rules the account replay doesn't model; the 10-08 OGN signal was skipped
+  by the first. My recommendation: model them in the replay (BACKLOG, next up; a fidelity fix on
+  the backtest side) rather than switch off risk controls meanwhile. Say if you want them off
+  until then; otherwise they stay on and the replay catches up.
+
+**What's next**
+1. The daily loss limit and the drawdown halt in the account replay, then a frozen rerun and
+   ledger notes.
+2. The reconcile's coin list at the scan; pin the candles in universe files.
+3. a2: the ML filter in the replay, then its `ml` protocol.
+4. The same-trades dataset extended to stale candles, fetch failures and a model in use.

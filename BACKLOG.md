@@ -11,17 +11,6 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Open
 
-- [ ] **On the box, first** (these need the VM: this cloud checkout can't reach it).
-  - Deploy the branch head through gate 1: `tradebot --config config-agent.yaml gate deploy
-    --dry-run`, then without `--dry-run`. It carries the ML filter off and the core fix (below).
-  - Set the drawdown limits, once, watching paper from that deploy:
-    `gate drawdown --set-limits --reference reports/universe-20260927-1513@ae152bd-178b23c9a0.json
-    --paper-from "<UTC time of the deploy>"`.
-  - The agent's `.env` with the Telegram lines; `notify --text "agent checkout ready"` arrives.
-  - `scripts/install-cron.sh` (Monday weekly + Telegram summary + push; daily drawdown gate;
-    backups).
-  - Done when: `deploys.jsonl` has the deploy, `report` says "ML filter: OFF", the limits are in
-    the ledger, `crontab -l` shows the three jobs, and STATUS.md records all four.
 - [ ] **a. The ML filter: what it did** - the reconciliation over 09-27 to 10-03 found it on (the
   old "inactive" note here was wrong). It is on whenever a promoted model file exists, and a learn
   that doesn't promote a new model keeps the old one.
@@ -32,9 +21,9 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   - Done when: STATUS.md records, from `report` and a reconcile on the bot's data over 09-27 to
     10-03 and the weekly window, whether the 10-03 learn deployed a model (to "What changed"), how
     many signals it blocked, and their outcomes.
-  - The owner switched the filter and its sizing off on 2026-10-10 (CLAUDE.md, hard rule: paper
-    runs only what the backtest models): `ML_IN_REPLAY = False` in `tradebot/config.py`. It is off
-    in paper from the deploy above.
+  - Recorded (STATUS.md 2026-10-12): the learn of 10-04 01:25 promoted a model (threshold 40%,
+    trained to 10-03); the filter was on from 10-04 02:25 to the deploy of 10-12 22:18. Off in
+    code since 391661c (`ML_IN_REPLAY = False`).
 - [ ] **a2. The ML filter in the account replay.** The replay takes every signal at 1x; with the
   filter on, paper filtered some and sized others up to 1.5x. Needed before the `ml` protocol
   decides whether it comes back.
@@ -51,16 +40,29 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
     the selections in force; the weekly lists learn's changes from the activity log.
   - Done when: STATUS.md names the reason for each of the six, and whether the 10-03 learn changed
     the selection.
+  - Recorded (STATUS.md 2026-10-12): coins that joined the list at the scan; the 10-04 learn kept
+    the selection. The reconcile refinement is the "coin list at the scan" item below.
 - [ ] **c. Core targets matched 10 of 12 coin-days in the weekly** (8 of 8 before 10-03).
   - Built (this round): each mismatch is explained: no daily candles at the bot's check (the fetch
     failed, e.g. right after waking), or the candle and close the bot used against the backtest's
     (the bot logs them from now on).
   - Done when: STATUS.md names the two coin-days and the cause.
+  - Recorded (STATUS.md 2026-10-12): 10-04 BTC and ETH, the backtest side had no 10-04 candle in
+    the Mac's run; the rerun gives 12 of 12. Paper's targets were right.
   - The fix is built (owner, 2026-10-10): the bot fetches every core price and the daily candle
     that just closed first, and moves nothing until it has them all, asking again every 5 minutes
     for up to 6 hours after the close; then it goes ahead with what it has (`core_retry` and
     `core_day.incomplete` in the activity log). Same-trades: identical orders. It reaches paper
     with the deploy above.
+- [ ] **Pin the candles behind a frozen rerun.** The reference rerun moved on 2026-10-12 (combined
+  Sharpe 1.07 -> 1.10, satellite 0.50 -> 0.59) with the same universe file and, as a rerun of the
+  old code on the box showed, the same code: the box's candle cache (copied after the bot's 10-10
+  learn) differs from the Mac's of 10-05 before the data end. A frozen rerun is frozen against new
+  candles, not against a cache that was refilled. From now on the agent's `data/` is the reference
+  cache (only unfrozen runs write to it; `learn` refuses in the agent checkout).
+  - Done when: a universe file records a hash of each coin's candles up to its data end, frozen
+    reruns compare it and say so when the cache differs, and the reference file carries the box's
+    hashes (stamped once, a new file name, the ledger told).
 - [ ] **The daily loss limit in the account replay** (fidelity fix, from the 10-04 to 10-12 reconcile:
   10-08 16:00 OGN momentum@4h, paper "skipped: daily loss limit reached", backtest taken, one knock-on
   after it). Live stops opening trades for the UTC day after -3% (`risk.daily_loss_limit_pct`); the
@@ -91,12 +93,10 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   - Done when: for each such signal over four such weeks, the report compares the entry condition
     on candles cut like the scanner's with the backtest's, and says whether truncation explains it.
     A fix on the backtest side is a fidelity fix; anything on the live side is a stop-and-ask.
-- [ ] **Weekly automation on the box** - `scripts/weekly.sh`, `daily.sh`, `install-cron.sh` built.
+- [ ] **Weekly automation on the box** - the cron is installed (2026-10-12: Monday weekly, daily
+  drawdown gate, nightly backup). The weekly's push needs a deploy key (Needs the owner).
   - Done when: two Monday entries in STATUS.md came from cron, each with uptime above 95% and a
-    Telegram summary sent.
-- [ ] **Ledger notes for core-btc-pre2017-v1** (the process note and the reading) and the replay
-  notes on `sizing-open-risk-budget-v1` and `core-robustness`, if they aren't there yet
-  (`research oos-show`, `research protocols`). Add them with `research note`.
+    Telegram summary sent, and the push went through.
 
 ## Go-live (stop and ask: the owner decides each)
 
@@ -119,7 +119,10 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Needs the owner
 
-- [ ] **Move the bot to an always-on Linux box** (DEPLOY.md) - in progress.
+- [ ] **A deploy key for the box** (DEPLOY.md step 3): `~/tradebot-agent` has an https remote and no
+  credentials, so nothing pushes from the box: not this session's commits, not Monday's STATUS.md.
+  Until then the owner pulls nothing new from GitHub; the work is committed locally on the box.
+- [ ] **Move the bot to an always-on Linux box** (DEPLOY.md) - done except the key above.
 
 ## Later
 
@@ -134,6 +137,11 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Done
 
+- [x] On the box: deployed 391661c through gate 1 (10-12 22:18 UTC), drawdown limits set from the
+  reference backtest watching paper from that deploy, the agent's Telegram, the cron (2026-10-12)
+- [x] BACKLOG a, b, c answered from the bot's data (STATUS.md 2026-10-12)
+- [x] Ledger notes: replay notes on sizing-open-risk-budget-v1 and core-robustness, the process
+  note and reading on core-btc-pre2017-v1 (2026-10-12)
 - [x] The gates that replace approvals: same-trades check (fixed dataset, golden orders), deploy
   gate, research protocols (register/run/record once, trial counts), drawdown gate, `notify`,
   weekly Telegram summary, cron scripts; ML filter off in code; core fetch-first with a 6-hour
