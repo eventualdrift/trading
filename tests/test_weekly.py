@@ -113,7 +113,7 @@ def test_set_reference_switches_the_reference_and_the_next_check_in_reports_it(t
                        "selection": ["momentum@1d"], "selection_full": selection_payload(sel)})
     ref, ref2 = tmp_path / "universe-ref.json", tmp_path / "universe-ref@pinned.json"
     ref.write_text(body)
-    ref2.write_text(body)
+    ref2.write_text(body.replace('"SOL/USDT"', '"ETH/USDT"'))  # another backtest: other numbers
     status = tmp_path / "STATUS.md"
     base = ["--config", str(conf), "--env", str(tmp_path / "none.env"), "weekly", "--synthetic",
             "--status-file", str(status), "--out-dir", str(tmp_path / "weekly")]
@@ -127,4 +127,5 @@ def test_set_reference_switches_the_reference_and_the_next_check_in_reports_it(t
     main(base)
     second = status.read_text().split("- weekly check-in (`tradebot weekly`)")[-1]
     assert f"reference backtest {ref} -> {ref2}" in second and f"--universe-file {ref2}" in second
+    assert "The frozen reference rerun moved" not in second  # another backtest's numbers are not a move
     assert "previous_reference" not in json.loads((state / "research" / "weekly.json").read_text())

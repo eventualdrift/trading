@@ -36,7 +36,7 @@ DAY_MS = 86_400_000
 SNAPSHOT_MS = 15 * 60_000  # the bot records an equity snapshot every 15 minutes while it runs
 # paper skip reasons the backtest's account replay models; any other is a live-only check
 MODELLED_SKIPS = ("max open positions", "open-risk budget", "already in a", "reward:risk", "daily loss limit",
-                  "halted")
+                  "halted (drawdown")  # an operational halt (an unknown order outcome) is live-only
 
 
 # --------------------------------------------------------------------- what paper had
@@ -231,10 +231,11 @@ def backtest_signals(datasets: dict[str, dict[str, pd.DataFrame]], combos: dict[
 
 
 def _slot_decisions(cfg: BotConfig, candidates: list[Trade], seeds: list[Trade], since_ms: int,
-                    end_ms: int, marks: dict | None = None) -> tuple[dict, list[Trade]]:
-    """The backtest's account replay (live rules and order) -> ({id(trade): 'taken' | reason}, taken).
-    ``marks``: closes per coin (finest timeframe first) to value the satellite at each signal for the
-    breakers; its equity path starts at the window (the peak before it is not known here)."""
+                    end_ms: int, marks: dict | None = None) -> tuple[dict, list[Trade], dict]:
+    """The backtest's account replay (live rules and order) -> ({id(trade): 'taken' | reason}, taken,
+    the breakers' equity checks per candidate). ``marks``: closes per coin (finest timeframe first) to
+    value the satellite at each signal for the breakers; its equity path starts at the window (the
+    peak before it is not known here)."""
     from .portfolio import simulate_satellite
 
     idx = pd.date_range(pd.Timestamp(min(since_ms, *(int(s.entry_time.value // 1_000_000) for s in seeds))
@@ -245,7 +246,7 @@ def _slot_decisions(cfg: BotConfig, candidates: list[Trade], seeds: list[Trade],
     for reason, ts in run.skipped.items():
         for t in ts:
             out[id(t)] = reason
-    return out, run.taken
+    return out, run.taken, run.breaker_checks
 
 
 # --------------------------------------------------------------------- the comparison
@@ -395,12 +396,15 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
     for p in held:
         if p.opened_at < since_ms and (p.closed_at is None or p.closed_at > since_ms):
             exit_ts = pd.Timestamp(p.closed_at if p.closed_at else end_ms + DAY_MS, unit="ms", tz="UTC")
+            notional = p.amount * p.entry_price
+            closed = p.status == "closed" and p.pnl is not None and notional > 0
             seeds.append(Trade(symbol=p.symbol, timeframe=p.timeframe, strategy=p.strategy, side=p.side,
                                signal_idx=-1, signal_time=pd.Timestamp(p.opened_at, unit="ms", tz="UTC"),
                                entry_time=pd.Timestamp(p.opened_at, unit="ms", tz="UTC"), exit_time=exit_ts,
                                entry_price=p.entry_price, exit_price=p.exit_price or p.entry_price,
                                stop_loss=p.initial_stop, take_profit=p.take_profit, reason="paper position",
-                               bars_held=0, r_multiple=0.0, return_pct=0.0,
+                               bars_held=0, r_multiple=float(p.r_multiple or 0.0) if closed else 0.0,
+                               return_pct=p.pnl / notional if closed else 0.0,  # paper's own outcome, net
                                stop_pct=abs(p.entry_price - p.initial_stop) / p.entry_price, flat_time=exit_ts,
                                size_frac=p.amount * p.entry_price / sat_equity if sat_equity else None))
     candidates = [s.trade for s in bt if s.trade is not None]
@@ -408,8 +412,25 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
     for tf in sorted(datasets, key=tf_ms):
         for sym, df in datasets[tf].items():
             marks.setdefault(sym, []).append(df["close"])
-    decisions, taken = (_slot_decisions(cfg, candidates, seeds, since_ms, end_ms, marks) if candidates
-                        else ({}, []))
+    decisions, taken, checks = (_slot_decisions(cfg, candidates, seeds, since_ms, end_ms, marks) if candidates
+                                else ({}, [], {}))
+    equity_records = db.equity_curve(mode)  # paper's equity every 15 minutes: its side of a breaker decision
+
+    def paper_vs_day_start(close_ms: int) -> str:
+        """Paper's equity at the scan after ``close_ms`` against its first record of that UTC day."""
+        if not len(equity_records):
+            return ""
+        ms = index_ms(equity_records.index)
+        day0 = close_ms // DAY_MS * DAY_MS
+        start = [i for i in range(len(ms)) if day0 <= ms[i] <= close_ms + 60_000]
+        if not start:
+            return ""
+        i0, i1 = start[0], start[-1]
+        e0, e1 = float(equity_records.iloc[i0]), float(equity_records.iloc[i1])
+        if e0 <= 0:
+            return ""
+        return (f"paper {e1 / e0 - 1:+.1%} vs its day's start (its 15-minute records at "
+                f"{_ts(int(ms[i1]))[-5:]} and {_ts(int(ms[i0]))[-5:]})")
 
     def paper_held(m: int) -> set[str]:
         return {p.symbol for p in held if p.opened_at < m and (p.closed_at is None or p.closed_at > m)}
@@ -491,10 +512,17 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
                 row.cause = "first difference: the ML filter (not modelled)"
             elif ps.status == "skipped" and not any(m in ps.note for m in MODELLED_SKIPS):
                 row.cause = f"first difference: a live-only check ({ps.note})"
+            elif s.trade is None and s.no_trade.startswith("no trade yet"):
+                row.cause = "at the window's end: the backtest has no next candle to enter on (not a difference)"
             elif "daily loss limit" in ps.note or row.backtest.startswith("daily loss limit"):
-                row.cause = ("first difference: the daily loss limit - paper's equity and the replay's (its own path "
-                             "from the window's start, valued at candle closes) are on different sides of it here")
-            elif "halted" in ps.note or row.backtest.startswith("drawdown halt"):
+                chk = checks.get(id(s.trade)) if s.trade is not None else None
+                replay = (f"the replay {chk['equity'] / chk['day_start'] - 1:+.1%} vs its own (its path from the "
+                          f"window's start, valued at candle closes)" if chk and chk["day_start"] > 0 else
+                          "the replay's path from the window's start, valued at candle closes, differs")
+                paper_side = paper_vs_day_start(close_ms)
+                row.cause = (f"first difference: the daily loss limit ({cfg.risk.daily_loss_limit_pct:g}%) - "
+                             + (paper_side + "; " if paper_side else "") + replay)
+            elif "halted (drawdown" in ps.note or row.backtest.startswith("drawdown halt"):
                 row.cause = ("first difference: the drawdown halt - paper's peak and equity and the replay's (its own "
                              "path from the window's start) differ here")
             else:

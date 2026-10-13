@@ -372,5 +372,6 @@ def test_a_daily_loss_limit_skip_is_a_modelled_check(paper_run, tmp_path):
     rec = run_reconcile(paper_run, db2)
     row = {(r.symbol, r.candle_ms): r for r in rec.rows}[(first.symbol, first.candle_time)]
     assert row.paper == "skipped: daily loss limit reached" and row.backtest == "taken"
-    assert row.cause.startswith("first difference: the daily loss limit - paper's equity and the replay's")
+    assert row.cause.startswith("first difference: the daily loss limit (3%) - paper ") and "vs its day's start" in row.cause
+    assert "; the replay " in row.cause and "vs its own (its path from the window's start" in row.cause
     assert "live-only" not in format_reconciliation(rec, cfg)

@@ -309,10 +309,11 @@ def test_drawdown_halt_pauses_entries_until_the_next_daily_close_and_restarts_th
     idx = pd.date_range("2022-01-01", periods=40, freq="D", tz="UTC")
     big = hourly_trade("AAA/USDT", 24 * 2, 24 * 5 + 6, -0.60)  # -18% of equity by day 5, 06:00
     same_day = hourly_trade("BBB/USDT", 24 * 5 + 12, 24 * 9, 0.05)  # halted
+    evening = hourly_trade("EEE/USDT", 24 * 5 + 20, 24 * 9, 0.05)  # still halted: the resume is the daily close
     next_day = hourly_trade("CCC/USDT", 24 * 6, 24 * 7 + 6, -0.30)  # resumed at the daily close; -9% of equity
     later = hourly_trade("DDD/USDT", 24 * 7 + 12, 24 * 9, 0.05)  # 9% under the restarted peak: not halted
-    run = simulate_satellite([big, same_day, next_day, later], cfg, idx)
-    assert run.skipped == {"drawdown halt (15%)": [same_day]}
+    run = simulate_satellite([big, same_day, evening, next_day, later], cfg, idx)
+    assert run.skipped == {"drawdown halt (15%)": [same_day, evening]}
     assert run.taken == [big, next_day, later]
     assert [(e["what"], pd.Timestamp(e["at"], unit="ms", tz="UTC").strftime("%d %H:%M")) for e in run.breakers] == \
         [("halted", "06 12:00"), ("resumed", "07 00:00")]
@@ -336,3 +337,17 @@ def test_a_seed_with_a_known_size_keeps_it():
     seed.size_frac = None  # sized from the stop like any backtest trade: 1% at risk, no limit hit
     run = simulate_satellite([seed, noon], cfg, idx)
     assert run.sizes[0] == pytest.approx(0.1 / 0.1 * 0.01 / 0.1) and noon in run.taken
+
+
+def test_the_breakers_walk_from_the_first_signal_even_before_the_index_starts():
+    """A replay whose daily index starts after its first trades (a window replay seeded with
+    older positions) still sets each day's starting equity from that day, not from 1.0 for ever."""
+    from tradebot.portfolio import simulate_satellite
+
+    cfg = BotConfig()
+    idx = pd.date_range("2022-01-10", periods=30, freq="D", tz="UTC")  # the trades below precede it
+    losers = [hourly_trade("AAA/USDT", 24 * 2, 24 * 5 + 6, -0.20), hourly_trade("BBB/USDT", 24 * 3, 24 * 5 + 8, -0.20)]
+    noon = hourly_trade("CCC/USDT", 24 * 5 + 12, 24 * 7, 0.05)  # day 5 is -4%: blocked
+    next_day = hourly_trade("DDD/USDT", 24 * 6, 24 * 8, 0.05)  # day 6 starts at 0.96: not blocked
+    run = simulate_satellite(losers + [noon, next_day], cfg, idx)
+    assert run.skipped == {"daily loss limit (3%)": [noon]} and next_day in run.taken

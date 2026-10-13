@@ -87,6 +87,8 @@ class SatelliteRun:
     # the live breakers replayed on this equity path: each halt (equity, peak) and its resume
     breakers: list[dict] = field(default_factory=list)
     daily_limit_days: int = 0  # days on which the daily loss limit blocked at least one signal
+    # per candidate the breakers saw (id(trade)): the satellite's equity then, the day's start, the peak
+    breaker_checks: dict[int, dict] = field(default_factory=dict)
     breaker_rule: str = ""  # the rule, in words, for the report
 
 
@@ -105,6 +107,7 @@ class Marks:
 
     def __init__(self, closes: dict | None):
         self._data: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+        self.step = DAY_MS  # the finest timeframe given: how often the equity path is walked for the peak
         for sym, series in (closes or {}).items():
             for s in (series if isinstance(series, (list, tuple)) else [series]):
                 if s is None or not len(s):
@@ -113,6 +116,7 @@ class Marks:
                 gaps = np.diff(opens)
                 gaps = gaps[gaps > 0]
                 step = int(gaps.min()) if len(gaps) else DAY_MS
+                self.step = min(self.step, step)
                 self._data.setdefault(sym, []).append((opens + step, s.to_numpy(dtype=float)))
 
     def price(self, symbol: str, at_ms: int) -> float | None:
@@ -163,11 +167,14 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     skip_detail: list[dict] = []
     sizes = []
     breakers: list[dict] = []
+    breaker_checks: dict[int, dict] = {}
     limit_days: set[int] = set()
     daily_limit, dd_limit = r.daily_loss_limit_pct / 100.0, r.max_drawdown_pct / 100.0
     peak = day_start = 1.0
     halted_until: int | None = None  # the resume: the first daily close after the halt
-    last_eval = _ms(index[0]) - 1 if n else -1
+    ordered = sorted(trades, key=live_order)
+    starts = ([_ms(index[0])] if n else []) + ([_ms(ordered[0].entry_time)] if ordered else [])
+    last_eval = min(starts, default=0) - 1  # the walk starts at the first signal even before the index
 
     def key(tr: Trade) -> str:
         return f"{tr.strategy}@{tr.timeframe}"
@@ -186,12 +193,14 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
         return eq
 
     def breakers_to(t_ms: int) -> None:
-        """Walk the equity path since the last evaluation: every daily close in between (the day's
-        starting equity; the peak) and ``t_ms`` itself; halt and resume like the live bot."""
+        """Walk the equity path since the last evaluation at every close of the finest timeframe given
+        (the peak; at 00:00 UTC the day's starting equity) and at ``t_ms`` itself; halt and resume like
+        the live bot, which checks its peak on every loop."""
         nonlocal peak, day_start, halted_until, last_eval
         if t_ms <= last_eval:
             return
-        points = list(range((last_eval // DAY_MS + 1) * DAY_MS, t_ms + 1, DAY_MS))
+        step = valuer.step
+        points = list(range((last_eval // step + 1) * step, t_ms + 1, step))
         if not points or points[-1] != t_ms:
             points.append(t_ms)
         for m in points:
@@ -208,7 +217,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
                 breakers.append({"at": m, "what": "halted", "equity": float(eq), "peak": float(peak)})
         last_eval = t_ms
 
-    for t in sorted(trades, key=live_order):
+    for t in ordered:
         t_ms = _ms(t.entry_time)
         breakers_to(t_ms)  # before the slots are freed: what went flat since is valued as realised at its time
         still = []
@@ -218,11 +227,17 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
             else:
                 still.append(item)
         open_ = still
-        frac = t.size_frac if t.size_frac is not None else position_fraction(t.stop_pct, r)
+        if t.ml and t.ml.get("filtered"):  # the live scan drops it before it competes for anything
+            skipped.setdefault("ML filter", []).append(t)
+            continue
+        frac = (t.size_frac if t.size_frac is not None
+                else position_fraction(t.stop_pct, r, (t.ml or {}).get("multiplier", 1.0)))
+        eq_t = valued(t_ms)
+        breaker_checks[id(t)] = {"equity": eq_t, "day_start": day_start, "peak": peak}
         if halted_until is not None:  # the live bot's order: halted, the daily limit, then the slot rules
             skipped.setdefault(f"drawdown halt ({r.max_drawdown_pct:g}%)", []).append(t)
             continue
-        if daily_limit > 0 and valued(t_ms) <= day_start * (1 - daily_limit) + 1e-12:
+        if daily_limit > 0 and eq_t <= day_start * (1 - daily_limit) + 1e-12:
             skipped.setdefault(f"daily loss limit ({r.daily_loss_limit_pct:g}%)", []).append(t)
             limit_days.add(t_ms // DAY_MS)
             continue
@@ -297,6 +312,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
         taken=[t for t, _, _ in booked], skipped=skipped, sizes=sizes,
         realized_end=realized_end, unmarked=unmarked, skip_detail=skip_detail,
         breakers=breakers, daily_limit_days=len(limit_days), breaker_rule=breaker_rule(cfg),
+        breaker_checks=breaker_checks,
     )
 
 
@@ -365,6 +381,7 @@ class PortfolioBacktest:
     assumptions: str = ""
     sizing: str = ""
     reset_days: float = 30
+    ml_replay: object | None = None  # ml.replay.MLReplay when the ML filter was replayed walk-forward
 
 
 def account_stats(res: "PortfolioBacktest", start: pd.Timestamp | None) -> dict[str, dict]:
@@ -406,10 +423,12 @@ def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade
                        capital: float = 1000.0, fraction: float | None = None,
                        since: str | None = "2022-01-01", sat_closes: dict[str, pd.Series] | None = None,
                        combos: list[dict] | None = None, universe: dict | None = None,
-                       open_risk_pct: float | None | str = "config", sat_marks: dict | None = None) -> PortfolioBacktest:
+                       open_risk_pct: float | None | str = "config", sat_marks: dict | None = None,
+                       ml_replay=None) -> PortfolioBacktest:
     """``sat_closes``: daily closes per coin, to mark open trades each day; ``sat_marks``: closes
     per coin on every timeframe replayed (finest first), to value the satellite at each signal
-    for the breakers (default: the daily closes)."""
+    for the breakers (default: the daily closes). ``ml_replay``: the walk-forward ML replay whose
+    decisions the trades carry (``Trade.ml``), for the report."""
     fraction = cfg.core.fraction if fraction is None else fraction
     budget = cfg.risk.max_open_risk_pct if open_risk_pct == "config" else open_risk_pct
     costs = Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate)  # the core trades at market
@@ -443,7 +462,7 @@ def portfolio_backtest(core_closes: dict[str, pd.Series], sat_trades: list[Trade
               f"total at most {r.max_total_exposure_pct:g}% of the satellite")
     return PortfolioBacktest(capital, fraction, curves, pd.Timestamp(since, tz="UTC") if since else None,
                              len(sat_trades), first_sat, sat, core_exp, combined_exp, combos or [], universe,
-                             cfg.costs_description(), sizing, cfg.core.rebalance_sleeves_days)
+                             cfg.costs_description(), sizing, cfg.core.rebalance_sleeves_days, ml_replay)
 
 
 def _corr(a: pd.Series, b: pd.Series, rule: str | None = None) -> tuple[float | None, int]:
@@ -498,6 +517,9 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
         if u.get("stamped_file"):
             out.append(f"    Same coins and data end with this code, settings and candles: --universe-file "
                        f"{u['stamped_file']}")
+            if u.get("stamped_candle_diffs"):
+                out.append(f"    ! That stamped file was written from an earlier cache: its candles differ from this "
+                           f"run's for {len(u['stamped_candle_diffs'])} coin-timeframes.")
         if u.get("frozen"):
             diffs, pinned = u.get("candle_diffs"), u.get("candles_pinned") or 0
             if diffs is None:
@@ -561,9 +583,12 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
     active = sat.equity.index >= start.floor("D")
     taken, skipped = sat.taken, [t for ts in sat.skipped.values() for t in ts]
     everything = taken + skipped
-    # a coin already held: the same move signalled again, not an opportunity lost to the slot limit
+    # a coin already held: the same move signalled again, not an opportunity lost to the slot limit;
+    # nor are the signals the ML filter or a breaker dropped
     held = {id(t) for t in sat.skipped.get("already holding that coin", [])}
-    lost = [t for t in skipped if id(t) not in held]
+    not_room = held | {id(t) for k, ts in sat.skipped.items() for t in ts
+                       if k.startswith(("ML filter", "daily loss limit", "drawdown halt"))}
+    lost = [t for t in skipped if id(t) not in not_room]
 
     def exp(ts):
         return f"{np.mean([t.r_multiple for t in ts]):+.3f}R ({len(ts)})" if ts else "- (0)"
@@ -610,6 +635,10 @@ def format_satellite_measurement(res: PortfolioBacktest) -> list[str]:
                    f"{np.median(s):.1f}%, min {s.min():.1f}%, max {s.max():.1f}%")
         out.append(f"    sizing: {res.sizing}")
     out += format_breakers(sat)
+    from .ml.replay import describe as describe_ml
+
+    out += describe_ml(res.ml_replay, [t.r_multiple for t in sat.skipped.get("ML filter", [])
+                                      if t.reason != "end_of_data"])
     e, c = sat.exposure[active], sat.open_count[active]
     out.append(f"  Exposure (open positions at market / satellite equity): average {e.mean():.0%}, "
                f"median {e.median():.0%}, max {e.max():.0%}; days with a position {(c > 0).mean():.0%}; "

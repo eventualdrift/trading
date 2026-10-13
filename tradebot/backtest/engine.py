@@ -88,6 +88,9 @@ class Trade:
     # the notional as a fraction of the satellite's equity when it is known (a paper position seeding a
     # window replay); None: the replay sizes it from stop_pct like the live risk manager
     size_frac: float | None = None
+    # the ML filter's decision on this signal when the replay models it (ml.replay.apply): probability,
+    # threshold, filtered, multiplier (x risk) and expected_r (the live scan's rank); None: no model in force
+    ml: dict | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -383,10 +386,12 @@ def backtest(
 def live_order(t: "Trade") -> tuple:
     """Order candidates exactly as the live bot handles them, so when slots run out the same
     trades are taken: by time; at a shared close the shorter timeframe's scan runs first (4h
-    before 1d); within a scan by the scanner's rank (reward:risk without the ML filter); ties go
-    to the coin with more 24h volume - the volume known at that candle, not today's ranking."""
+    before 1d); within a scan by the scanner's rank (expected R when the ML filter scored the
+    signal, reward:risk otherwise); ties go to the coin with more 24h volume - the volume known
+    at that candle, not today's ranking."""
     tf = tf_ms(t.timeframe) if t.timeframe else 0
-    return (t.entry_time, tf, -t.signal_rr, -t.signal_volume, t.symbol)
+    rank = t.ml["expected_r"] if t.ml and t.ml.get("expected_r") is not None else t.signal_rr - 1.0
+    return (t.entry_time, tf, -rank, -t.signal_volume, t.symbol)
 
 
 def portfolio_simulation(

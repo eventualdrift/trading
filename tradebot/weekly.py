@@ -211,7 +211,8 @@ def needs_owner(now: dict, prev: dict, settings_diffs: list[str], selection_chan
     if selection_changed:
         out.append("Learn changed the strategy selection (in-sample: informational, not evidence)")
     old, new = (prev.get("numbers") or {}).get("portfolio"), now.get("portfolio")
-    if old and new and prev.get("reference") == now.get("reference"):
+    old_ref = (prev.get("numbers") or {}).get("reference") or prev.get("reference")  # the file those numbers came from
+    if old and new and old_ref == now.get("reference"):
         moved = [k for k in new if k in old and abs(new[k]["sharpe"] - old[k]["sharpe"]) >= 0.01]
         if moved:
             out.append("The frozen reference rerun moved since last week ("

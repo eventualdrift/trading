@@ -323,13 +323,16 @@ def cmd_research(args, cfg):
 
 
 def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file: str | None = None,
-                      save_dir: str | None = "reports", current_selection: bool = False) -> dict:
+                      save_dir: str | None = "reports", current_selection: bool = False,
+                      ml_replay: bool | None = None) -> dict:
     """Everything the whole-account backtests need: core closes, satellite candidate trades,
     daily closes to value them, per-strategy split stats and the universe used.
 
     ``universe_file``: rerun on a saved coin list, data end date AND strategy selection
     (reproducible); ``current_selection`` reruns it with today's selection instead. Without it the
-    universe is today's, and it is saved to ``save_dir`` so the run can be reproduced later."""
+    universe is today's, and it is saved to ``save_dir`` so the run can be reproduced later.
+    ``ml_replay``: model the ML filter walk-forward (BACKLOG a2); None: only when config.ML_IN_REPLAY
+    says the bot uses it."""
     from .backtest.engine import refine_flat_times
     from .backtest.selection import run_combo
     from .learning import load_context, load_datasets, load_frame
@@ -352,10 +355,11 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                                 "the strategy names)")
     end = frozen["data_end_ms"] if frozen else None
     data_end = end or market.now_ms()
+    now = None if frozen else data_end  # one 'now' for every frame: the pins then match a frozen rerun's window
     core_closes = {}
     for sym in cfg.core.symbols:
-        core_closes[sym] = load_frame(market, store, sym, "1d", days, end_ms=end)["close"]
-    trades, combos, sat_closes, sat_marks, universe = [], [], {}, {}, None
+        core_closes[sym] = load_frame(market, store, sym, "1d", days, now_ms=now, end_ms=end)["close"]
+    trades, combos, sat_closes, sat_marks, universe, ml_rep = [], [], {}, {}, None, None
     if selection and selection.selected:
         keys = [c.key for c in selection.selected]
         if frozen:
@@ -366,8 +370,8 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
         else:
             symbols = select_universe(market, cfg)
         cfg.timeframes = selection.timeframes()
-        datasets = load_datasets(market, cfg, symbols, store, log_fn=lambda *_: None, end_ms=end)
-        context = load_context(market, cfg, store, log_fn=lambda *_: None, end_ms=end)
+        datasets = load_datasets(market, cfg, symbols, store, now_ms=now, log_fn=lambda *_: None, end_ms=end)
+        context = load_context(market, cfg, store, now_ms=now, log_fn=lambda *_: None, end_ms=end)
         for c in selection.selected:
             cand: dict = {}
             is_t, oos_t, _ = run_combo(datasets.get(c.timeframe, {}), c.strategy, c.params, c.timeframe, cfg, context,
@@ -385,9 +389,19 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
             for sym, df in datasets[tf].items():
                 sat_marks.setdefault(sym, []).append(df["close"])
         pins = candle_pins(datasets, core_closes)  # the candles this run loaded, pinned for frozen reruns
+        if cfg.ml.active if ml_replay is None else ml_replay:  # the ML filter, as a weekly learn would have had it
+            from .ml.dataset import build_candidates
+            from .ml.replay import apply, learn_times, walk_forward
+
+            chosen = {(c.strategy, c.timeframe): c.params for c in selection.combos}
+            cands = build_candidates(datasets, cfg, context, params_for=chosen)
+            focus = {(c.strategy, c.timeframe) for c in selection.selected}
+            start = min(int(v.value // 1_000_000) for v in first.values()) if first else data_end
+            ml_rep = apply(trades, cands, walk_forward(cands, cfg, learn_times(start, data_end), focus), cfg)
         source = frozen["source"] if frozen else describe_universe(cfg, time.strftime("%Y-%m-%d"))
         code, snap = code_version(), settings_snapshot(cfg)  # the config file's settings, as loaded
-        run = {"timeframes_used": list(cfg.timeframes), "core_fraction_used": cfg.core.fraction}
+        run = {"timeframes_used": list(cfg.timeframes), "core_fraction_used": cfg.core.fraction,
+               "ml_replayed": ml_rep is not None}
         path = universe_file
         if not frozen and save_dir and not synthetic:
             stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(data_end / 1000))
@@ -420,9 +434,11 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                 if not stamped.exists() or not all(load_universe(stamped).get(k) for k in ("selection_full", "candles")):
                     save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap,
                                   selection=selection, run=run, candles=pins)
+                else:  # kept as it is: say if it was written from other candles than this run's
+                    universe["stamped_candle_diffs"] = compare_candles(load_universe(stamped).get("candles"), pins)
                 universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
-            "sat_marks": sat_marks, "universe": universe}
+            "sat_marks": sat_marks, "universe": universe, "ml_replay": ml_rep}
 
 
 def _research_oos(args, cfg):
@@ -477,7 +493,7 @@ def _research_core(args, cfg, selection):
     x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
-                             universe=x["universe"], sat_marks=x["sat_marks"])
+                             universe=x["universe"], sat_marks=x["sat_marks"], ml_replay=x["ml_replay"])
     print(format_core_robustness(res, reset_phase_study(res), sma_scale_study(x["core_closes"], res, cfg), cfg))
     print("\n".join([""] + _universe_lines(res)))
     if not args.synthetic:
@@ -533,10 +549,10 @@ def cmd_portfolio_backtest(args, cfg):
     fraction = args.core_fraction if args.core_fraction is not None else (cfg.core.fraction or 0.65)
     cfg.core.fraction = fraction  # recorded with the run: the split it actually used
     x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file,
-                          current_selection=args.current_selection)
+                          current_selection=args.current_selection, ml_replay=True if args.ml_replay else None)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since=args.since or None, sat_closes=x["sat_closes"], combos=x["combos"],
-                             sat_marks=x["sat_marks"],
+                             sat_marks=x["sat_marks"], ml_replay=x["ml_replay"],
                              universe=x["universe"])
     print(format_portfolio_backtest(res, cfg.exchange.quote))
 
@@ -683,7 +699,7 @@ def _reference_backtest(cfg, reference: str, synthetic: bool = False):
     x = _portfolio_inputs(pcfg, selection, synthetic, 3200, reference)
     res = portfolio_backtest(x["core_closes"], x["trades"], pcfg, capital=1000.0, fraction=fraction,
                              since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
-                             universe=x["universe"], sat_marks=x["sat_marks"])
+                             universe=x["universe"], sat_marks=x["sat_marks"], ml_replay=x["ml_replay"])
     return res, x, pcfg, fraction
 
 
@@ -907,7 +923,9 @@ def cmd_weekly(args, cfg):
     if previous_ref and previous_ref != reference:
         changed.append(f"reference backtest {previous_ref} -> {reference}")
 
-    needs = wk.needs_owner(nums, state, diffs, selection_changed)
+    # a switched reference: last week's numbers are another backtest's, not a move of this one
+    prev_state = {**state, "reference": previous_ref} if previous_ref and previous_ref != reference else state
+    needs = wk.needs_owner(nums, prev_state, diffs, selection_changed)
     entry = wk.status_entry(date=wk.today(), code=code, settings=config_hash(snap), changed=changed,
                             numbers=numbers, reproduce=reproduce, needs=needs,
                             next_items=wk.backlog_next(wk.REPO / "BACKLOG.md"))
@@ -1079,6 +1097,9 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--since", default="2022-01-01", help="also report from this date (the test period)")
     sp.add_argument("--universe-file", default=None,
                     help="rerun on a saved coin list, data end date and strategy selection (reports/universe-*.json)")
+    sp.add_argument("--ml-replay", action="store_true",
+                    help="model the ML filter walk-forward: the model a weekly learn would have had at each signal "
+                         "(default: only when config.ML_IN_REPLAY says the bot uses it)")
     sp.add_argument("--current-selection", action="store_true",
                     help="with --universe-file: use today's strategy selection instead of the saved run's")
     sp.add_argument("--synthetic", action="store_true")

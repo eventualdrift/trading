@@ -12,9 +12,11 @@ from .config import RiskConfig
 from .models import Position, Signal
 
 
-def position_fraction(stop_pct: float, cfg: RiskConfig) -> float:
-    """Position size as a fraction of equity: risk / stop distance, capped per position."""
-    return min(cfg.risk_per_trade_pct / 100.0 / max(stop_pct, 1e-9), cfg.max_position_pct / 100.0)
+def position_fraction(stop_pct: float, cfg: RiskConfig, risk_multiplier: float = 1.0) -> float:
+    """Position size as a fraction of equity: risk (x the ML confidence multiplier, capped as
+    RiskManager.size caps it) / stop distance, capped per position."""
+    mult = min(max(risk_multiplier, 1.0), cfg.max_risk_multiplier)
+    return min(cfg.risk_per_trade_pct * mult / 100.0 / max(stop_pct, 1e-9), cfg.max_position_pct / 100.0)
 
 
 def risk_at_stake(side: str, entry: float, stop: float, amount: float) -> float:
