@@ -257,7 +257,7 @@ def replay(days: int = REPLAY_DAYS, overrides: dict | None = None, data_dir: Pat
 
     quiet = logging.getLogger("tradebot")
     level = quiet.level
-    quiet.setLevel(logging.ERROR)  # the replay's scans (and a scenario's outages) would print thousands of lines
+    quiet.setLevel(logging.CRITICAL)  # the replay's scans, and a scenario's expected outage errors, stay quiet
     was = config_module.ML_IN_REPLAY
     try:
         if scenario == "ml-model":  # the scenario runs the model path although the bot has it off in code
