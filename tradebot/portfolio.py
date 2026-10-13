@@ -25,7 +25,7 @@ from .backtest.engine import Costs, Trade, flat_at, live_order
 from .backtest.metrics import max_drawdown_pct
 from .config import BotConfig
 from .core import simulate_core_detail
-from .risk import position_fraction
+from .risk import drawdown_step, position_fraction
 
 
 def _ns(index) -> pd.DatetimeIndex:
@@ -137,7 +137,7 @@ def breaker_rule(cfg: BotConfig) -> str:
                      f"(checked at each signal, like live)")
     if r.max_drawdown_pct > 0:
         parts.append(f"halted at {r.max_drawdown_pct:g}% below its peak, resumed at the next daily close with the "
-                     f"peak restarted there (as /resume does)")
+                     f"peak restarted there (as live does)")
     return "; ".join(parts) if parts else "off (risk.daily_loss_limit_pct and risk.max_drawdown_pct are 0)"
 
 
@@ -155,7 +155,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     coin, finest timeframe first; default ``closes``, the daily ones): no new entry once the
     satellite is risk.daily_loss_limit_pct below its equity at 00:00 UTC, none while it is halted
     risk.max_drawdown_pct below its peak; a halt is resumed at the next daily close with the peak
-    restarted there, as the owner's /resume does. ``start_equity``: the realised equity the replay
+    restarted there, as live does (risk.drawdown_step: the same code). ``start_equity``: the realised equity the replay
     starts from (a window replay seeded with open paper positions passes 1 minus their unrealised
     P&L at the window's start, so the satellite is worth exactly 1.0 there, like paper's)."""
     r = cfg.risk
@@ -174,7 +174,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     breakers: list[dict] = []
     breaker_checks: dict[int, dict] = {}
     limit_days: set[int] = set()
-    daily_limit, dd_limit = r.daily_loss_limit_pct / 100.0, r.max_drawdown_pct / 100.0
+    daily_limit = r.daily_loss_limit_pct / 100.0
     peak = day_start = start_equity
     halted_until: int | None = None  # the resume: the first daily close after the halt
     ordered = sorted(trades, key=live_order)
@@ -200,7 +200,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     def breakers_to(t_ms: int) -> None:
         """Walk the equity path since the last evaluation at every close of the finest timeframe given
         (the peak; at 00:00 UTC the day's starting equity) and at ``t_ms`` itself; halt and resume like
-        the live bot, which checks its peak on every loop."""
+        the live bot, which checks its peak on every loop with the same step (risk.drawdown_step)."""
         nonlocal peak, day_start, halted_until, last_eval
         if t_ms <= last_eval:
             return
@@ -212,14 +212,11 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
             eq = valued(m)
             if m % DAY_MS == 0:
                 day_start = eq
-            if halted_until is not None and m >= halted_until:
-                halted_until = None
-                peak = eq
-                breakers.append({"at": m, "what": "resumed", "equity": float(eq)})
-            peak = max(peak, eq)
-            if dd_limit > 0 and halted_until is None and eq <= peak * (1 - dd_limit) + 1e-12:
-                halted_until = (m // DAY_MS + 1) * DAY_MS
-                breakers.append({"at": m, "what": "halted", "equity": float(eq), "peak": float(peak)})
+            before = peak
+            halted_until, peak, events = drawdown_step(halted_until, peak, m, eq, r.max_drawdown_pct)  # live's own
+            for what in events:
+                breakers.append({"at": m, "what": what, "equity": float(eq)}
+                                | ({"peak": float(max(before, eq))} if what == "halted" else {}))
         last_eval = t_ms
 
     for t in ordered:

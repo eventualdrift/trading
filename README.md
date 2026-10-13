@@ -292,15 +292,17 @@ Go-live readiness (paper track record):
   [PASS] positive expectancy: +0.214R per trade
   [PASS] profit factor: 1.46 (need 1.2)
   [PASS] drawdown within limit: max drawdown 6.2% (limit 15.0%)
-  [FAIL] every protective exit rests on the exchange: breakeven stop, trailing stop, take profit are
-         managed by the bot and don't fire while it is down - build and testnet-verify exchange-side
-         orders for them first
-  => NOT ready for live trading - keep paper trading
+  [PASS] the stop rests on the exchange at all times: stop-loss, breakeven and trailing stops are
+         exchange orders, each move one cancel-replace request (no moment without a stop);
+         take-profit: an exchange order with the stop until the stop first moves, bot-managed after
+  => the checklist passes - going live is the owner's decision (live trading is off in code)
 ```
 
-The last check is about the code, not the track record. It fails until every protective exit
-lives on the exchange as an order, so it still fires while the bot is down (asleep, crashed,
-offline). The other go-live items are in BACKLOG.md.
+The last check is about the code, not the track record: the owner's rule (2026-10-13) is that the
+stop rests on the exchange at all times, including through every move, so it still fires while
+the bot is down (asleep, crashed, offline); the take-profit may be bot-managed after the stop
+first moves. A passing checklist is evidence, not a decision: going live is the owner's, and
+`mode: live` stays refused in code until they make it. The other go-live items are in BACKLOG.md.
 
 ### Weekly check-in: `tradebot weekly`
 
@@ -534,7 +536,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | bigger bets on the strongest setups | up to 1.5x risk, only if the ML proved on unseen data that its most confident picks really earn more (off with the ML filter for now) |
 | trailing stop (momentum strategy) | once +1R, stop follows 3 ATR behind the best price; never loosened |
 | daily loss limit → no new trades until 00:00 UTC | 3% |
-| drawdown from peak → halt until `/resume` | 15% |
+| drawdown from peak → halt until the next daily close (00:00 UTC), the peak restarted there | 15% |
 | don't chase: skip if price already moved past the signal | 0.3R |
 | exchange-side stop-loss (live), verified after placing | on; sell if it can't be placed |
 | bad-data guard: skip frozen feeds, confirm any >10% jump on the next poll, ignore stale prices | on |
@@ -650,15 +652,17 @@ DEPLOY.md         moving the bot to an always-on Linux box
   every poll (30 s), replaying each completed 1-minute candle since the last check:
   - The original stop (an exchange stop-market order in live) fills at the stop, or at the
     1-minute open if it gapped, like the backtest.
-  - Breakeven and trailing stops are bot-managed: live leaves the exchange stop at the original
-    level. When a 1-minute candle crosses them, the bot sells at the price when it looks.
+  - Breakeven and trailing stops: the bot moves its level when a 1-minute candle reaches it. In
+    paper it sells at the price when it looks; on the exchange (testnet) the stop order itself is
+    moved there in one request, so it fires while the bot is down too.
   - The take-profit sells as soon as the current price is beyond the target, not at a close.
 
   While the bot runs, these exits sell within about a minute of the level. After downtime (a
   sleeping laptop) they sell at the price on waking, which can be far worse. The original stop
   is still replayed at its level.
-- Paper-only for now: the core sleeve and limit-order entries (`costs.entry_order: limit`).
-  Live mode refuses both until their live order paths have been built and reviewed.
+- Paper-only for now: limit-order entries (`costs.entry_order: limit`); an exchange mode refuses
+  them until their order path has been built and reviewed. The core sleeve's market orders run on
+  the testnet (`mode: testnet`); `mode: live` is refused in code (going live is the owner's decision).
 - Next: a strategy research phase with safeguards against luck. New strategies come from a
   written list, each with an economic reason, fixed in advance. Each must pass a final holdout
   used only once and be scored with a penalty for the number of variants tried (deflated

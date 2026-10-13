@@ -55,7 +55,7 @@ risk:
   max_position_pct: 30         # no single position above 30% of the account
   max_total_exposure_pct: 100  # never more than the account value in total (no leverage)
   daily_loss_limit_pct: 3      # stop opening trades for the day after -3%
-  max_drawdown_pct: 15         # halt (until /resume) after -15% from the peak
+  max_drawdown_pct: 15         # halt after -15% from the peak, until the next daily close (00:00 UTC), peak restarted there
   min_reward_risk: 1.5         # only take trades that aim for >= 1.5x the risk
   breakeven_at_r: 1.0          # move the stop to entry once the trade is +1R (0 = off)
   max_risk_multiplier: 1.5     # risk up to 1.5x on the strongest setups - only if the ML proved

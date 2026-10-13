@@ -30,31 +30,48 @@ def readiness(db: Database, cfg: BotConfig, now_ms: int, mode: str = "paper",
         Check("profit factor", m["profit_factor"] >= min_pf, f"{m['profit_factor']:.2f} (need {min_pf})"),
         Check("drawdown within limit", dd < cfg.risk.max_drawdown_pct,
               f"max drawdown {dd:.1f}% (limit {cfg.risk.max_drawdown_pct}%)"),
-        exchange_protection_check(),
+        exchange_protection_check(cfg),
     ]
 
 
-PROTECTIVE_EXITS = ("stop_loss", "breakeven_stop", "trailing_stop", "take_profit")
+STOP_EXITS = ("stop_loss", "breakeven_stop", "trailing_stop")
 
 
-def exchange_protection_check() -> Check:
-    """Go-live item: every protective exit must exist on the exchange. An exit the bot manages
-    itself does not fire while the bot is down (asleep, crashed, offline)."""
+def exchange_protection_check(cfg: BotConfig | None = None) -> Check:
+    """Go-live item, the owner's rule (2026-10-13): the stop rests on the exchange at all times,
+    including through every move; the take-profit is an exchange order with it until the stop first
+    moves, and bot-managed after that. A stop the bot managed itself would not fire while the bot is
+    down (asleep, crashed, offline)."""
     from .execution.live import EXCHANGE_SIDE_EXITS, PARTLY_EXCHANGE_SIDE
 
-    missing = [e for e in PROTECTIVE_EXITS if e not in EXCHANGE_SIDE_EXITS]
-    on = ", ".join(e.replace("_", " ") for e in PROTECTIVE_EXITS if e in EXCHANGE_SIDE_EXITS)
-    detail = ("stop-loss, breakeven, trailing and take-profit are all exchange orders" if not missing else
-              f"exchange orders: {on}; " + "; ".join(
-                  f"{e.replace('_', ' ')}: " + PARTLY_EXCHANGE_SIDE.get(e, "managed by the bot, doesn't fire while it is down")
-                  for e in missing))
-    return Check("every protective exit rests on the exchange", not missing, detail)
+    problems = [f"{e.replace('_', ' ')}: managed by the bot, doesn't fire while it is down"
+                for e in STOP_EXITS if e not in EXCHANGE_SIDE_EXITS]
+    if cfg is not None and not cfg.live.native_stop_loss:
+        problems.append("stop-loss: live.native_stop_loss is off, so no stop rests on the exchange")
+    if cfg is not None and not cfg.live.require_exchange_stop:
+        problems.append("stop-loss: live.require_exchange_stop is off, so a stop that can't be placed leaves the "
+                        "position without one")
+    if cfg is not None and not cfg.live.take_profit_order:
+        problems.append("take profit: live.take_profit_order is off, so it is never on the exchange")
+    elif "take_profit" not in EXCHANGE_SIDE_EXITS and "take_profit" not in PARTLY_EXCHANGE_SIDE:
+        problems.append("take profit: managed by the bot from the start")
+    tp = ("an exchange order" if "take_profit" in EXCHANGE_SIDE_EXITS else
+          "an exchange order with the stop until the stop first moves, bot-managed after")
+    detail = (f"stop-loss, breakeven and trailing stops are exchange orders, each move one cancel-replace request "
+              f"(no moment without a stop); take-profit: {tp}" if not problems else "; ".join(problems))
+    return Check("the stop rests on the exchange at all times", not problems, detail)
 
 
 def format_readiness(checks: list[Check]) -> str:
+    from .config import LIVE_TRADING
+
     lines = [f"  [{'PASS' if c.passed else 'FAIL'}] {c.name}: {c.detail}" for c in checks]
-    verdict = "READY for live trading (start small!)" if all(c.passed for c in checks) \
-        else "NOT ready for live trading - keep paper trading"
+    if not all(c.passed for c in checks):
+        verdict = "NOT ready for live trading - keep paper trading"
+    elif not LIVE_TRADING:  # the checklist is evidence for the owner, not the decision
+        verdict = "the checklist passes - going live is the owner's decision (live trading is off in code)"
+    else:
+        verdict = "READY for live trading (start small!)"
     return "\n".join(lines + ["", f"  => {verdict}"])
 
 

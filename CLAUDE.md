@@ -36,6 +36,15 @@ it in STATUS.md and on Telegram. The owner keeps the hard rules and the go-live 
   `ml.enabled` says). BACKLOG a2 models it walk-forward; then a registered test (template, family
   `ml`) decides whether it comes back. Only a passed test sets `ML_IN_REPLAY = True`.
 
+## Risk policy (the owner's, 2026-10-13)
+
+- **A drawdown halt resumes at the next daily close** (00:00 UTC), with the peak restarted there.
+  Live and the account replay run the same step (`tradebot/risk.py: drawdown_step`). A halt for an
+  order the bot couldn't verify (an operational halt) still waits for the owner's `/resume`.
+- **Operational risk rules.** The agent may change one without asking when all three hold: the
+  replay models it, the same-trades dataset covers the scenario, and the change makes live match
+  the replay. Edits to the rules, anything live, and go-live still need the owner.
+
 ## The gates
 
 ### Gate 1: deploy
@@ -188,4 +197,5 @@ Tick items off with the commit that did them.
   `drawdown-limits.json`, `drawdown-events.jsonl`, protocol files and run outputs) and
   `state/deploys.jsonl`.
 - Reports: `reports/` (universe files `universe-*.json`; `reports/weekly/`; `drawdown-*.txt`).
-  The weekly reference: `reports/universe-20260927-1513@ae152bd-178b23c9a0.json`.
+  The weekly reference: `state/research/weekly.json` names it (2026-10-13:
+  `reports/universe-20260927-1513@b068c25-75a58dc389.json`).

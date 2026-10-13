@@ -505,9 +505,12 @@ def test_the_breakers_scenario_fires_both_breakers():
     on the dataset (the defaults themselves never do in these 40 days), so the gate sees a change to
     how either acts."""
     golden = st.load_golden()
-    notes = [s[6] or "" for s in golden["scenarios"]["breakers"]["orders"]["signals"]]
+    rec = golden["scenarios"]["breakers"]["orders"]
+    notes = [s[6] or "" for s in rec["signals"]]
     assert any(n.startswith("halted (drawdown") for n in notes)
     assert "daily loss limit reached" in notes
+    first = min(s[4] for s in rec["signals"] if (s[6] or "").startswith("halted (drawdown"))
+    assert any(p[5] > first + DAY for p in rec["positions"])  # resumed at the daily close (CLAUDE.md, risk policy)
     plain = [s[6] or "" for s in golden["orders"]["signals"]]
     assert not any(n.startswith(("halted", "daily loss limit")) for n in plain)
     assert st._tightened(st.load_scenario("breakers")) == {"risk.max_drawdown_pct": 3.0, "risk.daily_loss_limit_pct": 1.0}

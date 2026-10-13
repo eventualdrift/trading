@@ -86,13 +86,51 @@ def test_open_risk_budget_counts_only_risk_still_at_stake():
     assert "max open positions" in rm.entry_block_reason(sig, fresh + protected, 10_000)
 
 
-def test_go_live_needs_every_protective_exit_on_the_exchange(monkeypatch):
+def test_go_live_needs_the_stop_on_the_exchange_at_all_times(monkeypatch):
+    """The owner's rule: the stop rests on the exchange through every move; the take-profit is an
+    exchange order until the stop first moves, bot-managed after."""
     import tradebot.execution.live as live
+    from tradebot.config import BotConfig
     from tradebot.report import exchange_protection_check
 
+    check = exchange_protection_check(BotConfig())
+    assert check.passed and check.name == "the stop rests on the exchange at all times"
+    assert "take-profit: an exchange order with the stop until the stop first moves, bot-managed after" in check.detail
+    cfg = BotConfig()
+    cfg.live.take_profit_order = False  # never on the exchange: not the rule
+    assert "live.take_profit_order is off" in exchange_protection_check(cfg).detail
+    assert not exchange_protection_check(cfg).passed
+    cfg = BotConfig()
+    cfg.live.require_exchange_stop = False  # a stop that can't be placed would leave the position bare
+    assert not exchange_protection_check(cfg).passed
+    cfg.live.native_stop_loss = False  # no stop on the exchange at all
+    check = exchange_protection_check(cfg)
+    assert not check.passed and "live.native_stop_loss is off" in check.detail
+    monkeypatch.setattr(live, "PARTLY_EXCHANGE_SIDE", {})
+    assert not exchange_protection_check().passed
+    monkeypatch.setattr(live, "EXCHANGE_SIDE_EXITS", frozenset({"stop_loss", "breakeven_stop", "take_profit"}))
     check = exchange_protection_check()
-    assert not check.passed and "exchange orders: stop loss, breakeven stop, trailing stop" in check.detail
-    assert "take profit: on the exchange with the stop (an OCO pair) until the stop first moves" in check.detail
-    monkeypatch.setattr(live, "EXCHANGE_SIDE_EXITS",
-                        frozenset({"stop_loss", "breakeven_stop", "trailing_stop", "take_profit"}))
-    assert exchange_protection_check().passed
+    assert not check.passed and check.detail == "trailing stop: managed by the bot, doesn't fire while it is down"
+
+
+def test_the_drawdown_step_halts_until_the_next_daily_close():
+    from tradebot.risk import DAY_MS, drawdown_step
+
+    day = 100 * DAY_MS
+    until, peak, ev = drawdown_step(None, 1000.0, day + 9 * 3_600_000, 840.0, 15.0)
+    assert (until, peak, ev) == (day + DAY_MS, 1000.0, ["halted"])
+    assert drawdown_step(until, peak, day + DAY_MS - 1, 900.0, 15.0) == (until, 1000.0, [])  # still halted
+    assert drawdown_step(until, peak, day + DAY_MS + 30_000, 880.0, 15.0) == (None, 880.0, ["resumed"])
+    assert drawdown_step(None, 1000.0, day, 900.0, 0.0) == (None, 1000.0, [])  # off
+
+
+def test_a_fall_first_seen_at_the_daily_close_belongs_to_the_day_that_ended():
+    """The replay evaluates at candle closes; a fall first seen at 00:00 happened inside the candle
+    that just closed, where the live bot (every loop) would have halted until that same 00:00 and
+    resumed before scanning: the halt is over at once, the peak restarts, nothing is blocked."""
+    from tradebot.risk import DAY_MS, drawdown_step
+
+    day = 100 * DAY_MS
+    assert drawdown_step(None, 1000.0, day, 840.0, 15.0) == (None, 840.0, ["halted", "resumed"])
+    assert drawdown_step(None, 1000.0, day + 1, 840.0, 15.0) == (day + DAY_MS, 1000.0, ["halted"])
+

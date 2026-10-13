@@ -20,7 +20,7 @@ from .execution.base import Broker, NotFilled, finalize_close
 from .ml.model import SignalModel
 from .models import Position, Signal
 from .notify import formatting as fmt
-from .risk import RiskManager
+from .risk import DAY_MS, RiskManager, drawdown_step
 from .scanner import Scanner
 from .timeframes import index_ms, last_closed_open_ms, tf_ms
 from .universe import select_universe
@@ -33,7 +33,7 @@ HELP = """<b>Commands</b>
 /signals – latest signals
 /performance – track record
 /pause – stop opening new trades (open trades are still managed)
-/resume – resume trading (also clears a drawdown halt)
+/resume – resume trading (also ends a drawdown halt before the daily close)
 /close &lt;id&gt; – close one position at market
 /closeall – close everything and pause
 /forget &lt;id&gt; – mark a position closed WITHOUT trading (after fixing it on the exchange yourself)
@@ -242,13 +242,35 @@ class TradingBot:
             self._set("day", day)
             self._set("day_start_equity", equity)
             self._set("daily_limit_notified", False)
-        peak = max(float(self._get("peak_equity", equity)), equity)
+        old = self._get("halted")
+        if isinstance(old, str) and old.startswith("drawdown"):  # a drawdown halt kept by an older version
+            self._set("halted", None)
+            self._set("dd_halt", {"reason": old, "until": (now_ms // DAY_MS + 1) * DAY_MS})
+        dd = self._get("dd_halt")
+        before = self._get("peak_equity")
+        before = None if before is None else float(before)
+        # the replay's own step (risk.drawdown_step): halted at the limit, resumed at the next daily close
+        until, peak, events = drawdown_step(dd["until"] if dd else None, before, now_ms, equity,
+                                            self.cfg.risk.max_drawdown_pct)
         self._set("peak_equity", peak)
-        if not self._get("halted") and self.risk.drawdown_hit(equity, peak):
-            reason = f"drawdown {(1 - equity / peak) * 100:.1f}% from peak {peak:,.2f}"
-            self._set("halted", reason)
-            self.notify(f"🚨 <b>Trading halted</b>: {reason}.\nOpen trades are still managed. "
-                        f"Review performance, then send /resume to continue.")
+        quote = self.cfg.exchange.quote
+        for what in events:
+            if what == "halted":
+                top = equity if before is None else max(before, equity)
+                reason = f"drawdown {(1 - equity / top) * 100:.1f}% from peak {top:,.2f}"
+                self._set("dd_halt", {"reason": reason, "until": until} if until is not None else None)
+                self._log("breaker", {"what": "halted", "equity": equity, "peak": top, "until": until}, now_ms)
+                self.notify(f"🚨 <b>Trading halted</b>: {reason}.\nOpen trades are still managed. New entries "
+                            f"resume by themselves at the next daily close (00:00 UTC), with the peak restarted "
+                            f"there, as the backtest replays it. /pause keeps them stopped.")
+            else:
+                self._set("dd_halt", None)
+                self._log("breaker", {"what": "resumed", "equity": equity}, now_ms)
+                still = ("paused (/pause)" if self._get("paused") else
+                         f"halted ({self._get('halted')})" if self._get("halted") else None)
+                self.notify(f"▶️ <b>The drawdown halt ended</b> at the daily close; the peak restarts at "
+                            f"{equity:,.2f} {quote}. " + (f"New entries stay stopped: {fmt.esc(still)} - /resume "
+                                                         f"when you're ready." if still else "New entries resume."))
         if not self._get("daily_limit_notified") and self.risk.daily_limit_hit(equity, self._get("day_start_equity", equity)):
             self._set("daily_limit_notified", True)
             self.notify(f"⚠️ Daily loss limit ({self.cfg.risk.daily_loss_limit_pct}%) reached - "
@@ -277,12 +299,16 @@ class TradingBot:
         core = self.core.equity(prices) if self.core is not None and self.core.initialized else 0.0
         return {"total": sat + core, "core": core, "satellite": sat, "btc_price": prices.get(btc), "prices": prices}
 
-    def _shift_breakers(self, delta: float) -> None:
-        """Capital moved in/out of the satellite is not a gain or loss for its breakers."""
+    def _scale_breakers(self, before: float, after: float) -> None:
+        """Capital moved in or out of the satellite is not a gain or loss for its breakers: its peak and
+        the day's starting equity scale with the satellite, so it stays as far from both limits in
+        percent as before - as in the replay, whose satellite path is rescaled at each reset."""
+        if before <= 0:
+            return
         for key in ("peak_equity", "day_start_equity"):
             v = self._get(key)
             if v is not None:
-                self._set(key, float(v) + delta)
+                self._set(key, float(v) * after / before)
 
     def _maybe_core_day(self, now_ms: int) -> None:
         """The core's daily rebalance. It fetches first - every coin's price and the daily candle that
@@ -310,7 +336,7 @@ class TradingBot:
             amount = sat * c.fraction
             self.broker.transfer(-amount)
             self.core.initialize(amount)
-            self._shift_breakers(-amount)
+            self._scale_breakers(sat, sat - amount)
             self._set("sleeves_last_ms", now_ms)
             self._log("core_transfer", {"amount": amount, "why": "core started"}, now_ms)
             self.notify(f"🏛 <b>Core sleeve started</b>: {amount:,.2f} {quote} ({c.fraction:.0%}) moved into the "
@@ -352,13 +378,13 @@ class TradingBot:
                 return
             self.broker.transfer(-moved)
             self.core.deposit(moved)
-            self._shift_breakers(-moved)
+            self._scale_breakers(sat, sat - moved)
             self._log("core_transfer", {"amount": moved, "why": "sleeve reset"}, now_ms)
             text = f"{moved:,.2f} {quote} satellite → core"
         else:
             moved, _ = self.core.withdraw(-delta, prices, now_ms)
             self.broker.transfer(moved)
-            self._shift_breakers(moved)
+            self._scale_breakers(sat, sat + moved)
             self._log("core_transfer", {"amount": -moved, "why": "sleeve reset"}, now_ms)
             text = f"{moved:,.2f} {quote} core → satellite"
         self.notify(f"⚖️ Sleeves reset to {c.fraction:.0%} core: moved {text}.")
@@ -368,6 +394,8 @@ class TradingBot:
             return "paused by user"
         if self.core is not None and self.core.pending:  # its fill could be the satellite's cash meanwhile
             return "a core order is unresolved"
+        if self._get("dd_halt"):  # the drawdown halt: modelled by the replay, so checked first, as it does
+            return f"halted ({self._get('dd_halt')['reason']})"
         if self._get("halted"):
             return f"halted ({self._get('halted')})"
         if self.risk.daily_limit_hit(equity, self._get("day_start_equity", equity)):
@@ -1057,7 +1085,8 @@ class TradingBot:
             if cmd == "status":
                 equity, _ = self.equity()
                 combos = ", ".join(c.key for c in (self.selection.selected if self.selection else [])) or "none"
-                state = "halted" if self._get("halted") else "paused" if self._get("paused") else "running"
+                state = ("halted" if self._get("halted") or self._get("dd_halt") else "paused" if self._get("paused")
+                         else "running")
                 if self.core is not None and self.core.initialized:
                     s = self.sleeves(self.market.now_ms())
                     w = ", ".join(f"{k.split('/')[0]} {v:.0%}" for k, v in self.core.weights.items()) or "no weights yet"
@@ -1094,9 +1123,12 @@ class TradingBot:
                     return (f"Can't resume: entry outcome still unknown for {ids}. The bot keeps checking; "
                             f"if you've confirmed on the exchange that nothing was bought, send /forget &lt;id&gt;.")
                 equity, _ = self.equity()
+                ended = self._get("dd_halt")
                 self._set("paused", False)
                 self._set("halted", None)
-                self._set("peak_equity", equity)
+                self._set("dd_halt", None)
+                if ended:  # the owner ends the drawdown halt before the daily close: the peak restarts as it would
+                    self._set("peak_equity", equity)
                 return "▶️ Resumed."
             if cmd == "close":
                 if not args or not args[0].lstrip("#").isdigit():

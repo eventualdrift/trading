@@ -47,7 +47,8 @@ log = logging.getLogger(__name__)
 
 FINAL = ("closed", "canceled", "expired", "rejected")
 # exits that rest on the exchange as orders, so they still fire while the bot is down. The
-# go-live checklist (report.readiness) requires every protective exit to be here.
+# go-live checklist (report.readiness) requires every stop here (the owner's rule: the stop rests on
+# the exchange at all times; the take-profit may be bot-managed after the stop first moves).
 EXCHANGE_SIDE_EXITS = frozenset({"stop_loss", "breakeven_stop", "trailing_stop"})
 # exits on the exchange only for part of a trade, and why
 PARTLY_EXCHANGE_SIDE = {

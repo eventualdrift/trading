@@ -109,13 +109,137 @@ def test_closeall_kill_switch(sim):
 def test_drawdown_halt(sim):
     market, db, broker, notes, bot = sim
     db.kv_set("paper:peak_equity", 2000.0)
-    now = market.start_ms + 50 * DAY
+    now = market.start_ms + 50 * DAY + 3 * 3_600_000 + 30_000  # a loop, not the daily close itself
     market.set_now(now)
     bot.tick(now)
-    assert db.kv_get("paper:halted")
+    assert db.kv_get("paper:dd_halt") and not db.kv_get("paper:halted")
     assert any("Trading halted" in m for m in notes.messages)
+    bot.handle_command("resume", [])  # the owner's call, before the daily close
+    assert not db.kv_get("paper:dd_halt")
+
+
+def _signal(now):
+    return Signal("BTC/USDT", "1h", "breakout", "long", 100.0, 95.0, 110.0, now - 3_600_000, now, now + 3_600_000,
+                  now + DAY, reason="test")
+
+
+HOUR = 3_600_000
+
+
+def test_the_drawdown_halt_resumes_at_the_next_daily_close_with_the_peak_restarted(sim):
+    """As the account replay does (the same step, risk.drawdown_step): halted at the limit, new
+    entries resume at the next 00:00 UTC with the peak restarted at the equity there."""
+    market, db, broker, notes, bot = sim
+    day = (market.start_ms // DAY + 50) * DAY
+    bot._update_breakers(day + 2 * HOUR, 1000.0)
+    bot._update_breakers(day + 12 * HOUR, 840.0)  # 16% under the peak: halted
+    halt = db.kv_get("paper:dd_halt")
+    assert halt["reason"] == "drawdown 16.0% from peak 1,000.00" and halt["until"] == day + DAY
+    assert any("Trading halted" in m and "next daily close (00:00 UTC)" in m for m in notes.messages)
+    assert bot._entry_block(_signal(day + 12 * HOUR), [], 840.0) == "halted (drawdown 16.0% from peak 1,000.00)"
+    bot._update_breakers(day + 20 * HOUR, 900.0)  # recovered in the evening: still halted until the close
+    assert db.kv_get("paper:dd_halt")
+    bot._update_breakers(day + DAY + 30_000, 880.0)  # the first loop after 00:00 UTC
+    assert db.kv_get("paper:dd_halt") is None and db.kv_get("paper:peak_equity") == 880.0
+    assert any("drawdown halt ended" in m and "New entries resume." in m for m in notes.messages)
+    assert not (bot._entry_block(_signal(day + DAY + HOUR), [], 880.0) or "").startswith("halted")
+    bot._update_breakers(day + DAY + 6 * HOUR, 800.0)  # 9% under the restarted peak: not halted
+    assert db.kv_get("paper:dd_halt") is None
+    logged = [d["what"] for _, kind, d in _breaker_log(db)]
+    assert logged == ["halted", "resumed"]
+
+
+def _breaker_log(db):
+    return [(ts, "breaker", data) for ts, data in db.botlog("paper", "breaker")]
+
+
+def test_live_halts_and_resumes_where_the_replay_step_does(sim):
+    """An equity path through the bot's loop (its state in the database between calls) gives the
+    same halts and resumes as the replay's walk over the same path."""
+    from tradebot.risk import drawdown_step
+
+    market, db, broker, notes, bot = sim
+    day = (market.start_ms // DAY + 50) * DAY
+    path = [(day + h * HOUR, 1000.0 * (1 - 0.004 * min(h, 45)) + (12.0 * (h - 60) if h > 60 else 0.0))
+            for h in range(0, 24 * 5, 3)]  # down 18% over two days, flat, then back up
+    path += [(day + 5 * DAY + h * HOUR, 1100.0 - 9.0 * h) for h in range(0, 48, 3)]  # a second fall
+    halted_until, peak, events = None, None, []
+    for t, eq in path:
+        halted_until, peak, happened = drawdown_step(halted_until, peak, t, eq, bot.cfg.risk.max_drawdown_pct)
+        events += [(t, e) for e in happened]
+    for t, eq in path:
+        bot._update_breakers(t, eq)
+    assert [(ts, d["what"]) for ts, _, d in _breaker_log(db)] == events
+    assert [e for _, e in events].count("halted") >= 2 and "resumed" in [e for _, e in events]
+
+
+def test_resume_restarts_the_peak_only_when_it_ends_a_drawdown_halt(sim):
+    """/resume after /pause (or an operational halt) leaves the peak alone, so the drawdown halt
+    still fires where the replay's does; ending a drawdown halt early restarts it, as the daily
+    close would."""
+    market, db, broker, notes, bot = sim
+    day = (market.start_ms // DAY + 50) * DAY
+    bot._update_breakers(day + HOUR, 1000.0)
+    bot._update_breakers(day + 2 * HOUR, 900.0)  # 10% down: no halt
+    bot.handle_command("pause", [])
     bot.handle_command("resume", [])
-    assert not db.kv_get("paper:halted")
+    assert db.kv_get("paper:peak_equity") == 1000.0
+    bot._update_breakers(day + 3 * HOUR, 840.0)  # 16% under the true peak: halted, as the replay is
+    assert db.kv_get("paper:dd_halt")
+    bot.handle_command("resume", [])  # the owner ends it early
+    assert db.kv_get("paper:dd_halt") is None and db.kv_get("paper:peak_equity") == pytest.approx(bot.equity()[0])
+
+
+def test_the_resume_message_says_when_entries_stay_stopped(sim):
+    market, db, broker, notes, bot = sim
+    day = (market.start_ms // DAY + 50) * DAY
+    bot._update_breakers(day + HOUR, 1000.0)
+    bot._update_breakers(day + 2 * HOUR, 800.0)
+    bot.handle_command("pause", [])  # as the halt message suggests
+    bot._update_breakers(day + DAY + 30_000, 800.0)
+    assert db.kv_get("paper:dd_halt") is None
+    assert "New entries stay stopped: paused (/pause)" in notes.messages[-1]
+
+
+def test_a_sleeve_transfer_keeps_the_breakers_percentages(sim):
+    """The replay rescales the satellite at each reset; live scales its peak and day start with
+    the transfer, so a move out of the satellite neither halts it nor hides a halt."""
+    market, db, broker, notes, bot = sim
+    db.kv_set("paper:peak_equity", 1000.0)
+    db.kv_set("paper:day_start_equity", 900.0)
+    bot._scale_breakers(870.0, 570.0)  # 300 moved to the core at 13% below the peak
+    assert db.kv_get("paper:peak_equity") == pytest.approx(1000.0 * 570 / 870)
+    assert db.kv_get("paper:day_start_equity") == pytest.approx(900.0 * 570 / 870)
+    day = (market.start_ms // DAY + 50) * DAY
+    bot._update_breakers(day + 12 * HOUR, 570.0)
+    assert db.kv_get("paper:dd_halt") is None  # still 13% down, not 18.6%
+
+
+def test_an_operational_halt_is_not_ended_by_the_daily_close(sim):
+    """A halt for an order the bot couldn't verify waits for the owner; only the drawdown halt
+    resumes by itself."""
+    market, db, broker, notes, bot = sim
+    day = (market.start_ms // DAY + 50) * DAY
+    bot._halt("entry #7 for BTC/USDT has an unknown outcome (timeout)")
+    db.kv_set("paper:peak_equity", 1000.0)
+    bot._update_breakers(day + 12 * HOUR, 800.0)  # the drawdown halt fires as well
+    assert db.kv_get("paper:dd_halt") and db.kv_get("paper:halted").startswith("entry #7")
+    bot._update_breakers(day + DAY + 30_000, 800.0)
+    assert db.kv_get("paper:dd_halt") is None and db.kv_get("paper:halted").startswith("entry #7")
+    assert "New entries stay stopped: halted (entry #7" in notes.messages[-1]
+    assert bot._entry_block(_signal(day + DAY + HOUR), [], 800.0).startswith("halted (entry #7")
+
+
+def test_a_drawdown_halt_kept_by_an_older_version_resumes_at_the_next_daily_close(sim):
+    market, db, broker, notes, bot = sim
+    day = (market.start_ms // DAY + 50) * DAY
+    db.kv_set("paper:halted", "drawdown 16.0% from peak 1,000.00")  # the old key: until /resume
+    db.kv_set("paper:peak_equity", 1000.0)
+    bot._update_breakers(day + 9 * HOUR, 845.0)
+    assert db.kv_get("paper:halted") is None
+    assert db.kv_get("paper:dd_halt") == {"reason": "drawdown 16.0% from peak 1,000.00", "until": day + DAY}
+    bot._update_breakers(day + DAY + 30_000, 845.0)
+    assert db.kv_get("paper:dd_halt") is None
 
 
 def test_stale_candles_are_not_traded_on_startup(sim, monkeypatch):

@@ -56,6 +56,9 @@ def build_data(db: Database, cfg: BotConfig, mode: str | None = None, prices: di
                              for b in btc]
 
     halted, paused = db.kv_get(f"{mode}:halted"), db.kv_get(f"{mode}:paused")
+    dd = db.kv_get(f"{mode}:dd_halt")
+    if dd and not halted:  # the drawdown halt, until the next daily close
+        halted = f"{dd['reason']} - resumes at 00:00 UTC"
     state = ({"label": "Halted", "kind": "critical", "detail": str(halted)} if halted else
              {"label": "Paused", "kind": "warning", "detail": "no new entries"} if paused else
              {"label": "Running", "kind": "good", "detail": ""})

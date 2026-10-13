@@ -57,7 +57,7 @@ class RiskConfig:
     max_position_pct: float = 30.0  # cap on a single position's notional, % of equity
     max_total_exposure_pct: float = 100.0  # cap on all open notional (100 = no leverage)
     daily_loss_limit_pct: float = 3.0  # pause new entries for the rest of the UTC day
-    max_drawdown_pct: float = 15.0  # halt new entries until /resume
+    max_drawdown_pct: float = 15.0  # halt new entries until the next daily close (00:00 UTC), peak restarted there
     min_reward_risk: float = 1.5
     breakeven_at_r: float = 1.0  # move stop to entry once price is +1R (0 = off)
     max_risk_multiplier: float = 1.5  # up to 1.5x risk on the ML's strongest setups (1 = off)

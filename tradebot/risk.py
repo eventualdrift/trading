@@ -19,6 +19,36 @@ def position_fraction(stop_pct: float, cfg: RiskConfig, risk_multiplier: float =
     return min(cfg.risk_per_trade_pct * mult / 100.0 / max(stop_pct, 1e-9), cfg.max_position_pct / 100.0)
 
 
+DAY_MS = 86_400_000
+
+
+def drawdown_step(halted_until: int | None, peak: float | None, at_ms: int, equity: float,
+                  max_drawdown_pct: float) -> tuple[int | None, float, list[str]]:
+    """The drawdown halt, one evaluation of the equity path - the same code in live (the bot's loop)
+    and in the account replay (portfolio.simulate_satellite), so the two halt and resume alike.
+
+    A halt resumes at the first evaluation at or after the next daily close (00:00 UTC) after it
+    fired, with the peak restarted at the equity there (the owner's rule, CLAUDE.md "Risk policy");
+    otherwise the peak follows the equity up and a fall of ``max_drawdown_pct`` below it halts new
+    entries. A fall first seen by an evaluation at 00:00 UTC itself (the replay's, at a candle close)
+    belongs to the day that just ended - the live bot, looking every loop, saw it inside that candle -
+    so that halt is over at once: the peak restarts there and nothing is blocked, as in live, whose
+    halt before midnight ends at the first loop after it, before that loop's scan.
+    Returns (halted_until, peak, events), the events "halted" and "resumed" in order."""
+    events = []
+    if halted_until is not None and at_ms >= halted_until:
+        halted_until, peak = None, equity
+        events.append("resumed")
+    peak = equity if peak is None else max(peak, equity)
+    if max_drawdown_pct > 0 and halted_until is None and equity <= peak * (1 - max_drawdown_pct / 100.0) + 1e-12:
+        halted_until = ((at_ms - 1) // DAY_MS + 1) * DAY_MS
+        events.append("halted")
+        if halted_until <= at_ms:  # seen at the daily close itself: already over
+            halted_until, peak = None, equity
+            events.append("resumed")
+    return halted_until, peak, events
+
+
 def risk_at_stake(side: str, entry: float, stop: float, amount: float) -> float:
     """Money lost if the current stop is hit (before costs); 0 once the stop is at or past entry."""
     per_unit = (entry - stop) if side == "long" else (stop - entry)
