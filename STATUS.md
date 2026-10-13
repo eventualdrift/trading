@@ -601,3 +601,51 @@ Code db4371d deployed (HEAD two small commits ahead, agent-side only) · setting
 3. The same-trades dataset extended to stale candles, fetch failures and a model in use.
 4. The `ml` protocol once the reserve holds 100 satellite trades after 2026-09-27.
 5. Monday 10-19: the first cron weekly; its push once credentials exist.
+
+## 2026-10-13 - session (continued): sizing from the marked equity; the coin list at the scan
+
+Code 21aab7f deployed; HEAD c20754a (the window-start anchor, agent-side) · settings 75a58dc389 (unchanged)
+
+**What changed**
+- 01a7fcd: the account replay sizes and caps each position from the satellite's equity at the
+  signal with open positions at the last close (live sizes from its equity at the last price);
+  before, from realised equity alone. The reconcile keys paper's coin list and the strategies in
+  force at the logged scan, not at the candle close plus a fixed lag: a coin that joined the list
+  when the bot woke is judged by the replay. Review (three findings, all confirmed): window seeds
+  are booked on the window-start base (733cde5); the tests pin a late scan and the marked-equity
+  room and budget (af93fa3).
+- Deployed through gate 1: 21aab7f, gate 12:28 to 12:42 UTC (lint, the suite, the suite in a fresh clone,
+  same-trades identical to the golden file, same orders as the running commit: not trade-affecting;
+  the container ran 45 s without a restart). c20754a after it: a window replay starts worth exactly
+  1.0 (the seeds' unrealised P&L is in paper's base already) - replay-side only, waits for the next
+  deploy.
+- Ledger notes (fidelity, the sizing fix): sizing-open-risk-budget-v1, core-robustness,
+  drawdown-limits-v1. BACKLOG: both items ticked; two residuals stay open (the sleeve-transfer
+  shift, the `ml` protocol).
+
+**What the numbers say**
+- The reference with sizing from the marked equity (pinned file, candles identical): combined
+  Sharpe 1.10, satellite 0.58, worst dips 24.5% / 21.8% - inside rounding of the morning's
+  numbers; the gate's limits would be 36.8% / 32.6% / 11 (set 36.5% / 31.7% / 11, unchanged).
+- 10-04 to 10-12: 98 shared signals (92 before the scan-time keying), 95 agree (87 of 92 at the
+  start of the day); one first difference, OGN 10-08 20:00 - paper's equity at the scan was within
+  a tenth of a USDT of its limit (its day's start was set at 00:00:30; the record at 19:58 reads
+  -2.9%), the replay's own path was -4.8% under its 00:00 close (its modelled outcomes within the
+  window and the day-start base differ from paper's). The window-end row is a note now, not a
+  difference.
+- 09-28 to 10-05 (the first weekly window): 51 shared signals (45 before), 47 agree, 1 first
+  difference, 3 knock-on, paper-only 0: the six signals that joined the list at the scan are
+  judged by the replay now.
+- Reproduce:
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@b068c25-75a58dc389.json
+    tradebot reconcile --since "2026-10-04 00:00" --end "2026-10-12 00:00"
+    tradebot reconcile --since "2026-09-28 00:00" --end "2026-10-05 00:00"
+
+**What needs you**
+- As in the entry above: push credentials (none at 12:54 UTC); the halt's resume assumption.
+
+**What's next** (BACKLOG.md)
+1. The same-trades dataset extended to stale candles, fetch failures and a model in use.
+2. Live vs backtest candle history (needs four weeks above 95% uptime; the box has two days).
+3. The sleeve-transfer shift (low), the `ml` protocol when the reserve has 100 trades.
+4. Monday 10-19: the first cron weekly, on the pinned reference; its push once credentials exist.
