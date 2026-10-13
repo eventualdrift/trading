@@ -409,3 +409,26 @@ def test_sizes_come_from_the_marked_equity_like_live():
     run = simulate_satellite([big, later], cfg, idx, closes={"AAA/USDT": px}, open_risk_pct=3.0)
     assert later in run.taken  # 3% of 1.6 holds 3% at stake plus 1% of 1.6; 3% of 1.0 would not
     assert later in simulate_satellite([big, later], cfg, idx, open_risk_pct=3.0).skipped["open-risk budget (3%)"]
+
+
+def test_a_window_replay_is_worth_exactly_one_at_its_start():
+    """A seed's size_frac is paper's notional over the satellite at the window's start, which already
+    holds the seed's unrealised P&L: the replay starts below 1.0 by that much, so its equity at the
+    window's start is 1.0 and the first candidate is sized from 1.0, not from 1.0 plus the seed's gain."""
+    from tradebot.portfolio import simulate_satellite
+
+    cfg = BotConfig()
+    idx = pd.date_range("2022-01-01", periods=30, freq="D", tz="UTC")
+    hours = pd.date_range("2021-12-25", periods=24 * 20, freq="h", tz="UTC")
+    px = pd.Series(100.0, index=hours)
+    px[hours >= pd.Timestamp("2021-12-28", tz="UTC")] = 150.0  # the seed is up 50% before the window
+    seed = hourly_trade("AAA/USDT", 24 * 2, 24 * 15, 0.0, start="2021-12-25")
+    seed.size_frac = 0.20  # 20% of the satellite at the window's start (2022-01-01), gain included
+    first = hourly_trade("BBB/USDT", 24 * 8, 24 * 12, 0.05, start="2021-12-25")  # 2022-01-02
+    gain = 0.20 * (0.5 - 0.001)
+    run = simulate_satellite([seed, first], cfg, idx, closes={"AAA/USDT": px}, start_equity=1.0 - gain)
+    assert run.sizes == pytest.approx([0.20, 0.10])  # the seed at its paper size; BBB 10% of exactly 1.0
+    assert run.realized_end == pytest.approx(1.0 - gain + 0.05 * 0.10, rel=1e-6)
+    assert run.equity.iloc[0] == pytest.approx(1.0, abs=1e-9)  # the window's first daily close: 1.0 + 0
+    naive = simulate_satellite([seed, first], cfg, idx, closes={"AAA/USDT": px})
+    assert naive.realized_end == pytest.approx(1.0 + 0.05 * 0.10 * (1.0 + gain), rel=1e-6)  # BBB sized from 1.0998

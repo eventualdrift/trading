@@ -236,12 +236,22 @@ def _slot_decisions(cfg: BotConfig, candidates: list[Trade], seeds: list[Trade],
     the breakers' equity checks per candidate). ``marks``: closes per coin (finest timeframe first) to
     value the satellite at each signal for the breakers; its equity path starts at the window (the
     peak before it is not known here)."""
-    from .portfolio import simulate_satellite
+    from .portfolio import Marks, simulate_satellite
 
     idx = pd.date_range(pd.Timestamp(min(since_ms, *(int(s.entry_time.value // 1_000_000) for s in seeds))
                                      if seeds else since_ms, unit="ms", tz="UTC").floor("D"),
                         pd.Timestamp(end_ms, unit="ms", tz="UTC").ceil("D"), freq="D")
-    run = simulate_satellite(seeds + candidates, cfg, idx, marks=marks)
+    # the seeds' unrealised P&L at the window's start is already in paper's equity there (the base of
+    # their size_frac): start below 1.0 by that much, so the replay is worth exactly 1.0 at the start
+    valuer = Marks(marks)
+    fee = cfg.costs_model().entry_fee
+    start_equity = 1.0
+    for s in seeds:
+        px = valuer.price(s.symbol, since_ms)
+        if s.size_frac is not None and px is not None:
+            sign = 1.0 if s.side == "long" else -1.0
+            start_equity -= s.size_frac * (sign * (px / s.entry_price - 1.0) - fee)
+    run = simulate_satellite(seeds + candidates, cfg, idx, marks=marks, start_equity=start_equity)
     out = {id(t): "taken" for t in run.taken}
     for reason, ts in run.skipped.items():
         for t in ts:

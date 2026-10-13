@@ -143,7 +143,8 @@ def breaker_rule(cfg: BotConfig) -> str:
 
 def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIndex,
                        closes: dict[str, pd.Series] | None = None,
-                       open_risk_pct: float | None | str = "config", marks: dict | None = None) -> SatelliteRun:
+                       open_risk_pct: float | None | str = "config", marks: dict | None = None,
+                       start_equity: float = 1.0) -> SatelliteRun:
     """Replay the satellite's trades like the live account and mark open ones to market daily.
 
     ``open_risk_pct``: the open-risk budget rule instead of max_open_positions (default: whatever
@@ -154,7 +155,9 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     coin, finest timeframe first; default ``closes``, the daily ones): no new entry once the
     satellite is risk.daily_loss_limit_pct below its equity at 00:00 UTC, none while it is halted
     risk.max_drawdown_pct below its peak; a halt is resumed at the next daily close with the peak
-    restarted there, as the owner's /resume does."""
+    restarted there, as the owner's /resume does. ``start_equity``: the realised equity the replay
+    starts from (a window replay seeded with open paper positions passes 1 minus their unrealised
+    P&L at the window's start, so the satellite is worth exactly 1.0 there, like paper's)."""
     r = cfg.risk
     budget = r.max_open_risk_pct if open_risk_pct == "config" else open_risk_pct
     index = _ns(index)
@@ -162,7 +165,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     closes = closes or {}
     valuer = Marks(marks if marks is not None else closes)
     entry_fee = cfg.costs_model().entry_fee
-    equity = 1.0
+    equity = start_equity
     open_: list[tuple[Trade, float, float]] = []  # (trade, notional, pnl)
     booked: list[tuple[Trade, float, float]] = []
     skipped: dict[str, list[Trade]] = {}
@@ -172,7 +175,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     breaker_checks: dict[int, dict] = {}
     limit_days: set[int] = set()
     daily_limit, dd_limit = r.daily_loss_limit_pct / 100.0, r.max_drawdown_pct / 100.0
-    peak = day_start = 1.0
+    peak = day_start = start_equity
     halted_until: int | None = None  # the resume: the first daily close after the halt
     ordered = sorted(trades, key=live_order)
     starts = ([_ms(index[0])] if n else []) + ([_ms(ordered[0].entry_time)] if ordered else [])
@@ -313,7 +316,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
         path = np.where(np.isnan(path), t.entry_price, path)
         unreal[span] += notional * (sign * (path / t.entry_price - 1.0) - entry_fee)
         gross[span] += notional * path / t.entry_price
-    eq = 1.0 + np.cumsum(realized) + unreal
+    eq = start_equity + np.cumsum(realized) + unreal
     return SatelliteRun(
         equity=pd.Series(eq, index=index),
         exposure=pd.Series(np.divide(gross, eq, out=np.zeros(n), where=eq > 0), index=index),
