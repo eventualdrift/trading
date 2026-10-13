@@ -158,3 +158,17 @@ def test_an_unresolved_core_order_holds_the_breakers_and_new_entries(cfg):
     assert db.kv_get("testnet:peak_equity") is None  # no breaker read the half-booked equity
     bot.tick(T0 + 60_000)  # the order resolves: everything resumes
     assert not bot.core.pending and bot._entry_block(signal(), [], 1000.0) != "a core order is unresolved"
+
+
+def test_the_core_day_waits_for_an_unresolved_core_order(cfg):
+    import ccxt
+
+    client, market, db, notes, bot = make_testnet_bot(cfg, [(100, 101, 99, 100)], core=0.65)
+    bot.core.initialize(650.0)
+    client.ex.fail["buy"] = ("after", ccxt.RequestTimeout("timed out"))
+    client.ex.trades_down = True  # the fill can't be booked yet
+    with pytest.raises(Exception):
+        bot.core.rebalance(T0, {"BTC/USDT": 100.0, "ETH/USDT": 10.0}, {"BTC/USDT": 1.0, "ETH/USDT": 0.0})
+    cash, last = bot.core.cash, db.kv_get("testnet:core_last_day")
+    bot._maybe_core_day(T0 + DAY)  # a core day (and a sleeve reset) comes round
+    assert bot.core.cash == cash and db.kv_get("testnet:core_last_day") == last  # nothing moved, retried later

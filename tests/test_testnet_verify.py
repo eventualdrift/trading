@@ -128,3 +128,18 @@ def test_an_earlier_run_s_leftovers_are_cancelled_not_taken_for_a_bot():
     old = client.ex.create_order("BTC/USDT", "market", "sell", 0.4, None, {"stopLossPrice": 90.0, "clientOrderId": "tbvsOLD"})
     steps = run(client)
     assert steps[0].ok and client.ex.orders[old["id"]]["status"] == "canceled"
+
+
+def test_an_earlier_run_s_leftover_pair_is_cancelled_whole():
+    from tradebot.execution import LiveBroker
+    from tradebot.models import Position, Signal
+
+    client = FakeSpotClient()
+    left = LiveBroker(client, "USDT", testnet=True, id_tag="v")
+    sig = Signal("BTC/USDT", "1h", "verify", "long", 100.0, 95.0, 110.0, 0, 0, 0, 10)
+    p = Position.from_signal(sig, "testnet", 0.5, 0)
+    left.open_position(p, 100.0, 1)
+    left.protect(p, 2)  # a pair from a run killed before its clean-up
+    steps = run(client)
+    assert steps[0].ok and all(s.ok for s in steps), [(s.name, s.detail) for s in steps if not s.ok]
+    assert client.ex.orders[p.sl_order_id]["status"] == client.ex.orders[p.protection["tp_order_id"]]["status"] == "canceled"

@@ -293,6 +293,8 @@ class TradingBot:
         day = last_closed_open_ms(now_ms - delay, "1d")
         if day <= self._get("core_last_day", 0) or now_ms < self._core_retry_at:
             return
+        if self.core.pending:  # an unbooked core fill reads as the satellite's: no split, reset or rebalance
+            return  # until it is booked (the day is retried on a later tick)
         c = self.cfg.core
         prices = {}
         for s in c.symbols:

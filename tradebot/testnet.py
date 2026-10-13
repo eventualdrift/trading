@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import time
+
+import ccxt
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -104,7 +106,10 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
         opened = [(s, o) for s in sorted({symbol, *core_symbols}) for o in rec.fetch_open_orders(s)]
         for s, o in opened:  # an earlier run's leftovers (a run killed before its clean-up): cancelled
             if str(o.get("clientOrderId") or "").startswith("tbv"):
-                rec.cancel_order(str(o["id"]), s)
+                try:
+                    rec.cancel_order(str(o["id"]), s)
+                except ccxt.OrderNotFound:  # an OCO leg: cancelling its sibling cancelled the pair
+                    pass
         busy = [o for s, o in opened if str(o.get("clientOrderId") or "").startswith("tb")
                 and not str(o.get("clientOrderId") or "").startswith("tbv")]
         if busy:  # a testnet bot on these keys: its orders and the run's would get in each other's way
