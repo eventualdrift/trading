@@ -27,12 +27,6 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   learns train as live's do on every configured timeframe, 0.64 with on the replayed timeframes
   only: the sign flips with the training set; the strategies were selected on that data).
   - Done when: registered, run once, recorded; only a pass sets `ML_IN_REPLAY = True`, through gate 1.
-- [ ] **Sleeve transfers and the breakers' thresholds** (low, from the 2026-10-13 review): live shifts
-  `peak_equity` and `day_start_equity` by the amount moved between sleeves (`_shift_breakers`), so the
-  distance to both thresholds changes with each transfer; the replay's normalised satellite path
-  doesn't see transfers. A few tenths of a percent around the first split and each 30-day reset.
-  - Done when: either the replay carries the sleeve amounts through resets (model live as it is), or
-    the owner decides live should preserve the ratio instead (a live change: stop-and-ask).
 - [ ] **Live vs backtest candle history** - live computes indicators on the last 1000 candles at
   most, the backtest on the full history. Signals reported as "scanned, live found no signal" (and
   paper-only "entry condition false on the full history") measure the difference.
@@ -41,26 +35,13 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
     on candles cut like the scanner's with the backtest's, and says whether truncation explains it.
     A fix on the backtest side is a fidelity fix; anything on the live side is a stop-and-ask.
 - [ ] **Weekly automation on the box** - the cron is installed (2026-10-12: Monday weekly, daily
-  drawdown gate, nightly backup). The weekly's push needs the owner's `gh auth login` for the
-  tradebot user (Needs the owner); the first cron weekly is 2026-10-19.
+  drawdown gate, nightly backup). Pushes work since the owner logged `gh` in for the tradebot user
+  (2026-10-13); the first cron weekly is 2026-10-19.
   - Done when: two Monday entries in STATUS.md came from cron, each with uptime above 95% and a
     Telegram summary sent, and the push went through.
 
 ## Go-live (stop and ask: the owner decides each)
 
-- [ ] **Every protective exit on the exchange.** Built for the testnet path (2026-10-13, see STATUS.md):
-  at entry an OCO pair on the exchange - a take-profit trigger and the stop-loss; breakeven and trailing
-  move the exchange stop in one cancel-replace request (no gap between requests; a move through the price
-  sells at once, a refused one puts a stop back at once, a lost answer is resolved by client id, a crash
-  mid-move is settled at start-up). The take-profit leaves the exchange at the first move: Binance spot
-  can't keep it across a move without about 0.4 s with no stop (your call, under Needs the owner).
-  - Done when: `tradebot testnet verify` passes on the testnet (waits for the testnet keys), and the
-    owner accepts the take-profit trade-off (the readiness check reports it until then).
-- [ ] **Core sleeve live order path.** Built for the testnet path (2026-10-13): market orders with a
-  client id saved before sending, the ledger from the fills, a lost answer resolved by client id; the
-  core's cash and coins kept out of the satellite's equity, free cash and coin checks. `mode: live` is
-  refused in code (`config.LIVE_TRADING`).
-  - Done when: `tradebot testnet verify` passes its core step on the testnet.
 - [ ] **The ML filter**: off in code since 2026-10-10. It comes back only through a2 and a passed
   `ml` protocol; until then paper and the backtest take the same signals at the same size.
 - [ ] **The core/satellite split before live.** The restated finding (STATUS.md, 2026-10-07): no
@@ -72,16 +53,7 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Needs the owner
 
-- [ ] **Testnet keys** (testnet money only; DEPLOY.md step 10): `TESTNET_API_KEY` and `TESTNET_API_SECRET`
-  from testnet.binance.vision in `~/tradebot-agent/.env`, so `tradebot testnet verify` can run.
-- [ ] **The take-profit across stop moves** (a trade-off only the owner can make): keep the stop gap-free
-  and the take-profit off the exchange after the first move (built), or keep the take-profit on the
-  exchange and accept about 0.4 s with no stop on every move (not built).
-- [ ] **The drawdown halt's resume** (an assumption to confirm): live halts new entries at 15% below
-  the satellite's peak until the owner sends /resume (which restarts the peak). The replay assumes
-  the resume at the next daily close. Say if a halt would stay longer in practice; the replay
-  would model that instead.
-- [ ] **Move the bot to an always-on Linux box** (DEPLOY.md) - done except the key above.
+Nothing open (2026-10-13).
 
 ## Later
 
@@ -93,8 +65,33 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   satellite (survivorship). Done when: a universe built from volume ranks as of each date
   (including delisted coins) exists, and any use of it in a verdict goes through a registered
   protocol.
+- [ ] **A social-attention signal** (the owner's item, 2026-10-13): X/Twitter mention volume or
+  sentiment as an input. Not pursued until a priced historical source exists: there is no historical
+  data at a sane price (full-archive search is Enterprise only; pay-per-use covers 7 days), about 14%
+  of crypto accounts are bots, and the effects found are concentrated in memecoins at 1-4 day
+  horizons. Then a registered protocol like anything else.
+  - Done when: a historical source with a price is found and recorded here; anything further is a
+    registered protocol on untouched data.
 
 ## Done
+
+- [x] Sleeve transfers and the breakers' thresholds: live scales `peak_equity` and `day_start_equity`
+  with each transfer, so the satellite stays as far from both limits in percent as the replay's
+  rescaled path (under the owner's risk policy: the replay models it, the breakers scenario covers a
+  reset, live now matches). e98d271
+- [x] The stop on the exchange at all times (go-live item; the owner's rule, 2026-10-13: the stop rests
+  on the exchange through every move, the take-profit is bot-managed after the first move): an OCO pair
+  at entry, each stop move one cancel-replace request; the go-live check reworded to the rule.
+  Testnet-verified 2026-10-13 (`tradebot testnet verify`, all nine steps). dd399b4, ca4f810, f9d90ad,
+  c750ff8, e98d271
+- [x] The core's live order path (go-live item): market orders with a client id saved before sending,
+  booked from the fills; testnet-verified 2026-10-13 (the core step). dd399b4 to c750ff8
+- [x] The drawdown halt resumes at the next daily close with the peak restarted (the owner's risk
+  policy, 2026-10-13): live runs the replay's own step (`risk.drawdown_step`); an operational halt still
+  waits for /resume; the same-trades check covers both breakers (a breakers scenario, 1f50e39). e98d271
+- [x] Testnet keys (owner, 2026-10-13), in the agent's `.env` only
+- [x] Move the bot to an always-on Linux box (DEPLOY.md): running in docker on the box; push
+  credentials and testnet keys in place (2026-10-13)
 
 - [x] Push credentials for the box: `gh` logged in as tradebot (owner, 2026-10-13); pushes work
 - [x] The same-trades dataset extended (owner's item): three stored scenarios run through the real bot
