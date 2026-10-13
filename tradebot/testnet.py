@@ -39,17 +39,23 @@ class Step:
 
 
 class Recorder:
-    """Passes everything through to the exchange object, and records the order requests."""
+    """Passes everything through to the exchange object, and records the order requests and the
+    client ids the run sent (clean-up touches only those)."""
 
     def __init__(self, ex):
         self.__dict__["_ex"] = ex
         self.__dict__["requests"] = []
+        self.__dict__["client_ids"] = set()
 
     def __getattr__(self, name):
         attr = getattr(self._ex, name)
         if name in WATCHED and callable(attr):
             def call(*a, **k):
                 self.requests.append(name)
+                params = (a[-1] if a and isinstance(a[-1], dict) else None) or k.get("params") or {}
+                for key in ("clientOrderId", "newClientOrderId", "aboveClientOrderId", "belowClientOrderId"):
+                    if params.get(key):
+                        self.client_ids.add(str(params[key]))
                 return attr(*a, **k)
             return call
         return attr
@@ -95,6 +101,12 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
     broker = LiveBroker(client, quote, testnet=True, sleep=sleep, clock=clock)
     try:
         base = client.market(symbol)["base"]
+        busy = [o for s in {symbol, *core_symbols} for o in rec.fetch_open_orders(s)
+                if str(o.get("clientOrderId") or "").startswith("tb")]
+        if busy:  # a testnet bot on these keys: its orders and the run's would get in each other's way
+            step("account", False, f"{len(busy)} bot orders are open on this testnet account - a testnet bot seems "
+                 f"to be running on the same keys; stop it before verifying")
+            return steps
         start = rec.fetch_balance()
         free_quote = float((start.get("free") or {}).get(quote) or 0.0)
         start_base = {s: float((start.get("total") or {}).get(client.market(s)["base"]) or 0.0)
@@ -168,10 +180,16 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
             step("an exchange-side exit while the bot isn't looking", pos2.exit_reason in ("take_profit", "stop_loss"),
                  f"{pos2.exit_reason} at {pos2.exit_price:,.2f} (levels {pos2.initial_stop:,.2f} / {pos2.take_profit:,.2f})")
         else:
+            legs = [rec.fetch_order(i, symbol) for i in (pos2.sl_order_id, pos2.protection.get("tp_order_id")) if i]
+            unbooked = [o for o in legs if float(o.get("filled") or 0.0) > 0]
             broker.close_position(pos2, client.fetch_last_price(symbol), "verify", clock())
-            step("an exchange-side exit while the bot isn't looking", None,
-                 f"the testnet price stayed between {pos2.initial_stop:,.2f} and {pos2.take_profit:,.2f} for "
-                 f"{wait_s / 60:.0f} minutes; sold")
+            if unbooked:
+                step("an exchange-side exit while the bot isn't looking", False,
+                     f"an exit order filled on the exchange but sync did not book it: {[o.get('id') for o in unbooked]}")
+            else:
+                step("an exchange-side exit while the bot isn't looking", None,
+                     f"the testnet price stayed between {pos2.initial_stop:,.2f} and {pos2.take_profit:,.2f} for "
+                     f"{wait_s / 60:.0f} minutes; sold")
 
         # 7. lost answers
         cid, sent = new_client_id("v"), clock()
@@ -192,11 +210,12 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
         broker.reserved = core.reserved
         core.initialize(2 * budget)
         prices = {s: client.fetch_last_price(s) for s in core_symbols}
+        before = rec.fetch_balance().get("total") or {}  # the core's own change: not the satellite's dust
         bought = core.rebalance(clock(), prices, {s: 1.0 for s in core_symbols})
         held = dict(core.holdings)
         now_bal = rec.fetch_balance().get("total") or {}
-        match = all(abs(float(now_bal.get(client.market(s)["base"]) or 0) - start_base.get(s, 0.0) - q)
-                    <= max(1e-6, 0.01 * q) for s, q in held.items())
+        coin = lambda b, s: float(b.get(client.market(s)["base"]) or 0)  # noqa: E731
+        match = all(abs(coin(now_bal, s) - coin(before, s) - q) <= max(1e-6, 0.01 * q) for s, q in held.items())
         sold = core.rebalance(clock(), prices, {s: 0.0 for s in core_symbols})
         cid, sent = new_client_id("c"), clock()
         s0 = core_symbols[0]
@@ -218,12 +237,12 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
 
 
 def _clean_up(client, rec, symbols, start_base: dict, log) -> Step:
-    """Cancel every bot order still open on the symbols, sell what the run bought."""
-    left = []
+    """Cancel the run's own orders still open, sell what the run bought; report any dust left."""
+    left, dust = [], []
     for s in sorted(symbols):
         try:
             for o in rec.fetch_open_orders(s):
-                if str(o.get("clientOrderId") or "").startswith("tb"):
+                if str(o.get("clientOrderId") or "") in rec.client_ids:
                     try:
                         rec.cancel_order(str(o["id"]), s)
                     except Exception:  # noqa: BLE001 - recorded below
@@ -232,9 +251,13 @@ def _clean_up(client, rec, symbols, start_base: dict, log) -> Step:
             extra = client.amount_to_precision(s, total - start_base.get(s, total))
             if extra * client.fetch_last_price(s) >= 6.0:
                 rec.create_order(s, "market", "sell", extra, None, {"clientOrderId": f"tbvCLEAN{s[:3]}{int(time.time()) % 10_000}"})
+            elif extra > 0:
+                dust.append(f"{extra:g} {client.market(s)['base']}")
         except Exception as exc:  # noqa: BLE001
             left.append(f"{s}: {exc}")
-    step = Step("clean-up", not left, "no bot order left open, the run's coins sold" if not left else "; ".join(left))
+    detail = ("the run's orders cancelled, its coins sold" + (f" (dust under the minimum order left: {', '.join(dust)})"
+                                                              if dust else "")) if not left else "; ".join(left)
+    step = Step("clean-up", not left, detail)
     log(f"  [{'ok' if step.ok else 'FAILED'}] clean-up: {step.detail}")
     return step
 

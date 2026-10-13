@@ -366,3 +366,121 @@ def test_the_satellite_leaves_the_core_s_cash_and_coins_alone(tmp_path):
     with pytest.raises(Exception, match="sold outside the bot"):
         b.close_position(p, 100.0, "exit_signal", 4)
     assert client.ex.free["BTC"] == pytest.approx(core_btc)  # the core's coins were not sold for it
+
+
+# ---------------------------------------------------------------- review fixes
+def test_an_execution_status_unknown_answer_is_resolved_not_taken_as_a_refusal(tmp_path):
+    """-1006 ('execution status unknown') comes back from ccxt as OperationFailed, not NetworkError:
+    the order may have filled, so it is looked up by its client id."""
+    client, b, db, core = core_on_exchange(tmp_path)
+    core.initialize(1000.0)
+    client.ex.fail["buy"] = ("after", ccxt.OperationFailed("binance {\"code\":-1006,\"msg\":\"Execution status unknown.\"}"))
+    trades = core.rebalance(0, {"BTC/USDT": 100.0, "ETH/USDT": 10.0}, {"BTC/USDT": 1.0, "ETH/USDT": 0.0})
+    assert len(trades) == 1 and core.holdings["BTC/USDT"] == pytest.approx(client.ex.free["BTC"])
+    client2, b2, saved = broker()
+    client2.ex.fail["buy"] = ("after", ccxt.OperationFailed("binance status unknown"))
+    p = position(b2)  # the entry too: found by its client id, not "nothing was bought"
+    assert p.status == "open" and p.amount == pytest.approx(0.999)
+
+
+def test_a_filter_failure_in_a_cancel_replace_answer_is_read_from_its_body():
+    """ccxt raises a -2021 whose new order failed PRICE_FILTER as InvalidOrder (its body scan comes
+    first): the body still says the cancel happened, so a stop goes back at once, with no wait."""
+    import json
+
+    client, b, saved, p = protected()
+    client.ex.set_price("BTC/USDT", 106.0)
+    real = client.ex.privatePostOrderCancelReplace
+
+    def filter_failure(params):
+        old = client.ex.orders[str(params["cancelOrderId"])]
+        client.ex._cancel_order(old)
+        raise ccxt.InvalidOrder("binance " + json.dumps({
+            "code": -2021, "msg": "Order cancel-replace partially failed.",
+            "data": {"cancelResult": "SUCCESS", "newOrderResult": "FAILURE",
+                     "cancelResponse": {"orderId": int(old["id"]), "status": "CANCELED"},
+                     "newOrderResponse": {"code": -1013, "msg": "Filter failure: PRICE_FILTER"}}}))
+
+    client.ex.privatePostOrderCancelReplace = filter_failure
+    slept = []
+    b.sleep = lambda s: slept.append(s)
+    b.move_stop(p, p.entry_price)
+    p.breakeven_moved = True
+    b.sync_stop(p, 20)
+    client.ex.privatePostOrderCancelReplace = real
+    assert not slept  # no recvWindow wait with the coins unprotected
+    assert client.ex.coverage() == pytest.approx(p.amount) and client.ex.orders[p.sl_order_id]["status"] == "open"
+
+
+def test_the_sweep_keeps_a_stop_known_only_by_an_unresolved_move_s_client_id():
+    client, b, saved, p = protected()
+    client.ex.set_price("BTC/USDT", 106.0)
+    client.ex.fail["replace"] = ("after", ccxt.RequestTimeout("timed out"))
+    client.ex.down = 5  # the move can't be resolved yet
+    b.move_stop(p, p.entry_price)
+    p.breakeven_moved = True
+    with pytest.raises(ccxt.ExchangeNotAvailable):
+        b.sync_stop(p, 20)
+    new_cid = p.protection["move"]["cid"]
+    known = {p.sl_order_id, p.protection.get("tp_order_id"), new_cid}
+    assert b.cancel_orphans({"BTC/USDT"}, {k for k in known if k}) == []
+    assert client.ex.orders[client.ex.by_cid[new_cid]]["status"] == "open"
+
+
+def test_an_order_read_back_takes_its_fees_from_its_trades(tmp_path):
+    """Binance's order query has no fees: a buy found by lookup is booked with the coins the fee
+    took, from the order's trades - the ledger and the account agree."""
+    client, b, db, core = core_on_exchange(tmp_path)
+    core.initialize(1000.0)
+    client.ex.fail["buy"] = ("after", ccxt.RequestTimeout("timed out"))
+    core.rebalance(0, {"BTC/USDT": 100.0, "ETH/USDT": 10.0}, {"BTC/USDT": 1.0, "ETH/USDT": 0.0})
+    assert core.holdings["BTC/USDT"] == pytest.approx(client.ex.free["BTC"])  # the fee's coins are not booked
+    assert any(c[0] == "trades" for c in client.ex.calls)
+    sold = core.rebalance(1, {"BTC/USDT": 100.0, "ETH/USDT": 10.0}, {"BTC/USDT": 0.0, "ETH/USDT": 0.0})
+    assert [t.side for t in sold] == ["sell"] and core.holdings == {}  # its exit is not refused for missing coins
+
+
+def test_a_bnb_fee_is_not_charged_to_the_core_s_cash(tmp_path):
+    client, b, db, core = core_on_exchange(tmp_path, {"BTC/USDT": 100.0, "ETH/USDT": 10.0, "BNB/USDT": 500.0})
+    client.ex.bnb_fees = True
+    client.ex.free["BNB"] = 1.0
+    core.initialize(1000.0)
+    [t] = core.rebalance(0, {"BTC/USDT": 100.0, "ETH/USDT": 10.0}, {"BTC/USDT": 1.0, "ETH/USDT": 0.0})
+    spent = 10_000.0 - client.ex.free["USDT"]
+    assert core.cash == pytest.approx(1000.0 - spent)  # cash moved as the USDT balance did
+    assert t.fee > 0 and core.holdings["BTC/USDT"] == pytest.approx(client.ex.free["BTC"])  # the fee is recorded
+
+
+def test_a_protection_that_sold_during_its_move_closes_the_position_once():
+    client, b, saved, p = protected()
+    client.ex.set_price("BTC/USDT", 106.0)
+    client.ex.fail["replace"] = ("before", ccxt.RequestTimeout("timed out"))  # the move is in doubt...
+    b.move_stop(p, p.entry_price)
+    p.breakeven_moved = True
+    real = b._resolve_move
+
+    def take_profit_fires_first(pos, now_ms):  # ...and the take-profit fires before it is resolved
+        client.ex.set_price("BTC/USDT", 111.0)
+        return real(pos, now_ms)
+
+    b._resolve_move = take_profit_fires_first
+    b.sync_stop(p, 20)
+    assert p.status == "closed" and p.exit_reason == "take_profit" and p.exit_filled == pytest.approx(p.amount)
+    assert b.sync([p], 21) == []  # nothing counted twice, nothing left
+
+
+def test_a_leg_that_fires_while_the_pair_is_read_back_is_booked_from_the_fresh_read():
+    client, b, saved = broker()
+    p = position(b)
+    real = b._verify_stop
+    fired = []
+
+    def stop_fires_on_read_back(order, symbol, stop, qty):
+        if not fired:
+            fired.append(1)
+            client.ex.set_price("BTC/USDT", 94.0)  # the stop leg triggers between placing and checking
+        return real(order, symbol, stop, qty)
+
+    b._verify_stop = stop_fires_on_read_back
+    b.protect(p, 2)
+    assert p.status == "closed" and p.exit_filled == pytest.approx(p.amount) and p.exit_price == pytest.approx(94.0)

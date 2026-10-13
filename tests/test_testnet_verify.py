@@ -73,3 +73,37 @@ def test_the_command_needs_testnet_keys(tmp_path, monkeypatch, capsys):
     conf.write_text(f"state_dir: {tmp_path / 'state'}\n")
     with pytest.raises(SystemExit, match="TESTNET_API_KEY"):
         main(["--config", str(conf), "--env", str(tmp_path / "none.env"), "testnet", "verify"])
+
+
+def test_a_testnet_account_s_own_coins_and_real_lot_steps_don_t_hide_an_exchange_exit(tmp_path):
+    """The testnet funds every account with coins; Binance's BTC lot step leaves dust. An exit fill
+    is checked against the coins there were once the protection stood, so sync still books it, and
+    the core's check counts only its own change."""
+    client = FakeSpotClient(balances={"BTC": 1.0, "ETH": 100.0}, lot=1e-5)
+    steps = run(client)
+    assert all(s.ok for s in steps), [(s.name, s.detail) for s in steps if not s.ok]
+    exit_step = next(s for s in steps if s.name.startswith("an exchange-side exit"))
+    assert exit_step.ok is True and "take_profit" in exit_step.detail
+    assert client.ex.free["BTC"] == pytest.approx(1.0, abs=2e-4) and client.ex.free["ETH"] == pytest.approx(100.0, abs=2e-3)
+
+
+def test_it_won_t_run_beside_a_testnet_bot_on_the_same_keys():
+    client = FakeSpotClient()
+    client.ex.create_order("BTC/USDT", "market", "buy", 0.5, None, {"clientOrderId": "tbeBOT"})
+    client.ex.create_order("BTC/USDT", "market", "sell", 0.4, None, {"stopLossPrice": 90.0, "clientOrderId": "tbsBOT"})
+    steps = run(client)
+    assert steps[0].ok is False and "testnet bot" in steps[0].detail
+    assert [o["status"] for o in client.ex.orders.values() if o["clientOrderId"] == "tbsBOT"] == ["open"]
+
+
+def test_clean_up_touches_only_the_run_s_own_orders():
+    client = FakeSpotClient()
+    rec = tn.Recorder(client.ex)
+    client.ex = rec
+    rec.create_order("BTC/USDT", "market", "buy", 1.0, None, {"clientOrderId": "tbeRUN"})
+    mine = rec.create_order("BTC/USDT", "market", "sell", 0.5, None, {"stopLossPrice": 90.0, "clientOrderId": "tbsRUN"})
+    rec._ex.create_order("BTC/USDT", "market", "buy", 1.0, None, {"clientOrderId": "tbeOTHER"})
+    other = rec._ex.create_order("BTC/USDT", "market", "sell", 0.5, None, {"stopLossPrice": 90.0, "clientOrderId": "tbsOTHER"})
+    step = tn._clean_up(client, rec, {"BTC/USDT"}, {"BTC/USDT": 0.999}, lambda *_: None)
+    assert step.ok and rec._ex.orders[mine["id"]]["status"] == "canceled"
+    assert rec._ex.orders[other["id"]]["status"] == "open"

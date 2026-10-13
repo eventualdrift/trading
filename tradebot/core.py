@@ -202,15 +202,17 @@ class CoreSleeve:
             self._set("pending", None)
             return None
         holdings = self.holdings
-        if side == "buy":  # a fee taken in the coin arrives as fewer coins; any other is a cost in quote
+        # the ledger moves as the balances did: a fee taken in the coin is fewer coins, one taken in quote
+        # is less cash; one paid in another coin (BNB) touches neither - it is recorded as the trade's fee
+        quote_fee = fill.get("quote_fee", fill["fee"] - fill["base_fee"] * fill["avg"])
+        if side == "buy":
             got = fill["filled"] - fill["base_fee"]
-            other_fees = fill["fee"] - fill["base_fee"] * fill["avg"]
-            self._set("cash", self.cash - fill["filled"] * fill["avg"] - other_fees)
+            self._set("cash", self.cash - fill["filled"] * fill["avg"] - quote_fee)
             holdings[symbol] = holdings.get(symbol, 0.0) + got
             qty = got
         else:
-            self._set("cash", self.cash + fill["filled"] * fill["avg"] - fill["fee"])
-            holdings[symbol] = holdings.get(symbol, 0.0) - fill["filled"]
+            self._set("cash", self.cash + fill["filled"] * fill["avg"] - quote_fee)
+            holdings[symbol] = holdings.get(symbol, 0.0) - fill["filled"] - fill["base_fee"]
             qty = fill["filled"]
         self._set("holdings", {k: v for k, v in holdings.items() if v > 1e-12})
         t = CoreTrade(symbol, side, qty, fill["avg"], fill["fee"], pending.get("w_from", 0.0), pending.get("w_to", 0.0))

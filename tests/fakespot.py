@@ -28,11 +28,14 @@ TESTNET = "https://testnet.binance.vision/api/v3"
 
 
 class FakeSpot:
-    def __init__(self, prices=None, quote_balance=10_000.0):
+    def __init__(self, prices=None, quote_balance=10_000.0, balances=None, lot=1e-6):
+        """``balances``: other coins already on the account (the testnet funds every account with
+        some); ``lot``: the quantity step (Binance BTCUSDT: 0.00001)."""
         self.prices = dict(prices or {"BTC/USDT": 100.0, "ETH/USDT": 10.0})
+        self.lot = lot
         self.options = {"recvWindow": 10_000}
         self.urls = {"api": {"public": TESTNET, "private": TESTNET, "v1": "https://testnet.binance.vision/api/v1"}}
-        self.free = defaultdict(float, {"USDT": float(quote_balance)})
+        self.free = defaultdict(float, {"USDT": float(quote_balance), **(balances or {})})
         self.locked = defaultdict(float)
         self.orders: dict[str, dict] = {}
         self.by_cid: dict[str, str] = {}
@@ -41,6 +44,7 @@ class FakeSpot:
         self.fail: dict[str, tuple] = {}
         self.down = 0  # the next N reads fail (the exchange unreachable for a while)
         self.fee = 0.001
+        self.bnb_fees = False  # market buys pay their fee in BNB (Binance's fee discount)
         self.fill_fraction = 1.0  # a triggered or market order fills this share; the rest expires
         self.last_http_response = None
         self.coverage_log: list[tuple[str, dict]] = []
@@ -60,9 +64,9 @@ class FakeSpot:
     def symbol_of(self, market_id):
         return next(s for s in self.prices if self.market_id(s) == market_id)
 
-    @staticmethod
-    def amount_to_precision(symbol, a):
-        return f"{int(float(a) * 1e6) / 1e6:.6f}"
+    def amount_to_precision(self, symbol, a):
+        steps = int(float(a) / self.lot + 1e-9)
+        return f"{steps * self.lot:.8f}"
 
     @staticmethod
     def price_to_precision(symbol, p):
@@ -77,8 +81,10 @@ class FakeSpot:
     def _new_id(self):
         return str(len(self.orders) + 1)
 
-    def _pub(self, o):
+    def _pub(self, o, with_fee=True):
         out = {k: v for k, v in o.items() if not k.startswith("_")}
+        if not with_fee:  # GET /api/v3/order has no fills or commission: ccxt gives fee None
+            out["fee"] = None
         out["remaining"] = o["amount"] - o["filled"]
         out["info"] = {"orderListId": o.get("_list", -1), "type": o["_btype"]}
         return out
@@ -179,10 +185,15 @@ class FakeSpot:
             if side == "buy":
                 if filled * px > self.free["USDT"] + 1e-9:
                     raise ccxt.InsufficientFunds("binance Account has insufficient balance for requested action.")
-                fee = filled * self.fee
                 self.free["USDT"] -= filled * px
-                self.free[b] += filled - fee
-                fee_d = {"currency": b, "cost": fee}
+                if self.bnb_fees:  # the fee discount: paid in BNB, the coins arrive whole
+                    fee_d = {"currency": "BNB", "cost": filled * px * self.fee * 0.75 / self.prices.get("BNB/USDT", 500.0)}
+                    self.free["BNB"] -= fee_d["cost"]
+                    self.free[b] += filled
+                else:
+                    fee = filled * self.fee
+                    self.free[b] += filled - fee
+                    fee_d = {"currency": b, "cost": fee}
             else:
                 if float(amount) > self.free[b] + 1e-9:
                     raise ccxt.InsufficientFunds("binance Account has insufficient balance for requested action.")
@@ -266,7 +277,15 @@ class FakeSpot:
             oid = self.by_cid.get(params.get("clientOrderId"))
         if oid not in self.orders:
             raise ccxt.OrderNotFound("binance Order does not exist.")
-        return self._pub(self.orders[oid])
+        return self._pub(self.orders[oid], with_fee=False)
+
+    def fetch_my_trades(self, symbol=None, since=None, limit=None, params=None):
+        """The order's trades (GET /api/v3/myTrades?orderId=): where the fees are."""
+        self.calls.append(("trades", (params or {}).get("orderId")))
+        o = self.orders.get(str((params or {}).get("orderId")))
+        if o is None or not o["filled"]:
+            return []
+        return [{"order": o["id"], "amount": o["filled"], "price": o["average"], "fee": o["fee"]}]
 
     def cancel_order(self, oid, symbol=None, params=None):
         self._injected("cancel")
@@ -314,8 +333,8 @@ class FakeSpotClient:
 
     id = "binance"
 
-    def __init__(self, prices=None, sandbox=True, quote_balance=10_000.0):
-        self.ex = FakeSpot(prices, quote_balance)
+    def __init__(self, prices=None, sandbox=True, quote_balance=10_000.0, balances=None, lot=1e-6):
+        self.ex = FakeSpot(prices, quote_balance, balances, lot)
         self.sandbox = sandbox
         if not sandbox:
             self.ex.urls = {"api": {"public": "https://api.binance.com/api/v3", "private": "https://api.binance.com/api/v3"}}
