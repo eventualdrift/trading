@@ -1006,7 +1006,12 @@ def _gate_same_trades(args, cfg):
     golden = st.load_golden()
     if golden and golden["dataset_sha256"] != st.dataset_sha256():
         sys.exit("The stored dataset no longer matches the golden file: it must never change.")
-    orders = st.replay(days=golden["replay"]["days"] if golden else st.REPLAY_DAYS)
+    days = golden["replay"]["days"] if golden else st.REPLAY_DAYS
+    orders = st.replay(days=days)
+    recorded = dict((golden or {}).get("scenarios") or {})
+    for name, sc in recorded.items():
+        if sc["sha256"] != st.scenario_sha256(name):
+            sys.exit(f"The stored scenario {name} no longer matches the golden file: it must never change.")
     if args.accept:
         if not passed(cfg.state_path, args.accept):
             sys.exit(f"{args.accept} has no passing verdict in the ledger: the golden file stays as it is.")
@@ -1018,11 +1023,14 @@ def _gate_same_trades(args, cfg):
         import json
         import time as _time
 
-        st.write_golden(orders, args.accept, code_version())
+        scenarios = {name: {"sha256": st.scenario_sha256(name), "recorded_by_code": code_version(),
+                            "orders": st.replay(days=days, scenario=name)} for name in recorded}
+        st.write_golden(orders, args.accept, code_version(), scenarios=scenarios)
         _append(cfg.state_path, {"id": args.accept, "kind": "golden", "at": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()),
                                  "code": code_version(), "orders_sha256": hashlib.sha256(
                                      json.dumps(orders, sort_keys=True).encode()).hexdigest()})
-        print(f"Golden file rewritten, accepted by {args.accept}: {st.summary(orders)}")
+        print(f"Golden file rewritten, accepted by {args.accept}: {st.summary(orders)}"
+              + (f"; scenarios re-recorded: {', '.join(scenarios)}" if scenarios else ""))
         return
     if golden is None:
         if not args.init:
@@ -1036,6 +1044,35 @@ def _gate_same_trades(args, cfg):
         print("\n".join(diffs))
         sys.exit(1)
     print(f"identical to the golden file: {st.summary(orders)}")
+    # the scenarios: what the plain orders can't see (a lagging feed, outages, a model in use). A missing
+    # one is recorded once (--record-scenarios); a changed one is a failure-path change, re-recorded the
+    # same way after review - the plain orders above decide whether a registered test is needed
+    to_record = None if args.record_scenarios is None else (set(args.record_scenarios) or set(st.SCENARIOS))
+    failed = []
+    for name in st.SCENARIOS:
+        got = st.replay(days=days, scenario=name)
+        if name in recorded:
+            sdiffs = st.differences(recorded[name]["orders"], got)
+            if not sdiffs:
+                print(f"scenario {name}: identical to the golden file: {st.summary(got)}")
+                continue
+            if to_record is None or name not in to_record:
+                print(f"scenario {name}: ORDERS DIFFER from the golden file - a change to the failure path "
+                      f"(--record-scenarios {name} re-records it once reviewed):")
+                print("\n".join(sdiffs))
+                failed.append(name)
+                continue
+        elif to_record is None or name not in to_record:
+            print(f"scenario {name}: no golden orders yet (--record-scenarios {name} records them, first time only)")
+            failed.append(name)
+            continue
+        recorded[name] = {"sha256": st.scenario_sha256(name), "recorded_by_code": code_version(), "orders": got}
+        print(f"scenario {name}: recorded: {st.summary(got)}")
+    if to_record is not None and not failed:
+        st.write_golden(golden["orders"], golden.get("accepted_by"), golden.get("generated_by_code"),
+                        days=days, scenarios=recorded)
+    if failed:
+        sys.exit(1)
 
 
 def _gate_deploy(args, cfg):
@@ -1170,6 +1207,8 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("gate", help="the gates that replace approvals (CLAUDE.md): same-trades, deploy, drawdown")
     sp.add_argument("gate", choices=["same-trades", "deploy", "drawdown"])
     sp.add_argument("--init", action="store_true", help="same-trades: write the first golden file")
+    sp.add_argument("--record-scenarios", nargs="*", default=None, metavar="NAME",
+                    help="same-trades: record the scenarios' orders in the golden file (names, or all)")
     sp.add_argument("--accept", default=None,
                     help="same-trades: rewrite the golden file for a change that passed this registered test")
     sp.add_argument("--bot-dir", default="~/tradebot", help="deploy: the running bot's checkout")

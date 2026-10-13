@@ -1,0 +1,10 @@
+{
+ "name": "fetch-failures",
+ "note": "Fetches that fail, then recover. The named market methods raise for that symbol (\"*\": every symbol) while now is in [from, to). Stored once (2026-10-13); never regenerated.",
+ "outages": [
+  {"symbol": "SOL/USDT", "methods": ["fetch_last_price", "fetch_last_price_ts", "fetch_price_bars"], "from": "2024-09-15T10:00:00Z", "to": "2024-09-15T13:00:00Z"},
+  {"symbol": "BTC/USDT", "methods": ["fetch_ohlcv_df", "history"], "from": "2024-09-20T00:00:00Z", "to": "2024-09-20T02:00:00Z"},
+  {"symbol": "*", "methods": ["*"], "from": "2024-09-25T12:00:00Z", "to": "2024-09-25T12:30:00Z"},
+  {"symbol": "ETH/USDT", "methods": ["fetch_ohlcv_df"], "from": "2024-10-01T04:00:00Z", "to": "2024-10-01T05:00:00Z"}
+ ]
+}

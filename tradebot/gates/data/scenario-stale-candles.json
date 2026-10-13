@@ -1,0 +1,9 @@
+{
+ "name": "stale-candles",
+ "note": "A feed that publishes candles late. Base (1h) candles opening in [from, to) appear only late_minutes after they close; until each is published, nothing after it is either. Stored once (2026-10-13); never regenerated.",
+ "late": [
+  {"symbol": "ETH/USDT", "from": "2024-09-05T08:00:00Z", "to": "2024-09-05T14:00:00Z", "late_minutes": 90},
+  {"symbol": "BNB/USDT", "from": "2024-09-11T23:00:00Z", "to": "2024-09-12T01:00:00Z", "late_minutes": 420},
+  {"symbol": "SOL/USDT", "from": "2024-09-24T16:00:00Z", "to": "2024-09-24T20:00:00Z", "late_minutes": 45}
+ ]
+}

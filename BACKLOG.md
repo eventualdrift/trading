@@ -25,15 +25,6 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   doesn't see transfers. A few tenths of a percent around the first split and each 30-day reset.
   - Done when: either the replay carries the sleeve amounts through resets (model live as it is), or
     the owner decides live should preserve the ratio instead (a live change: stop-and-ask).
-- [ ] **Extend the same-trades dataset** (owner, 2026-10-12) so the replay exercises what the
-  golden file can't see today: stale candles (a feed that publishes a candle late), fetch
-  failures (a price or candle fetch that errors, then recovers) and an ML model in use (a stored
-  model that filters and sizes signals, so a change to that path shows up as different orders).
-  - Done when: `tradebot/gates/data/` carries a second, stored scenario file for each (never
-    regenerated), the replay runs them through the real bot after the plain one, the golden file
-    records their orders, and `gate same-trades` on this code reports identical orders. The
-    golden file for the new scenarios is written with `--init`-like first-time logic for the new
-    section only; the existing orders stay byte-identical.
 - [ ] **Live vs backtest candle history** - live computes indicators on the last 1000 candles at
   most, the backtest on the full history. Signals reported as "scanned, live found no signal" (and
   paper-only "entry condition false on the full history") measure the difference.
@@ -90,6 +81,12 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Done
 
+- [x] The same-trades dataset extended (owner's item): three stored scenarios run through the real bot
+  after the plain replay - a feed that publishes candles late, fetches that fail and recover, a stored
+  logistic model that filters and sizes signals - each recorded in its own golden section
+  (`gate same-trades --record-scenarios`, first time only; a changed scenario is a failure-path change,
+  re-recorded the same way after review; the plain orders stay byte-identical and still decide whether a
+  registered test is needed) (2026-10-13)
 - [x] Sizing from the marked equity: the replay sizes and caps from the satellite's equity at the signal
   with open positions at the last close, as live does (01a7fcd); reference inside rounding
 - [x] Reconcile: the coin list and strategies in force at the logged scan, not at the close plus a lag

@@ -23,6 +23,9 @@ DAY = 86_400_000
 def test_the_stored_dataset_is_the_one_the_golden_file_was_made_on(tmp_path):
     golden = st.load_golden()
     assert golden["dataset_sha256"] == st.dataset_sha256()
+    for name in st.SCENARIOS:  # the scenarios too: stored, hashed, never regenerated
+        assert golden["scenarios"][name]["sha256"] == st.scenario_sha256(name)
+        assert set(golden["scenarios"][name]["orders"]) == {"positions", "signals", "core_trades"}
     assert golden["replay"]["days"] == st.REPLAY_DAYS and golden["accepted_by"] is None
     st.make_dataset(tmp_path)  # the generator still makes the same bytes; the stored files are what counts
     assert st.dataset_sha256(tmp_path) == golden["dataset_sha256"]
@@ -51,7 +54,12 @@ def _golden_copy(tmp_path, monkeypatch):
 def test_the_same_trades_command(tmp_path, monkeypatch, capsys):
     golden = _golden_copy(tmp_path, monkeypatch)
     orders = st.load_golden()["orders"]
-    monkeypatch.setattr(st, "replay", lambda days=st.REPLAY_DAYS, **_: json.loads(json.dumps(orders)))
+    scen = {k: v["orders"] for k, v in st.load_golden()["scenarios"].items()}
+
+    def fake_replay(days=st.REPLAY_DAYS, scenario=None, **_):
+        return json.loads(json.dumps(scen[scenario] if scenario else orders))
+
+    monkeypatch.setattr(st, "replay", fake_replay)
     conf = tmp_path / "c.yaml"
     conf.write_text(f"state_dir: {tmp_path / 'state'}\n")
     base = ["--config", str(conf), "--env", str(tmp_path / "none.env"), "gate", "same-trades"]
@@ -60,7 +68,8 @@ def test_the_same_trades_command(tmp_path, monkeypatch, capsys):
 
     changed = json.loads(json.dumps(orders))
     changed["positions"][0][6] *= 2  # one entry twice the size
-    monkeypatch.setattr(st, "replay", lambda days=st.REPLAY_DAYS, **_: changed)
+    monkeypatch.setattr(st, "replay", lambda days=st.REPLAY_DAYS, scenario=None, **_: (
+        json.loads(json.dumps(scen[scenario])) if scenario else changed))
     with pytest.raises(SystemExit) as e:
         main(base)
     assert e.value.code == 1 and "ORDERS DIFFER" in capsys.readouterr().out
@@ -72,6 +81,7 @@ def test_the_same_trades_command(tmp_path, monkeypatch, capsys):
     main(base + ["--accept", "risk-double-v1"])
     new = json.loads(golden.read_text())
     assert new["accepted_by"] == "risk-double-v1" and new["orders"] == changed
+    assert {k: v["orders"] for k, v in new["scenarios"].items()} == scen  # re-recorded, unchanged here
     main(base)
     assert "identical" in capsys.readouterr().out.splitlines()[-1]
     assert any(e.get("kind") == "golden" and e["id"] == "risk-double-v1" for e in protocols.ledger(tmp_path / "state"))
@@ -439,3 +449,90 @@ def test_the_weekly_telegram_summary():
     assert "**" not in text and "Full reports" not in text and text.endswith("Needs you: nothing")
     long = telegram_summary("d", "c", ["- x" * 2000], ["a", "b"])
     assert len(long) < 3600 and long.endswith("(STATUS.md has the rest)")
+
+
+# --------------------------------------------------------------------- gate 1: the scenarios
+def test_the_scenario_feed_lags_and_fails_as_scheduled():
+    from tradebot.timeframes import index_ms
+
+    stale = st.ReplayMarket(scenario=st.load_scenario("stale-candles"))
+    plain = st.ReplayMarket()
+    at = st._iso_ms("2024-09-05T10:00:30Z")  # ETH's 08:00 candle (closed 09:00) is published 90 minutes late
+    stale.set_now(at)
+    plain.set_now(at)
+    eth, btc = stale.fetch_ohlcv_df("ETH/USDT", "1h"), stale.fetch_ohlcv_df("BTC/USDT", "1h")
+    assert index_ms(eth.index)[-1] == st._iso_ms("2024-09-05T07:00:00Z")  # nothing from 08:00 on yet
+    assert index_ms(btc.index)[-1] == st._iso_ms("2024-09-05T09:00:00Z") == index_ms(plain.fetch_ohlcv_df("ETH/USDT", "1h").index)[-1]
+    assert index_ms(stale.fetch_ohlcv_df("ETH/USDT", "4h").index)[-1] == st._iso_ms("2024-09-05T04:00:00Z")  # closed 08:00, all of it published
+    stale.set_now(st._iso_ms("2024-09-05T10:31:00Z"))
+    assert index_ms(stale.fetch_ohlcv_df("ETH/USDT", "1h").index)[-1] == st._iso_ms("2024-09-05T08:00:00Z")
+    stale.set_now(st._iso_ms("2024-09-06T00:00:30Z"))  # the lag is over: everything is published
+    plain.set_now(st._iso_ms("2024-09-06T00:00:30Z"))
+    assert len(stale.fetch_ohlcv_df("ETH/USDT", "1h", limit=10**6)) == len(plain.fetch_ohlcv_df("ETH/USDT", "1h", limit=10**6))
+    failing = st.ReplayMarket(scenario=st.load_scenario("fetch-failures"))
+    failing.set_now(st._iso_ms("2024-09-15T11:00:30Z"))
+    with pytest.raises(RuntimeError, match="simulated feed outage: fetch_last_price SOL/USDT"):
+        failing.fetch_last_price("SOL/USDT")
+    assert failing.fetch_last_price("BTC/USDT") > 0 and len(failing.fetch_ohlcv_df("SOL/USDT", "1h"))  # others work
+    failing.set_now(st._iso_ms("2024-09-15T13:00:30Z"))
+    assert failing.fetch_last_price("SOL/USDT") > 0  # recovered
+    failing.set_now(st._iso_ms("2024-09-25T12:10:00Z"))  # everything is down for half an hour
+    for sym in st.SYMBOLS:
+        with pytest.raises(RuntimeError):
+            failing.fetch_ohlcv_df(sym, "1h")
+    model = st.StoredModel.load()
+    assert 0 < model.threshold < 1 and model.report.confidence_scaling and model.feature_columns
+
+
+def test_the_scenarios_run_through_the_real_bot_and_the_model_filters():
+    golden = st.load_golden()
+    for name in st.SCENARIOS:
+        got = st.replay(days=4, scenario=name)
+        cutoff = st.ReplayMarket().start_ms + (st.REPLAY_FROM_DAY + 4) * DAY
+        expected = golden["scenarios"][name]["orders"]
+        assert got["signals"] == [s for s in expected["signals"] if s[4] < cutoff][:len(got["signals"])]
+    ml = st.replay(days=4, scenario="ml-model")
+    assert any(s[5] == "filtered" and "ML probability" in (s[6] or "") for s in ml["signals"])
+    plain = st.replay(days=4)
+    assert not any(s[5] == "filtered" for s in plain["signals"])  # off in code, as in paper
+
+
+def test_the_same_trades_command_records_and_checks_scenarios(tmp_path, monkeypatch, capsys):
+    golden = _golden_copy(tmp_path, monkeypatch)
+    data = json.loads(golden.read_text())
+    orders, scen = data["orders"], {k: v["orders"] for k, v in data["scenarios"].items()}
+    plain_text = "\n".join(st._order_lines(orders, "  "))
+    assert plain_text in golden.read_text()
+    data.pop("scenarios")  # as before the scenarios existed
+    golden.write_text(json.dumps(data))
+    current = {k: json.loads(json.dumps(v)) for k, v in scen.items()}
+    monkeypatch.setattr(st, "replay", lambda days=st.REPLAY_DAYS, scenario=None, **_: (
+        json.loads(json.dumps(current[scenario] if scenario else orders))))
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"state_dir: {tmp_path / 'state'}\n")
+    base = ["--config", str(conf), "--env", str(tmp_path / "none.env"), "gate", "same-trades"]
+    with pytest.raises(SystemExit) as e:  # the plain orders match; the scenarios are not recorded yet
+        main(base)
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and "identical to the golden file" in out and "no golden orders yet" in out
+    main(base + ["--record-scenarios"])
+    out = capsys.readouterr().out
+    assert out.count(": recorded:") == 3
+    written = json.loads(golden.read_text())
+    assert {k: v["orders"] for k, v in written["scenarios"].items()} == scen and written["orders"] == orders
+    assert plain_text in golden.read_text()  # the plain section's bytes as before
+    assert all(v["sha256"] == st.scenario_sha256(k) for k, v in written["scenarios"].items())
+    main(base)
+    assert capsys.readouterr().out.count("identical to the golden file") == 4
+    current["stale-candles"]["signals"].append(["ETH/USDT", "1h", "breakout", "long", 1, "skipped", "x"])
+    with pytest.raises(SystemExit) as e:
+        main(base)
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and "scenario stale-candles: ORDERS DIFFER" in out and "failure path" in out
+    with pytest.raises(SystemExit):  # recording another scenario does not record the changed one
+        main(base + ["--record-scenarios", "ml-model"])
+    capsys.readouterr()
+    main(base + ["--record-scenarios", "stale-candles"])
+    assert "scenario stale-candles: recorded" in capsys.readouterr().out
+    main(base)
+    assert capsys.readouterr().out.count("identical to the golden file") == 4
