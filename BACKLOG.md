@@ -19,25 +19,12 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   learns train as live's do on every configured timeframe, 0.64 with on the replayed timeframes
   only: the sign flips with the training set; the strategies were selected on that data).
   - Done when: registered, run once, recorded; only a pass sets `ML_IN_REPLAY = True`, through gate 1.
-- [ ] **Sizing from the marked equity** (fidelity): live sizes a position from the satellite's equity
-  with open positions at the last price (`broker.equity`); the replay sizes from realised equity
-  (cash plus closed trades). Small most days, large after a big open move.
-  - Done when: the replay sizes from the same marked equity the breakers use, a test shows an open
-    position's gain or loss changes the next size as live, the frozen reference rerun and ledger
-    notes follow, and the same-trades check stays identical.
 - [ ] **Sleeve transfers and the breakers' thresholds** (low, from the 2026-10-13 review): live shifts
   `peak_equity` and `day_start_equity` by the amount moved between sleeves (`_shift_breakers`), so the
   distance to both thresholds changes with each transfer; the replay's normalised satellite path
   doesn't see transfers. A few tenths of a percent around the first split and each 30-day reset.
   - Done when: either the replay carries the sleeve amounts through resets (model live as it is), or
     the owner decides live should preserve the ratio instead (a live change: stop-and-ask).
-- [ ] **Reconcile: the coin list at the scan, not at the close.** The six paper-only signals of
-  BACKLOG b were candles closing at 10-04 00:00 and 08:00 scanned 24-36 minutes later with a coin
-  list refreshed on waking (GLMR, STRK, BEAMX had just entered the top 30). The reconcile keys the
-  backtest's list at the candle close plus a lag, so it doesn't replay them ("not replayed").
-  - Done when: a logged scan's own time picks the list (within a minute), the six become shared
-    rows judged by the replay, and the first weekly window's "paper only" count drops to the
-    signals whose strategy was really not in force.
 - [ ] **Extend the same-trades dataset** (owner, 2026-10-12) so the replay exercises what the
   golden file can't see today: stale candles (a feed that publishes a candle late), fetch
   failures (a price or candle fetch that errors, then recovers) and an ML model in use (a stored
@@ -103,6 +90,10 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Done
 
+- [x] Sizing from the marked equity: the replay sizes and caps from the satellite's equity at the signal
+  with open positions at the last close, as live does (01a7fcd); reference inside rounding
+- [x] Reconcile: the coin list and strategies in force at the logged scan, not at the close plus a lag
+  (01a7fcd): the first weekly window's six paper-only signals are shared rows, 47 of 51 agree, paper-only 0
 - [x] The daily loss limit and the max-drawdown halt in the account replay, on its own equity path
   valued at each signal; window replays seeded at paper's sizes and outcomes; the reconcile names a
   breaker disagreement with both sides' numbers (2362e5f, b068c25; CLAUDE.md rule amended by the
