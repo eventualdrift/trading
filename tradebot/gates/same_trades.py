@@ -10,11 +10,14 @@ The dataset is synthetic and stored, not regenerated, so a change to the synthet
 can't move it. The replay's config is the code's defaults (plus the fixed overrides below), so a
 changed default is caught too. The ML filter is off, as in paper (CLAUDE.md).
 
-Three stored scenarios run after the plain replay, so that what the golden orders can't see is
+Four stored scenarios run after the plain replay, so that what the golden orders can't see is
 seen too: a feed that publishes candles late (``stale-candles``), fetches that fail and recover
-(``fetch-failures``) and a stored model that filters and sizes signals (``ml-model``). Their
-schedules and the model live in ``data/`` and are never regenerated; the golden file records each
-scenario's orders in its own section.
+(``fetch-failures``), a stored model that filters and sizes signals (``ml-model``) and the code's
+default risk limits divided by stored factors, so that the daily loss limit and the drawdown halt
+fire on the dataset (``breakers``; the defaults themselves never do in these 40 days): a change to
+how either breaker acts, or to a default limit, moves its orders. Their schedules, factors and the
+model live in ``data/`` and are never regenerated; the golden file records each scenario's orders
+in its own section.
 """
 from __future__ import annotations
 
@@ -39,7 +42,7 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 SELECTION = [("momentum", "4h"), ("breakout", "1d"), ("breakout", "1h")]
 DATASET_DAYS, DATASET_SEED = 300, 7
 REPLAY_FROM_DAY, REPLAY_DAYS = 240, 40  # the core's 200-day averages exist from day 240
-SCENARIOS = ("stale-candles", "fetch-failures", "ml-model")
+SCENARIOS = ("stale-candles", "fetch-failures", "ml-model", "breakers")
 
 
 # --------------------------------------------------------------------- the dataset
@@ -245,6 +248,20 @@ def replay_config(state_dir: Path, overrides: dict | None = None):
     return cfg
 
 
+def _tightened(spec: dict | None) -> dict:
+    """The breakers scenario's limits: each named default of the code divided by its stored factor
+    (the code's defaults, so a changed default changes the scenario's orders too)."""
+    from ..config import BotConfig
+
+    out = {}
+    for key, factor in ((spec or {}).get("divide_defaults") or {}).items():
+        obj = BotConfig()
+        for part in key.split("."):
+            obj = getattr(obj, part)
+        out[key] = float(obj) / float(factor)
+    return out
+
+
 def _r(x):
     return None if x is None else float(f"{float(x):.10g}")
 
@@ -252,7 +269,7 @@ def _r(x):
 def replay(days: int = REPLAY_DAYS, overrides: dict | None = None, data_dir: Path = DATA_DIR,
            scenario: str | None = None) -> dict:
     """Run the live bot on the fixed dataset and return every order and decision it made; with a
-    ``scenario`` (SCENARIOS), under that scenario's feed or model."""
+    ``scenario`` (SCENARIOS), under that scenario's feed, model or risk limits."""
     from .. import config as config_module
 
     quiet = logging.getLogger("tradebot")
@@ -278,7 +295,7 @@ def _replay(days: int, overrides: dict | None, data_dir: Path, scenario: str | N
 
     spec = load_scenario(scenario, data_dir) if scenario else None
     with tempfile.TemporaryDirectory() as tmp:
-        cfg = replay_config(Path(tmp), overrides)
+        cfg = replay_config(Path(tmp), {**_tightened(spec), **(overrides or {})})  # then the caller's (tests)
         model = None
         if scenario == "ml-model":
             cfg.ml.enabled = True

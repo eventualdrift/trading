@@ -500,6 +500,35 @@ def test_the_scenarios_run_through_the_real_bot_and_the_model_filters():
     assert not any(s[5] == "filtered" for s in plain["signals"])  # off in code, as in paper
 
 
+def test_the_breakers_scenario_fires_both_breakers():
+    """The defaults divided by the stored factors make the daily loss limit and the drawdown halt act
+    on the dataset (the defaults themselves never do in these 40 days), so the gate sees a change to
+    how either acts."""
+    golden = st.load_golden()
+    notes = [s[6] or "" for s in golden["scenarios"]["breakers"]["orders"]["signals"]]
+    assert any(n.startswith("halted (drawdown") for n in notes)
+    assert "daily loss limit reached" in notes
+    plain = [s[6] or "" for s in golden["orders"]["signals"]]
+    assert not any(n.startswith(("halted", "daily loss limit")) for n in plain)
+    assert st._tightened(st.load_scenario("breakers")) == {"risk.max_drawdown_pct": 3.0, "risk.daily_loss_limit_pct": 1.0}
+
+
+def test_a_changed_default_limit_changes_the_breakers_scenario(monkeypatch):
+    """The scenario's limits come from the code's defaults: a default changed in config.py moves
+    them (and so the scenario's orders), where fixed limits would hide it."""
+    import tradebot.config as config
+
+    real = config.BotConfig
+
+    def changed():
+        cfg = real()
+        cfg.risk.max_drawdown_pct, cfg.risk.daily_loss_limit_pct = 20.0, 0.0  # the second switched off
+        return cfg
+
+    monkeypatch.setattr(config, "BotConfig", changed)
+    assert st._tightened(st.load_scenario("breakers")) == {"risk.max_drawdown_pct": 4.0, "risk.daily_loss_limit_pct": 0.0}
+
+
 def test_the_lag_and_the_outages_reach_the_bot(tmp_path):
     """The stored schedules act late in the replay; schedules inside the first days show the wiring:
     the first plain signal (BNB 1h, candle 2024-08-28 17:00) is lost to a lag and to an outage."""
@@ -538,13 +567,13 @@ def test_the_same_trades_command_records_and_checks_scenarios(tmp_path, monkeypa
     assert e.value.code == 1 and "identical to the golden file" in out and "no golden orders yet" in out
     main(base + ["--record-scenarios"])
     out = capsys.readouterr().out
-    assert out.count(": recorded:") == 3
+    assert out.count(": recorded:") == len(st.SCENARIOS)
     written = json.loads(golden.read_text())
     assert {k: v["orders"] for k, v in written["scenarios"].items()} == scen and written["orders"] == orders
     assert plain_text in golden.read_text()  # the plain section's bytes as before
     assert all(v["sha256"] == st.scenario_sha256(k) for k, v in written["scenarios"].items())
     main(base)
-    assert capsys.readouterr().out.count("identical to the golden file") == 4
+    assert capsys.readouterr().out.count("identical to the golden file") == 1 + len(st.SCENARIOS)
     current["stale-candles"]["signals"].append(["ETH/USDT", "1h", "breakout", "long", 1, "skipped", "x"])
     with pytest.raises(SystemExit) as e:
         main(base)
@@ -556,4 +585,4 @@ def test_the_same_trades_command_records_and_checks_scenarios(tmp_path, monkeypa
     main(base + ["--record-scenarios", "stale-candles"])
     assert "scenario stale-candles: recorded" in capsys.readouterr().out
     main(base)
-    assert capsys.readouterr().out.count("identical to the golden file") == 4
+    assert capsys.readouterr().out.count("identical to the golden file") == 1 + len(st.SCENARIOS)

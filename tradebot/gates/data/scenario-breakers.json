@@ -1,0 +1,8 @@
+{
+ "name": "breakers",
+ "note": "The live breakers on the dataset: the code's default risk limits divided by these factors (15% and 3% today, which never fire in these 40 days: 3% and 1%), so the daily loss limit blocks entries and the drawdown halt fires. Mechanics coverage, not settings: paper keeps the defaults. Stored once (2026-10-13); never regenerated.",
+ "divide_defaults": {
+  "risk.max_drawdown_pct": 5,
+  "risk.daily_loss_limit_pct": 3
+ }
+}
