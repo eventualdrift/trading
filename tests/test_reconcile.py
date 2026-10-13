@@ -401,14 +401,17 @@ def test_the_coin_list_at_the_scan_decides_what_is_replayed(paper_run, tmp_path)
     base = run_reconcile(paper_run, db2)
     row = next(r for r in base.rows if r.paper.startswith("opened") and r.backtest == "taken")
     close = row.candle_ms + HOUR
-    scan_ts = next(ts for ts, d in db2.botlog("paper", "scan") if d["tf"] == "1h" and int(d["candle"]) == row.candle_ms)
-    assert scan_ts > close
+    scan_ts = close + 24 * 60_000  # the bot woke 24 minutes after the close (as on 10-04) and scanned then
+    for d in (db2,):
+        d._conn.execute("UPDATE botlog SET ts=? WHERE kind='scan' AND data LIKE ?",
+                        (scan_ts, f'%"candle": {row.candle_ms},%'))
     others = [s for s in market.symbols if s != row.symbol]
     db2.log_bot(close - 30 * 60_000, "paper", "universe", others)  # the coin was out of the list at the close
     db2.log_bot(scan_ts, "paper", "universe", list(market.symbols))  # and back in it when the scan ran
     new = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db2).rows}[(row.symbol, row.candle_ms)]
     assert new.backtest == "taken" and new.paper == row.paper
     db3 = copy_db(db, tmp_path / "scan3.db")  # out of the list at the scan too: not replayed
+    db3._conn.execute("UPDATE botlog SET ts=? WHERE kind='scan' AND data LIKE ?", (scan_ts, f'%"candle": {row.candle_ms},%'))
     db3.log_bot(close - 30 * 60_000, "paper", "universe", others)
     db3.log_bot(scan_ts + HOUR, "paper", "universe", list(market.symbols))
     gone = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db3).rows}[(row.symbol, row.candle_ms)]

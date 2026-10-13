@@ -395,3 +395,17 @@ def test_sizes_come_from_the_marked_equity_like_live():
         assert run.realized_end == pytest.approx(1.0 + 0.05 * expect, rel=1e-6)  # ... so BBB earns 5% of that
     run = simulate_satellite([held, later], cfg, idx)  # no marks: sized from the realised 1.0
     assert run.realized_end == pytest.approx(1.0 + 0.05 * 0.10, rel=1e-6)
+    # the exposure room and the open-risk budget come from the marked equity too
+    big = hourly_trade("AAA/USDT", 24 * 2, 24 * 9, 0.0)
+    big.size_frac = 0.30  # 30% of equity, stop 10%: 3% at stake
+    px = pd.Series(100.0, index=hours)
+    px[hours >= t0 + pd.Timedelta(hours=24 * 4)] = 300.0  # tripled: the satellite is worth 1.6 at the next signal
+    cfg.risk.max_total_exposure_pct = 25.0  # caps the seed at 0.25 too
+    run = simulate_satellite([big, later], cfg, idx, closes={"AAA/USDT": px})
+    marked = 1.0 + 0.25 * (2.0 - 0.001)  # AAA tripled, less its fee
+    assert run.sizes[1] == pytest.approx((marked * 0.25 - 0.25) / marked)  # the room left, of the marked equity
+    assert later in simulate_satellite([big, later], cfg, idx).skipped["total exposure limit"]  # none of 1.0
+    cfg.risk.max_total_exposure_pct = 100.0
+    run = simulate_satellite([big, later], cfg, idx, closes={"AAA/USDT": px}, open_risk_pct=3.0)
+    assert later in run.taken  # 3% of 1.6 holds 3% at stake plus 1% of 1.6; 3% of 1.0 would not
+    assert later in simulate_satellite([big, later], cfg, idx, open_risk_pct=3.0).skipped["open-risk budget (3%)"]
