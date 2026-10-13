@@ -353,6 +353,12 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         for e in d.get("errors", []):
             scan_errors[(e.split(" ")[0], d["tf"], int(d["candle"]))] = e
     scans = db.botlog(mode, "scan")
+    scan_at = {(d["tf"], int(d["candle"])): ts for ts, d in scans}  # when each candle was really scanned
+
+    def scan_time(tf: str, candle_ms: int) -> int:
+        """When paper scanned this candle: the logged scan (the coin list and strategies in force
+        then are what it used), else minutes after the close."""
+        return scan_at.get((tf, candle_ms), candle_ms + tf_ms(tf) + SCAN_LAG_MS)
     rec.scans_logged_from = scans[0][0] if scans else None
     scanned = {(d["tf"], int(d["candle"])) for _, d in scans}
     stale = {(d["tf"], int(d["candle"])): d for _, d in db.botlog(mode, "scan_skipped")}
@@ -364,7 +370,7 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
     bt = backtest_signals(datasets, all_combos, cfg, context, since_ms, end_ms)
 
     def active(s: BtSignal) -> bool:
-        t = s.candle_ms + tf_ms(s.timeframe) + SCAN_LAG_MS
+        t = scan_time(s.timeframe, s.candle_ms)
         return s.combo in _combos(selections.at(t)) and s.symbol in set(universes.at(t) or [])
 
     def key_of(s: BtSignal) -> tuple:
@@ -451,7 +457,7 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         i = int(np.searchsorted(opens, candle))
         if i >= len(opens) or int(opens[i]) != candle:
             return "the candle is missing from the frozen data"
-        combo = next((v for v in _combos(selections.at(close_ms + SCAN_LAG_MS)).values() if v[:2] == (strat, tf)), None)
+        combo = next((v for v in _combos(selections.at(scan_time(tf, candle))).values() if v[:2] == (strat, tf)), None)
         if combo is None:
             return "that strategy is not in the selection assumed for that time"
         if i < make_strategy(combo[0], combo[2]).warmup:

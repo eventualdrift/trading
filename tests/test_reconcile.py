@@ -391,3 +391,25 @@ def test_an_operational_halt_is_a_live_only_check(paper_run, tmp_path):
     db2._conn.execute("DELETE FROM positions WHERE signal_id=?", (first.id,))
     row = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db2).rows}[(first.symbol, first.candle_time)]
     assert row.cause == "first difference: a live-only check (halted (entry #7 for X/USDT has an unknown outcome (timeout)))"
+
+
+def test_the_coin_list_at_the_scan_decides_what_is_replayed(paper_run, tmp_path):
+    """A coin that joined paper's list when the bot woke and scanned a candle late is judged by
+    the replay: the list in force at the logged scan counts, not the one at the candle's close."""
+    cfg, market, db, *_ = paper_run
+    db2 = copy_db(db, tmp_path / "scan.db")
+    base = run_reconcile(paper_run, db2)
+    row = next(r for r in base.rows if r.paper.startswith("opened") and r.backtest == "taken")
+    close = row.candle_ms + HOUR
+    scan_ts = next(ts for ts, d in db2.botlog("paper", "scan") if d["tf"] == "1h" and int(d["candle"]) == row.candle_ms)
+    assert scan_ts > close
+    others = [s for s in market.symbols if s != row.symbol]
+    db2.log_bot(close - 30 * 60_000, "paper", "universe", others)  # the coin was out of the list at the close
+    db2.log_bot(scan_ts, "paper", "universe", list(market.symbols))  # and back in it when the scan ran
+    new = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db2).rows}[(row.symbol, row.candle_ms)]
+    assert new.backtest == "taken" and new.paper == row.paper
+    db3 = copy_db(db, tmp_path / "scan3.db")  # out of the list at the scan too: not replayed
+    db3.log_bot(close - 30 * 60_000, "paper", "universe", others)
+    db3.log_bot(scan_ts + HOUR, "paper", "universe", list(market.symbols))
+    gone = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db3).rows}[(row.symbol, row.candle_ms)]
+    assert gone.backtest.startswith("(not replayed")

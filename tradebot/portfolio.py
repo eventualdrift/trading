@@ -147,7 +147,9 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
     """Replay the satellite's trades like the live account and mark open ones to market daily.
 
     ``open_risk_pct``: the open-risk budget rule instead of max_open_positions (default: whatever
-    risk.max_open_risk_pct says). Same acceptance and sizing as the live risk manager, and its two
+    risk.max_open_risk_pct says). Same acceptance and sizing as the live risk manager, from the
+    satellite's equity at the signal with open positions at the last close (as live sizes from its
+    equity at the last price), and its two
     breakers on the replay's own equity path - valued along the way from ``marks`` (closes per
     coin, finest timeframe first; default ``closes``, the daily ones): no new entry once the
     satellite is risk.daily_loss_limit_pct below its equity at 00:00 UTC, none while it is halted
@@ -249,7 +251,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
             at_stake = sum(n_ * ot.stop_pct for ot, n_, _ in holding
                            if ot.protected_time is None or ot.protected_time > t.entry_time)
             # admitted on its 1x risk, then sized with the multiplier: entry_block_reason, then size, as live
-            return at_stake + equity * base_frac * t.stop_pct > equity * budget / 100.0 + 1e-12
+            return at_stake + eq_t * base_frac * t.stop_pct > eq_t * budget / 100.0 + 1e-12
 
         if full(open_):
             reason = (f"max open positions ({r.max_open_positions})" if budget is None
@@ -263,12 +265,14 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
         if any(ot.symbol == t.symbol for ot, _, _ in open_):
             skipped.setdefault("already holding that coin", []).append(t)
             continue
-        room = equity * r.max_total_exposure_pct / 100.0 - sum(n_ for _, n_, _ in open_)
+        # sized and capped from the satellite's equity as live sees it at the scan: open positions at the
+        # last price (here the last closed candle), not realised cash alone
+        room = eq_t * r.max_total_exposure_pct / 100.0 - sum(n_ for _, n_, _ in open_)
         if room <= 0:
             skipped.setdefault("total exposure limit", []).append(t)
             continue
-        notional = min(equity * frac, room)  # like the live risk manager: shrink to fit
-        frac = notional / equity
+        notional = min(eq_t * frac, room)  # like the live risk manager: shrink to fit
+        frac = notional / eq_t
         item = (t, notional, notional * t.return_pct)
         open_.append(item)
         booked.append(item)

@@ -374,3 +374,24 @@ def test_the_peak_and_the_halt_are_walked_at_every_candle_close_not_only_daily()
     assert pd.Timestamp(run.breakers[0]["at"], unit="ms", tz="UTC") == t0 + pd.Timedelta(hours=24 * 5 + 4)
     daily = px.resample("1D").last()  # with daily closes only, the intraday dip is invisible
     assert not simulate_satellite([held, noon], cfg, idx, closes={"AAA/USDT": daily}).skipped
+
+
+def test_sizes_come_from_the_marked_equity_like_live():
+    """Live sizes a position from the satellite's equity with open positions at the last price;
+    an open position's gain or loss changes the next size."""
+    from tradebot.portfolio import simulate_satellite
+
+    cfg = BotConfig()
+    idx = pd.date_range("2022-01-01", periods=30, freq="D", tz="UTC")
+    hours = pd.date_range("2022-01-01", periods=24 * 12, freq="h", tz="UTC")
+    t0 = hours[0]
+    held = hourly_trade("AAA/USDT", 24 * 2, 24 * 9, 0.0)  # 10% of equity
+    later = hourly_trade("BBB/USDT", 24 * 5, 24 * 8, 0.05)
+    for move, expect in ((1.5, 0.1 * (1 + 0.1 * (0.5 - 0.001))), (0.5, 0.1 * (1 - 0.1 * (0.5 + 0.001)))):
+        px = pd.Series(100.0, index=hours)
+        px[hours >= t0 + pd.Timedelta(hours=24 * 4)] = 100.0 * move  # AAA +50% / -50% by the next signal
+        run = simulate_satellite([held, later], cfg, idx, closes={"AAA/USDT": px})
+        assert run.sizes[1] == pytest.approx(0.10)  # 10% of the marked equity (AAA at market, less its fee) ...
+        assert run.realized_end == pytest.approx(1.0 + 0.05 * expect, rel=1e-6)  # ... so BBB earns 5% of that
+    run = simulate_satellite([held, later], cfg, idx)  # no marks: sized from the realised 1.0
+    assert run.realized_end == pytest.approx(1.0 + 0.05 * 0.10, rel=1e-6)
