@@ -505,7 +505,7 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
             out.append(f"    Data to {pd.Timestamp(u['data_end_ms'], unit='ms', tz='UTC'):%Y-%m-%d %H:%M} UTC"
                        + (" (frozen: from the universe file)" if u.get("frozen") else ""))
         if u.get("file"):
-            out.append(f"    Reproduce this run: --universe-file {u['file']}")
+            out.append(f"    Reproduce this run: --universe-file {u['file']}" + (" --ml-replay" if u.get("ml_replayed") else ""))
         if u.get("code"):
             from .provenance import config_summary
 
@@ -527,13 +527,19 @@ def _universe_lines(res: "PortfolioBacktest") -> list[str]:
             if diffs is None:
                 out.append("    ! The universe file predates candle pinning: it can't confirm this rerun used the same "
                            "candles as the saved run (the stamped file pins this run's).")
-            elif diffs:
-                out.append(f"    ! Candles differ from the saved run's for {len(diffs)} of {pinned} coin-timeframes (the "
-                           f"cache was refilled since): numbers can differ for that reason alone.")
-                out += [f"      {d}" for d in diffs[:10]] + ([f"      ... {len(diffs) - 10} more"] if len(diffs) > 10 else [])
             else:
-                out.append(f"    Candles: identical to the saved run's ({pinned} coin-timeframes pinned: first and last "
-                           f"candle, rows, hash).")
+                real = [d for d in diffs if "not in the saved run" not in d]
+                extra = len(diffs) - len(real)
+                if real:
+                    out.append(f"    ! Candles differ from the saved run's for {len(real)} of {pinned - extra} coin-timeframes "
+                               f"(the cache was refilled since): numbers can differ for that reason alone.")
+                    out += [f"      {d}" for d in real[:10]] + ([f"      ... {len(real) - 10} more"] if len(real) > 10 else [])
+                else:
+                    out.append(f"    Candles: identical to the saved run's ({pinned - extra} coin-timeframes pinned: first "
+                               f"and last candle, rows, hash).")
+                if extra:
+                    out.append(f"    ({extra} coin-timeframes loaded now were not pinned in the saved run: another timeframe "
+                               f"set, e.g. the ML replay's learns.)")
         elif u.get("candles_pinned"):
             out.append(f"    Candles pinned in the universe file: {u['candles_pinned']} coin-timeframes (frozen reruns "
                        f"check them).")

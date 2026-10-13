@@ -351,3 +351,26 @@ def test_the_breakers_walk_from_the_first_signal_even_before_the_index_starts():
     next_day = hourly_trade("DDD/USDT", 24 * 6, 24 * 8, 0.05)  # day 6 starts at 0.96: not blocked
     run = simulate_satellite(losers + [noon, next_day], cfg, idx)
     assert run.skipped == {"daily loss limit (3%)": [noon]} and next_day in run.taken
+
+
+def test_the_peak_and_the_halt_are_walked_at_every_candle_close_not_only_daily():
+    """Live checks the halt on every loop: a dip that comes and goes between two signals still
+    halts. The replay walks every close of the finest timeframe given."""
+    from tradebot.portfolio import simulate_satellite
+
+    cfg = BotConfig()
+    cfg.risk.daily_loss_limit_pct = 0
+    cfg.risk.risk_per_trade_pct = 5.0  # 30% of equity in the held coin
+    idx = pd.date_range("2022-01-01", periods=30, freq="D", tz="UTC")
+    hours = pd.date_range("2022-01-01", periods=24 * 12, freq="h", tz="UTC")
+    t0 = hours[0]
+    px = pd.Series(100.0, index=hours)
+    px[(hours >= t0 + pd.Timedelta(hours=24 * 5 + 3)) & (hours < t0 + pd.Timedelta(hours=24 * 5 + 9))] = 40.0
+    held = hourly_trade("AAA/USDT", 24 * 2, 24 * 9, 0.0)
+    noon = hourly_trade("BBB/USDT", 24 * 5 + 12, 24 * 8, 0.05)  # the dip is over by noon
+    run = simulate_satellite([held, noon], cfg, idx, closes={"AAA/USDT": px})
+    assert run.skipped == {"drawdown halt (15%)": [noon]}
+    assert [e["what"] for e in run.breakers] == ["halted"]  # nothing is evaluated after the last signal
+    assert pd.Timestamp(run.breakers[0]["at"], unit="ms", tz="UTC") == t0 + pd.Timedelta(hours=24 * 5 + 4)
+    daily = px.resample("1D").last()  # with daily closes only, the intraday dip is invisible
+    assert not simulate_satellite([held, noon], cfg, idx, closes={"AAA/USDT": daily}).skipped

@@ -375,3 +375,19 @@ def test_a_daily_loss_limit_skip_is_a_modelled_check(paper_run, tmp_path):
     assert row.cause.startswith("first difference: the daily loss limit (3%) - paper ") and "vs its day's start" in row.cause
     assert "; the replay " in row.cause and "vs its own (its path from the window's start" in row.cause
     assert "live-only" not in format_reconciliation(rec, cfg)
+
+
+def test_an_operational_halt_is_a_live_only_check(paper_run, tmp_path):
+    """Only the drawdown halt is replayed; a halt for an unknown order outcome is live-only."""
+    cfg, market, db, *_ = paper_run
+    db2 = copy_db(db, tmp_path / "halt.db")
+    base = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db2).rows}
+    positions = db2.positions_by_signal("paper")
+    sigs = sorted(db2.signals_since(0), key=lambda s: s.candle_time)
+    first = next(s for s in sigs if s.id in positions and positions[s.id].status == "closed"
+                 and base[(s.symbol, s.candle_time)].backtest == "taken")
+    db2._conn.execute("UPDATE signals SET status='skipped', note=? WHERE id=?",
+                      ("halted (entry #7 for X/USDT has an unknown outcome (timeout))", first.id))
+    db2._conn.execute("DELETE FROM positions WHERE signal_id=?", (first.id,))
+    row = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db2).rows}[(first.symbol, first.candle_time)]
+    assert row.cause == "first difference: a live-only check (halted (entry #7 for X/USDT has an unknown outcome (timeout)))"

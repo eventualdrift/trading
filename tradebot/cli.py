@@ -390,7 +390,9 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
             for sym, df in datasets[tf].items():
                 sat_marks.setdefault(sym, []).append(df["close"])
         pins = candle_pins(datasets, core_closes)  # the candles this run loaded, pinned for frozen reruns
-        if cfg.ml.active if ml_replay is None else ml_replay:  # the ML filter, as a weekly learn would have had it
+        if ml_replay is None:  # a frozen rerun follows its file; otherwise only when the bot uses the filter
+            ml_replay = bool(frozen["ml_replayed"]) if frozen and frozen.get("ml_replayed") is not None else cfg.ml.active
+        if ml_replay:  # the ML filter, as a weekly learn would have had it
             from .ml.dataset import build_candidates
             from .ml.replay import apply, learn_times, walk_forward
 
