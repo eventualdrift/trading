@@ -501,3 +501,103 @@ Telegram summary.
 2. The reconcile's coin list at the scan; pin the candles in universe files.
 3. a2: the ML filter in the replay, then its `ml` protocol.
 4. The same-trades dataset extended to stale candles, fetch failures and a model in use.
+
+## 2026-10-13 - session: the risk controls modelled, candles pinned, the ML filter replayed
+
+Code db4371d deployed (HEAD two small commits ahead, agent-side only) · settings 75a58dc389 (unchanged)
+
+**What changed**
+- CLAUDE.md (owner, 2026-10-13): "paper runs only what the backtest models" now keeps components
+  that only reduce risk (the daily loss limit, the max-drawdown halt) on, and the replay models
+  them first. Decisions taken as sent: the controls stayed on throughout.
+- 2362e5f: the account replay applies both breakers on its own equity path, valued at each signal
+  from the last closed candle of the finest timeframe replayed (live values from the last price);
+  the daily limit is checked at each signal against the day's 00:00 UTC equity, as live does; a
+  halt is resumed at the next daily close with the peak restarted, as /resume does. Window
+  replays (the reconcile) start from paper's open positions at paper's own sizes and realised
+  outcomes; a breaker disagreement is named with both sides' numbers. Universe files pin the
+  candles a run loaded (per coin and timeframe: first and last candle, rows, hash); a frozen
+  rerun says "identical" or lists what differs; `weekly --set-reference` switches the reference
+  without a check-in. The weekly's Telegram summary and STATUS entry lead with learn's selection
+  changes.
+- b068c25: BACKLOG a2 - the ML filter replayed walk-forward (`portfolio-backtest --ml-replay`):
+  one learn a week from the data start, each trained only on signals whose exit candle had closed
+  by then, promoted only through the live gate; the model in force scores, filters, sizes (the
+  confidence multiplier) and ranks (expected R) each later signal as the live scan does. A test
+  proves no learn sees a later label. Plus the first review's eleven findings (all confirmed,
+  all fixed): seeds carry paper's outcome; the peak is walked at every candle close; the walk
+  starts at the first signal; an operational halt is not the drawdown halt; a saving run loads
+  every frame to one data end so pins match a frozen rerun; a kept stamped file is checked
+  against this run's candles; switching the reference no longer reports a false "moved".
+- db4371d: the second review's findings: the learns train on every configured timeframe (15m,
+  1h, 4h, 1d) as live's learn does; an outcome counts once its exit candle has closed; under the
+  open-risk budget a signal is admitted on its 1x risk and then sized up; the window-end "no
+  next candle" row is a note, not a disagreement; a daily-limit disagreement quotes paper's
+  equity at the scan that decided.
+- Deployed through gate 1: db4371d at 11:29 UTC (lint, the suite, the suite in a fresh clone, same-trades
+  identical to the golden file, same orders as the running commit: not trade-affecting; the
+  container ran 45 s without a restart). The bot has run db4371d since; the two commits after it
+  (rerun flag and messages, tests) change nothing live and wait for the next deploy.
+- The weekly reference is now `reports/universe-20260927-1513@b068c25-75a58dc389.json` (the same
+  run stamped at b068c25 with the box's candle pins: 62 coin-timeframes); Monday's entry reports
+  the switch. Ledger notes through `research note`: sizing-open-risk-budget-v1, core-robustness
+  and drawdown-limits-v1 (the fidelity fix and the reference's move), ml-replay-a2 (information).
+
+**What the numbers say** (`--config config-agent.yaml` from `~/tradebot-agent`; reproduce lines below)
+- **The reference with the breakers**, from the satellite's first trade (2023-01-14): combined
+  +29.3%/yr, worst dip 24.5%, Sharpe 1.10 (was 1.10); core only 1.11; core at the same exposure
+  1.12; satellite +9.5%/yr, worst dip 21.7%, Sharpe 0.58 (was 0.59). The daily loss limit blocked
+  nothing in 3.7 years (1% risk per trade and three slots: a 3% day takes three stops); the halt
+  fired twice (2024-05-09 and 2026-02-22, each resumed the next day), blocking 6 signals. The
+  limits the drawdown gate would set from this replay: account 36.8%, satellite 32.6%, losing run
+  11, against the set 36.5% / 31.7% / 11; the set ones stand (changing them is a registered test)
+  and are the tighter.
+- **Why paper hit the limit on 10-08 and the backtest never does**: RUNE (opened 09-27 00:00, the
+  first candle) was sized from the whole 1,000 before the first sleeve split moved 650 to the
+  core, so its stop cost 3.2% of the satellite; every later position is 1% at risk. The window
+  replay now seeds paper's positions at paper's sizes, so 10-04 to 10-12 agrees on 88 of 92
+  shared signals (was 87): OGN 10-08 16:00 is blocked on both sides. The one first difference
+  left is OGN 10-08 20:00: paper opened it (its equity was -2.9% against the day's start at
+  19:58, having been -3.1% at 19:28), the replay still had it under the limit at the 20:00
+  candle close. A knife edge, now explained in the report line; the 10-12 00:00 S/USDT row is
+  the window's end, no longer counted.
+- **The ML filter replayed on the reference** (information, not evidence - the strategies were
+  selected on this data): with the learns trained as live trains them (every
+  configured timeframe), 260 weekly learns, 5 promotions (the first 2025-04-30), 2,320 signals
+  scored, 1,114 filtered out (as backtest trades 386 won of 1,114, -111R in total), none sized
+  up; from the satellite's first trade the satellite's Sharpe is 0.38 with the filter against
+  0.58 without, the combined account 1.05 against 1.10. A first run whose learns saw only the
+  replayed timeframes (4h, 1d) had given 0.64 with: the sign flips with the training set, so
+  this is exactly what an `ml` protocol on untouched data must decide, not a finding either
+  way (ledger: ml-replay-a2, two notes).
+- **Candle pins**: the box's cache starts before the reference's window for every established
+  coin; the 20 coin-timeframes that start later are listings younger than the window (TAO, ENA,
+  SAGA 2024; ONDO, PUMP, XPL 2025; SUI, WLD, ARB, PEPE 2023 on 1d). So the rolling fetch start
+  truncated nothing on the box, and the box's rerun gives 2,587 / 1,400 to the end value whether
+  pinned or not; the Mac's cache of 10-05 can't be checked after the fact. From now on a weekly
+  rerun on a refilled cache says so, per coin and timeframe.
+- Reproduce:
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@b068c25-75a58dc389.json
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@b068c25-75a58dc389.json --ml-replay
+    tradebot reconcile --since "2026-10-04 00:00" --end "2026-10-12 00:00"
+    tradebot gate deploy --dry-run
+
+**What needs you**
+- **Push credentials** (still): `gh auth status` says not logged in for the tradebot user as of
+  12:08 UTC; nothing pushed. GitHub is at a6e31ae; the box is at db4371d plus this entry's
+  commit. The Monday cron (10-19 06:17 UTC) will fail its push and say so until this is done.
+- **The halt's resume**: the replay assumes you send /resume by the next daily close (the peak
+  then restarts, as the command does). If a halt would stay longer in practice, say so and the
+  replay models that instead.
+- A residual from the review, no action unless you want it: live shifts the breakers' peak and
+  day-start by the amount moved between sleeves, which changes the distance to both thresholds by
+  a few tenths of a percent around each reset; the replay's normalised path doesn't. Modelling it
+  in the replay is in BACKLOG; making live ratio-preserving would be a live change (yours).
+
+**What's next** (BACKLOG.md)
+1. Sizing from the marked equity in the replay (live sizes from equity with open positions at the
+   last price), then the frozen rerun and ledger notes.
+2. The reconcile's coin list at the scan (the first weekly's six paper-only signals).
+3. The same-trades dataset extended to stale candles, fetch failures and a model in use.
+4. The `ml` protocol once the reserve holds 100 satellite trades after 2026-09-27.
+5. Monday 10-19: the first cron weekly; its push once credentials exist.

@@ -15,8 +15,9 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   back, on untouched data - at least 100 satellite trades after the reference's data end
   (2026-09-27), so not before the paper reserve has them. The replay models the filter
   walk-forward since b068c25 (`portfolio-backtest --ml-replay`); on the reference file it is
-  information only (ledger note `ml-replay-a2`: satellite Sharpe 0.58 without, 0.64 with; inside
-  the noise band, and the strategies were selected on that data).
+  information only (ledger note `ml-replay-a2`: satellite Sharpe 0.58 without, 0.38 with when the
+  learns train as live's do on every configured timeframe, 0.64 with on the replayed timeframes
+  only: the sign flips with the training set; the strategies were selected on that data).
   - Done when: registered, run once, recorded; only a pass sets `ML_IN_REPLAY = True`, through gate 1.
 - [ ] **Sizing from the marked equity** (fidelity): live sizes a position from the satellite's equity
   with open positions at the last price (`broker.equity`); the replay sizes from realised equity
