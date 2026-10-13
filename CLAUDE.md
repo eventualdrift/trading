@@ -17,7 +17,9 @@ it in STATUS.md and on Telegram. The owner keeps the hard rules and the go-live 
   sizing or the split because of recent performance. The only path to changing what the bot
   trades is a registered test, on untouched data, that passed (gate 2).
 - **Paper runs only what the backtest models.** Any component live uses that the account replay
-  can't reproduce is switched off until it can.
+  can't reproduce is switched off until it can, except components that only reduce risk (the
+  daily loss limit, the max-drawdown halt): those stay on, and the replay is made to model them
+  first.
 - **Retraining happens on the weekly schedule only.** A drawdown never triggers a retrain.
 - **The agent writes only to its own state and data.** Only frozen runs touch the bot's: its
   database is opened read-only (`observe_state_dir`), its strategies read-only

@@ -93,7 +93,7 @@ def sizing_verdict(stats: dict, test: dict = SIZING_TEST) -> dict:
 
 
 def sizing_study(core_closes, trades, cfg: BotConfig, *, capital: float, fraction: float, sat_closes=None,
-                 combos=None, universe=None, test: dict = SIZING_TEST) -> dict:
+                 combos=None, universe=None, test: dict = SIZING_TEST, sat_marks=None) -> dict:
     import pandas as pd
 
     from .portfolio import account_stats, portfolio_backtest
@@ -102,7 +102,8 @@ def sizing_study(core_closes, trades, cfg: BotConfig, *, capital: float, fractio
     runs = {}
     for label, budget in (("baseline", None), ("rule", test["budget_pct"])):
         res = portfolio_backtest(core_closes, trades, cfg, capital=capital, fraction=fraction, since=test["since"],
-                                 sat_closes=sat_closes, combos=combos, universe=universe, open_risk_pct=budget)
+                                 sat_closes=sat_closes, combos=combos, universe=universe, open_risk_pct=budget,
+                                 sat_marks=sat_marks)
         sat = res.satellite
         runs[label] = {
             "test": account_stats(res, since), "full": account_stats(res, None),

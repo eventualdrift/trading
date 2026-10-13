@@ -35,7 +35,8 @@ SCAN_LAG_MS = 5 * 60_000  # a candle's scan runs within minutes of its close: wh
 DAY_MS = 86_400_000
 SNAPSHOT_MS = 15 * 60_000  # the bot records an equity snapshot every 15 minutes while it runs
 # paper skip reasons the backtest's account replay models; any other is a live-only check
-MODELLED_SKIPS = ("max open positions", "open-risk budget", "already in a", "reward:risk")
+MODELLED_SKIPS = ("max open positions", "open-risk budget", "already in a", "reward:risk", "daily loss limit",
+                  "halted")
 
 
 # --------------------------------------------------------------------- what paper had
@@ -230,14 +231,16 @@ def backtest_signals(datasets: dict[str, dict[str, pd.DataFrame]], combos: dict[
 
 
 def _slot_decisions(cfg: BotConfig, candidates: list[Trade], seeds: list[Trade], since_ms: int,
-                    end_ms: int) -> tuple[dict, list[Trade]]:
-    """The backtest's account replay (live rules and order) -> ({id(trade): 'taken' | reason}, taken)."""
+                    end_ms: int, marks: dict | None = None) -> tuple[dict, list[Trade]]:
+    """The backtest's account replay (live rules and order) -> ({id(trade): 'taken' | reason}, taken).
+    ``marks``: closes per coin (finest timeframe first) to value the satellite at each signal for the
+    breakers; its equity path starts at the window (the peak before it is not known here)."""
     from .portfolio import simulate_satellite
 
     idx = pd.date_range(pd.Timestamp(min(since_ms, *(int(s.entry_time.value // 1_000_000) for s in seeds))
                                      if seeds else since_ms, unit="ms", tz="UTC").floor("D"),
                         pd.Timestamp(end_ms, unit="ms", tz="UTC").ceil("D"), freq="D")
-    run = simulate_satellite(seeds + candidates, cfg, idx)
+    run = simulate_satellite(seeds + candidates, cfg, idx, marks=marks)
     out = {id(t): "taken" for t in run.taken}
     for reason, ts in run.skipped.items():
         for t in ts:
@@ -379,7 +382,15 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
     positions = db.positions_by_signal(mode)
     held = db.positions_with_status(mode, ("open", "closed", "working", "unknown"))
 
-    # --- the backtest's account replay, starting from the paper positions open when the window starts
+    # --- the backtest's account replay, starting from the paper positions open when the window starts,
+    # at paper's own sizes (a position opened before the first sleeve split was sized from the whole
+    # account): their notional over the satellite's equity at the window's start
+    snaps = db.snapshots(mode)
+    sat_equity = None
+    if len(snaps):
+        before = snaps[snaps.index <= pd.Timestamp(since_ms, unit="ms", tz="UTC")]
+        at_start = float((before if len(before) else snaps).iloc[-1 if len(before) else 0]["satellite"] or 0)
+        sat_equity = at_start if at_start > 0 else None
     seeds = []
     for p in held:
         if p.opened_at < since_ms and (p.closed_at is None or p.closed_at > since_ms):
@@ -390,9 +401,15 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
                                entry_price=p.entry_price, exit_price=p.exit_price or p.entry_price,
                                stop_loss=p.initial_stop, take_profit=p.take_profit, reason="paper position",
                                bars_held=0, r_multiple=0.0, return_pct=0.0,
-                               stop_pct=abs(p.entry_price - p.initial_stop) / p.entry_price, flat_time=exit_ts))
+                               stop_pct=abs(p.entry_price - p.initial_stop) / p.entry_price, flat_time=exit_ts,
+                               size_frac=p.amount * p.entry_price / sat_equity if sat_equity else None))
     candidates = [s.trade for s in bt if s.trade is not None]
-    decisions, taken = _slot_decisions(cfg, candidates, seeds, since_ms, end_ms) if candidates else ({}, [])
+    marks: dict[str, list] = {}  # closes per coin, finest timeframe first: the satellite's value at each signal
+    for tf in sorted(datasets, key=tf_ms):
+        for sym, df in datasets[tf].items():
+            marks.setdefault(sym, []).append(df["close"])
+    decisions, taken = (_slot_decisions(cfg, candidates, seeds, since_ms, end_ms, marks) if candidates
+                        else ({}, []))
 
     def paper_held(m: int) -> set[str]:
         return {p.symbol for p in held if p.opened_at < m and (p.closed_at is None or p.closed_at > m)}
@@ -474,6 +491,12 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
                 row.cause = "first difference: the ML filter (not modelled)"
             elif ps.status == "skipped" and not any(m in ps.note for m in MODELLED_SKIPS):
                 row.cause = f"first difference: a live-only check ({ps.note})"
+            elif "daily loss limit" in ps.note or row.backtest.startswith("daily loss limit"):
+                row.cause = ("first difference: the daily loss limit - paper's equity and the replay's (its own path "
+                             "from the window's start, valued at candle closes) are on different sides of it here")
+            elif "halted" in ps.note or row.backtest.startswith("drawdown halt"):
+                row.cause = ("first difference: the drawdown halt - paper's peak and equity and the replay's (its own "
+                             "path from the window's start) differ here")
             else:
                 row.cause = "first difference: same holdings before this close, decided differently within it"
         # fills, where both sides entered

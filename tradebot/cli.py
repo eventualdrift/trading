@@ -335,7 +335,8 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
     from .learning import load_context, load_datasets, load_frame
     from .portfolio import combo_split_stats
     from .provenance import code_version, config_differences, config_hash, settings_snapshot, without_timeframes
-    from .universe import load_universe, save_universe, saved_selection
+    from .timeframes import tf_ms
+    from .universe import candle_pins, compare_candles, load_universe, save_universe, saved_selection
 
     market = _market(cfg, synthetic)
     store = _store(cfg, market)
@@ -354,7 +355,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
     core_closes = {}
     for sym in cfg.core.symbols:
         core_closes[sym] = load_frame(market, store, sym, "1d", days, end_ms=end)["close"]
-    trades, combos, sat_closes, universe = [], [], {}, None
+    trades, combos, sat_closes, sat_marks, universe = [], [], {}, {}, None
     if selection and selection.selected:
         keys = [c.key for c in selection.selected]
         if frozen:
@@ -380,6 +381,10 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                 if sym not in sat_closes:  # daily closes to value open trades each day
                     sat_closes[sym] = df["close"] if tf == "1d" else df["close"].resample("1D").last().dropna()
                 first[sym] = min(first.get(sym, df.index[0]), df.index[0])
+        for tf in sorted(datasets, key=tf_ms):  # finest first: the satellite's value at each signal (the breakers)
+            for sym, df in datasets[tf].items():
+                sat_marks.setdefault(sym, []).append(df["close"])
+        pins = candle_pins(datasets, core_closes)  # the candles this run loaded, pinned for frozen reruns
         source = frozen["source"] if frozen else describe_universe(cfg, time.strftime("%Y-%m-%d"))
         code, snap = code_version(), settings_snapshot(cfg)  # the config file's settings, as loaded
         run = {"timeframes_used": list(cfg.timeframes), "core_fraction_used": cfg.core.fraction}
@@ -387,14 +392,15 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
         if not frozen and save_dir and not synthetic:
             stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(data_end / 1000))
             path = save_universe(Path(save_dir) / f"universe-{stamp}.json", symbols, data_end, source, keys, cfg,
-                                 code=code, config=snap, selection=selection, run=run)
+                                 code=code, config=snap, selection=selection, run=run, candles=pins)
         universe = {"source": source, "symbols": symbols, "first": first, "data_end_ms": data_end,
                     "file": path, "frozen": bool(frozen), "code": code, "config": snap,
                     "config_hash": config_hash(snap), **run, "selection_now": keys,
                     "selection_created": selection.created_at,
                     "selection_saved": (frozen or {}).get("selection"),
                     "selection_source": selection_source,
-                    "selection_today": [c.key for c in today.selected] if today else []}
+                    "selection_today": [c.key for c in today.selected] if today else [],
+                    "candles_pinned": sum(len(v) for v in pins.values())}
         if frozen:
             universe["saved_code"] = frozen.get("code")
             saved_cfg = frozen.get("config")
@@ -403,18 +409,20 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
             universe["legacy_settings"] = legacy
             universe["config_diffs"] = (config_differences(*(without_timeframes(x) for x in (saved_cfg, snap))) if legacy
                                         else config_differences(saved_cfg, snap)) if saved_cfg else None
+            universe["candle_diffs"] = compare_candles(frozen.get("candles"), pins)  # None: nothing pinned then
             outdated = ((frozen.get("code"), universe["saved_config_hash"]) != (code, universe["config_hash"])
-                        or not frozen.get("selection_full"))
+                        or not frozen.get("selection_full") or not frozen.get("candles"))
             if outdated and not current_selection:
-                # same coins, data end and selection, stamped with THIS run's code and settings: a complete reference
+                # same coins, data end and selection, stamped with THIS run's code, settings and candles: a
+                # complete reference
                 base = Path(universe_file).stem.split("@")[0]  # the original run's name, without an older stamp
                 stamped = Path(universe_file).with_name(f"{base}@{code.split('+')[0]}-{universe['config_hash']}.json")
-                if not stamped.exists() or not load_universe(stamped).get("selection_full"):
+                if not stamped.exists() or not all(load_universe(stamped).get(k) for k in ("selection_full", "candles")):
                     save_universe(stamped, symbols, data_end, source, keys, cfg, code=code, config=snap,
-                                  selection=selection, run=run)
+                                  selection=selection, run=run, candles=pins)
                 universe["stamped_file"] = str(stamped)
     return {"core_closes": core_closes, "trades": trades, "combos": combos, "sat_closes": sat_closes,
-            "universe": universe}
+            "sat_marks": sat_marks, "universe": universe}
 
 
 def _research_oos(args, cfg):
@@ -469,7 +477,7 @@ def _research_core(args, cfg, selection):
     x = _portfolio_inputs(cfg, selection, args.synthetic, args.days, args.universe_file)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
-                             universe=x["universe"])
+                             universe=x["universe"], sat_marks=x["sat_marks"])
     print(format_core_robustness(res, reset_phase_study(res), sma_scale_study(x["core_closes"], res, cfg), cfg))
     print("\n".join([""] + _universe_lines(res)))
     if not args.synthetic:
@@ -504,7 +512,8 @@ def _research_sizing(args, cfg, selection):
     x = _portfolio_inputs(cfg, selection, args.synthetic, args.days,
                           args.universe_file or SIZING_TEST.get("universe_file"))
     study = sizing_study(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
-                         sat_closes=x["sat_closes"], combos=x["combos"], universe=x["universe"])
+                         sat_closes=x["sat_closes"], combos=x["combos"], universe=x["universe"],
+                         sat_marks=x["sat_marks"])
     if prev:
         print(f"RE-RUN - not a new test. The first result ({prev.get('ran_at')}: "
               f"{'PASS' if prev['verdict']['pass'] else 'FAIL'}) stands.\n")
@@ -527,6 +536,7 @@ def cmd_portfolio_backtest(args, cfg):
                           current_selection=args.current_selection)
     res = portfolio_backtest(x["core_closes"], x["trades"], cfg, capital=args.capital, fraction=fraction,
                              since=args.since or None, sat_closes=x["sat_closes"], combos=x["combos"],
+                             sat_marks=x["sat_marks"],
                              universe=x["universe"])
     print(format_portfolio_backtest(res, cfg.exchange.quote))
 
@@ -673,7 +683,7 @@ def _reference_backtest(cfg, reference: str, synthetic: bool = False):
     x = _portfolio_inputs(pcfg, selection, synthetic, 3200, reference)
     res = portfolio_backtest(x["core_closes"], x["trades"], pcfg, capital=1000.0, fraction=fraction,
                              since="2022-01-01", sat_closes=x["sat_closes"], combos=x["combos"],
-                             universe=x["universe"])
+                             universe=x["universe"], sat_marks=x["sat_marks"])
     return res, x, pcfg, fraction
 
 
@@ -812,6 +822,16 @@ def cmd_weekly(args, cfg):
     from .timeframes import last_closed_open_ms
 
     state = wk.load_state(cfg.state_path)
+    if args.set_reference:  # switch the reference without running: Monday's entry reports the switch
+        if not Path(args.set_reference).exists():
+            sys.exit(f"reference universe file not found: {args.set_reference}")
+        old = state.get("reference")
+        if old and old != args.set_reference:
+            state["previous_reference"] = old
+        state["reference"] = args.set_reference
+        wk.save_state(cfg.state_path, state)
+        print(f"Weekly reference: {old or '(none)'} -> {args.set_reference} (reported in the next check-in)")
+        return
     reference = args.reference or state.get("reference")
     if not reference:
         sys.exit("Pass --reference reports/universe-<run>.json once: the frozen backtest to rerun every week "
@@ -871,20 +891,21 @@ def cmd_weekly(args, cfg):
     sel_now = {"keys": sorted(c.key for c in today.selected) if today else [],
                "created": today.created_at if today else None}
     changed = []
-    commits = wk.git_log(state.get("code"))
-    if state.get("code") and state["code"] != code:
-        changed.append(f"code {state['code']} -> {code}" + (": " + "; ".join(commits[:8]) if commits else ""))
-    diffs = config_differences(state["settings"], snap) if state.get("settings") else []
-    changed += [f"setting {d}" for d in diffs]
     logged = wk.selection_changes(rec) if rec is not None else []
-    changed += logged  # learn's changes during the week, from the bot's activity log
+    changed += logged  # learn's changes during the week, from the bot's activity log: first, they change what trades
     prev_sel = state.get("selection")
     selection_changed = bool(logged) or (bool(prev_sel) and prev_sel.get("created") != sel_now["created"])
     if selection_changed and not logged:
         changed.append(f"learn re-selected strategies: {', '.join(prev_sel.get('keys') or []) or 'none'} -> "
                        f"{', '.join(sel_now['keys']) or 'none'}")
-    if state.get("reference") and state["reference"] != reference:
-        changed.append(f"reference backtest {state['reference']} -> {reference}")
+    commits = wk.git_log(state.get("code"))
+    if state.get("code") and state["code"] != code:
+        changed.append(f"code {state['code']} -> {code}" + (": " + "; ".join(commits[:8]) if commits else ""))
+    diffs = config_differences(state["settings"], snap) if state.get("settings") else []
+    changed += [f"setting {d}" for d in diffs]
+    previous_ref = state.get("previous_reference") or state.get("reference")
+    if previous_ref and previous_ref != reference:
+        changed.append(f"reference backtest {previous_ref} -> {reference}")
 
     needs = wk.needs_owner(nums, state, diffs, selection_changed)
     entry = wk.status_entry(date=wk.today(), code=code, settings=config_hash(snap), changed=changed,
@@ -897,7 +918,7 @@ def cmd_weekly(args, cfg):
     print(entry)
     print(f"Appended to {status}; full reports in {out_dir}")
     if args.notify:
-        err = _telegram_send(cfg, wk.telegram_summary(wk.today(), code, numbers, needs))
+        err = _telegram_send(cfg, wk.telegram_summary(wk.today(), code, numbers, needs, changed))
         print(err or "Telegram summary sent")
         if err:
             sys.exit(3)  # written, not sent: scripts/weekly.sh still commits and pushes
@@ -1106,6 +1127,8 @@ def main(argv: list[str] | None = None) -> None:
                                        "frozen, uptime, and a STATUS.md entry (reporting only)")
     sp.add_argument("--reference", default=None,
                     help="universe file of the backtest to rerun each week (needed once; remembered)")
+    sp.add_argument("--set-reference", default=None, metavar="FILE",
+                    help="only switch the remembered reference to FILE (no check-in now; the next one reports it)")
     sp.add_argument("--days", type=int, default=7, help="reconcile this many days up to the end (default 7)")
     sp.add_argument("--end", default=None, help="UTC end of the week (default: the last full hour)")
     sp.add_argument("--status-file", default=None, help="default: STATUS.md in the repository")

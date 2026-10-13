@@ -85,6 +85,9 @@ class Trade:
     # through the stop, or (refine_flat_times) the close of the finer candle that touched the stop.
     # None (hand-built trades): exit_time
     flat_time: pd.Timestamp | None = None
+    # the notional as a fraction of the satellite's equity when it is known (a paper position seeding a
+    # window replay); None: the replay sizes it from stop_pct like the live risk manager
+    size_frac: float | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)

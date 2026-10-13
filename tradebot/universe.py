@@ -112,11 +112,68 @@ def saved_selection(frozen: dict, cfg: BotConfig):
     return sel, f"recovered from the bot's activity log (learn of {when} UTC; the file saved only the strategy names)"
 
 
+def candle_fingerprint(frame) -> dict:
+    """What a run's candles for one coin and timeframe were, in a few numbers: the first and last
+    candle, the row count and a hash of every candle (time, open, high, low, close, volume) - so a
+    frozen rerun can tell a refilled cache from the data the saved run used."""
+    import hashlib
+
+    import numpy as np
+    import pandas as pd
+
+    idx = pd.DatetimeIndex(frame.index)
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(idx.as_unit("ns").asi8 // 1_000_000).tobytes())
+    cols = [c for c in ("open", "high", "low", "close", "volume") if c in getattr(frame, "columns", [])]
+    for c in cols or [None]:
+        values = (frame[c] if c else frame).to_numpy(dtype=float)
+        h.update(np.ascontiguousarray(values).tobytes())
+    return {"first": idx[0].strftime("%Y-%m-%d %H:%M") if len(idx) else None,
+            "last": idx[-1].strftime("%Y-%m-%d %H:%M") if len(idx) else None,
+            "rows": int(len(idx)), "sha256": h.hexdigest()[:16]}
+
+
+def candle_pins(datasets: dict[str, dict], core_closes: dict | None = None) -> dict:
+    """Fingerprints of every frame a run loaded: {symbol: {timeframe: fingerprint}}; the core's
+    daily closes under their own key, as they span a longer history."""
+    pins: dict[str, dict] = {}
+    for tf, frames in (datasets or {}).items():
+        for sym, df in frames.items():
+            pins.setdefault(sym, {})[tf] = candle_fingerprint(df)
+    for sym, s in (core_closes or {}).items():
+        pins.setdefault(sym, {})["core-1d"] = candle_fingerprint(s)
+    return pins
+
+
+def compare_candles(saved: dict | None, now: dict) -> list[str] | None:
+    """How this run's candles differ from the saved run's pins, one line per coin and timeframe
+    (None: the saved run pinned nothing)."""
+    if not saved:
+        return None
+    out = []
+    for sym in sorted(set(saved) | set(now)):
+        a, b = saved.get(sym) or {}, now.get(sym) or {}
+        for tf in sorted(set(a) | set(b), key=lambda x: (x.startswith("core"), x)):
+            x, y = a.get(tf), b.get(tf)
+            name = f"{sym.split('/')[0]} {tf}"
+            if x is None:
+                out.append(f"{name}: not in the saved run, loaded now ({y['rows']} rows)")
+            elif y is None:
+                out.append(f"{name}: in the saved run ({x['rows']} rows), not loaded now")
+            elif x.get("sha256") != y.get("sha256"):
+                span = lambda f: f"{f['rows']} rows, {f['first']} to {f['last']}"  # noqa: E731
+                out.append(f"{name}: {span(x)} then; {span(y)} now"
+                           + ("" if (x["rows"], x["first"], x["last"]) != (y["rows"], y["first"], y["last"])
+                              else " (same span, different values)"))
+    return out
+
+
 def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selection_keys: list[str],
                   cfg: BotConfig, code: str | None = None, config: dict | None = None,
-                  selection=None, run: dict | None = None) -> str:
+                  selection=None, run: dict | None = None, candles: dict | None = None) -> str:
     """Freeze a run's coin list, data end date and strategy selection so it can be reproduced
-    (--universe-file)."""
+    (--universe-file); ``candles`` pins the candles it loaded (candle_pins)."""
     import json
     import time
     from pathlib import Path
@@ -139,6 +196,7 @@ def save_universe(path, symbols: list[str], data_end_ms: int, source: str, selec
         "code": code,  # git commit of the code that produced the run
         "config": config,  # the config file's settings, as loaded (provenance.settings_snapshot)
         **(run or {}),  # what the run itself used: timeframes_used, core_fraction_used
+        "candles": candles,  # per coin and timeframe: first, last, rows, hash of the candles loaded
     }, indent=2, default=str))
     return str(path)
 

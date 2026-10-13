@@ -238,3 +238,73 @@ def test_report_says_which_ml_model_is_in_force(tmp_path):
     assert "ML filter: ACTIVE - model trained 2026-09-26" in text and "threshold 55%" in text
     assert "Last learn's ML training (2026-10-03 17:40 UTC): not deployed - worse than current model" in text
     assert "not active" in ml_status(None, tmp_path / "none.json")
+
+
+def test_candle_fingerprints_tell_a_refilled_cache_apart():
+    import numpy as np
+    import pandas as pd
+
+    from tradebot.universe import candle_fingerprint, candle_pins, compare_candles
+
+    idx = pd.date_range("2024-01-01", periods=50, freq="4h", tz="UTC")
+    df = pd.DataFrame({"open": 1.0, "high": 2.0, "low": 0.5, "close": np.linspace(1, 2, 50), "volume": 10.0}, index=idx)
+    a = candle_fingerprint(df)
+    assert a["rows"] == 50 and a["first"] == "2024-01-01 00:00" and a["last"] == "2024-01-09 04:00"
+    assert candle_fingerprint(df.copy()) == a  # deterministic
+    changed = df.copy()
+    changed.iloc[10, 3] *= 1.001  # one close differs
+    b = candle_fingerprint(changed)
+    assert b["sha256"] != a["sha256"] and (b["rows"], b["first"], b["last"]) == (a["rows"], a["first"], a["last"])
+    shorter = candle_fingerprint(df.iloc[5:])
+    assert candle_fingerprint(df["close"])["sha256"] != a["sha256"]  # a close series pins differently from a frame
+    saved = candle_pins({"4h": {"BTC/USDT": df, "SOL/USDT": df}}, {"BTC/USDT": df["close"]})
+    assert set(saved["BTC/USDT"]) == {"4h", "core-1d"} and set(saved["SOL/USDT"]) == {"4h"}
+    now = candle_pins({"4h": {"BTC/USDT": changed, "ETH/USDT": df}}, {"BTC/USDT": df.iloc[5:]["close"]})
+    diffs = compare_candles(saved, now)
+    assert diffs == ["BTC 4h: 50 rows, 2024-01-01 00:00 to 2024-01-09 04:00 then; 50 rows, 2024-01-01 00:00 to "
+                     "2024-01-09 04:00 now (same span, different values)",
+                     "BTC core-1d: 50 rows, 2024-01-01 00:00 to 2024-01-09 04:00 then; 45 rows, 2024-01-01 20:00 to "
+                     "2024-01-09 04:00 now",
+                     "ETH 4h: not in the saved run, loaded now (50 rows)",
+                     "SOL 4h: in the saved run (50 rows), not loaded now"]
+    assert compare_candles(saved, saved) == [] and compare_candles(None, now) is None
+    assert shorter["rows"] == 45
+
+
+def test_frozen_rerun_pins_the_candles_and_reports_a_refilled_cache(tmp_path, monkeypatch, capsys):
+    import json
+
+    from tradebot.backtest.selection import ComboResult, Selection
+    from tradebot.learning import SELECTION_FILE
+
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    Selection(0.0, [ComboResult("momentum", "1d", {}, {}, {}, 1, 1.0, True)]).save(state / SELECTION_FILE)
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"state_dir: {state}\ntimeframes: [1d]\nuniverse:\n  top_n: 4\nml:\n  enabled: false\n"
+                    "data:\n  history_days: {1d: 600}\n")
+    old = tmp_path / "universe-run.json"  # saved before candles were pinned
+    old.write_text(json.dumps({"symbols": ["BTC/USDT", "SOL/USDT"], "data_end_ms": 1_748_736_000_000,
+                               "source": "saved run", "selection": ["momentum@1d"]}))
+    args = ["--config", str(conf), "--env", str(tmp_path / "none.env"), "portfolio-backtest", "--synthetic",
+            "--days", "600", "--since", ""]
+    main(args + ["--universe-file", str(old)])
+    out = capsys.readouterr().out
+    assert "! The universe file predates candle pinning" in out
+    stamped = next(tmp_path.glob("universe-run@*.json"))
+    pins = json.loads(stamped.read_text())["candles"]
+    assert set(pins) == {"BTC/USDT", "SOL/USDT", "ETH/USDT"}  # ETH: the core's daily closes only
+    assert set(pins["BTC/USDT"]) == {"1d", "core-1d"} and set(pins["ETH/USDT"]) == {"core-1d"}
+    assert pins["SOL/USDT"]["1d"]["rows"] > 100 and pins["BTC/USDT"]["1d"]["last"] == "2025-05-31 00:00"
+    main(args + ["--universe-file", str(stamped)])  # the same candles: said so
+    out = capsys.readouterr().out
+    assert "Candles: identical to the saved run's (4 coin-timeframes pinned" in out and "predates candle" not in out
+    data = json.loads(stamped.read_text())
+    data["candles"]["SOL/USDT"]["1d"]["sha256"] = "0000000000000000"  # as if the cache had been refilled
+    data["candles"]["SOL/USDT"]["1d"]["rows"] -= 3
+    stamped.write_text(json.dumps(data))
+    main(args + ["--universe-file", str(stamped)])
+    out = capsys.readouterr().out
+    assert "! Candles differ from the saved run's for 1 of 4 coin-timeframes" in out
+    assert "SOL 1d: " in out and " then; " in out and " now" in out

@@ -85,3 +85,46 @@ def test_one_settings_hash_in_every_report(tmp_path, monkeypatch, capsys):
     pb = (folder / "portfolio-backtest.txt").read_text()
     assert "this run: timeframes 1d, core 0.65" in pb and "older format" in pb
     assert "Setting changed" not in pb  # the run's timeframes in the old file are not a settings change
+
+
+def test_telegram_summary_leads_with_what_changed():
+    from tradebot.weekly import telegram_summary
+
+    learn = "learn of 2026-10-10 01:25 (in force from 10-10 02:25): added momentum@1h; dropped momentum@4h"
+    text = telegram_summary("2026-10-13", "abc1234", ["- Uptime 99% of the week"], ["one thing"],
+                            changed=[learn, "code a -> b"])
+    lines = text.splitlines()
+    assert lines[0] == "Weekly check-in 2026-10-13 (code abc1234)"
+    assert lines[1] == "Changed: " + learn and lines[2] == "  code a -> b"
+    assert lines[3] == "- Uptime 99% of the week" and lines[-1] == "Needs you: one thing"
+    assert "Changed:" not in telegram_summary("d", "c", ["- n"], [])
+
+
+def test_set_reference_switches_the_reference_and_the_next_check_in_reports_it(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("TRADEBOT_MODE", raising=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    sel = Selection(1_700_000_000.0, [ComboResult("momentum", "1d", {}, {}, {}, 1, 1.0, True)])
+    sel.save(state / SELECTION_FILE)
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"state_dir: {state}\ntimeframes: [1d]\nuniverse:\n  top_n: 3\nml:\n  enabled: false\n"
+                    "data:\n  history_days: {1d: 600}\n")
+    body = json.dumps({"symbols": ["BTC/USDT", "SOL/USDT"], "data_end_ms": 1_748_736_000_000, "source": "saved run",
+                       "selection": ["momentum@1d"], "selection_full": selection_payload(sel)})
+    ref, ref2 = tmp_path / "universe-ref.json", tmp_path / "universe-ref@pinned.json"
+    ref.write_text(body)
+    ref2.write_text(body)
+    status = tmp_path / "STATUS.md"
+    base = ["--config", str(conf), "--env", str(tmp_path / "none.env"), "weekly", "--synthetic",
+            "--status-file", str(status), "--out-dir", str(tmp_path / "weekly")]
+    main(base + ["--reference", str(ref)])
+    main(base + ["--set-reference", str(ref2)])
+    out = capsys.readouterr().out
+    assert f"Weekly reference: {ref} -> {ref2}" in out
+    assert status.read_text().count("- weekly check-in (`tradebot weekly`)") == 1  # none written by the switch
+    saved = json.loads((state / "research" / "weekly.json").read_text())
+    assert saved["reference"] == str(ref2) and saved["previous_reference"] == str(ref)
+    main(base)
+    second = status.read_text().split("- weekly check-in (`tradebot weekly`)")[-1]
+    assert f"reference backtest {ref} -> {ref2}" in second and f"--universe-file {ref2}" in second
+    assert "previous_reference" not in json.loads((state / "research" / "weekly.json").read_text())

@@ -355,3 +355,22 @@ def test_the_first_logged_selection_is_in_force_from_its_learn():
     assert tl.at(int(made * 1000) - 1) is today  # before the learn: today's selection assumed
     assert selection_timeline([(t_log, {"combos": [], "created_at": None})], today).at(t_log - DAY) is today
     assert selection_timeline([], today).at(t_log) is today and selection_timeline([], today).first is None
+
+
+def test_a_daily_loss_limit_skip_is_a_modelled_check(paper_run, tmp_path):
+    """Paper's daily loss limit is replayed from the backtest's own equity path: a skip for it
+    that the replay didn't make is named as that, not as a live-only check."""
+    cfg, market, db, *_ = paper_run
+    db2 = copy_db(db, tmp_path / "limit.db")
+    base = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db2).rows}
+    positions = db2.positions_by_signal("paper")
+    sigs = sorted(db2.signals_since(0), key=lambda s: s.candle_time)
+    first = next(s for s in sigs if s.id in positions and positions[s.id].status == "closed"
+                 and base[(s.symbol, s.candle_time)].backtest == "taken")
+    db2._conn.execute("UPDATE signals SET status='skipped', note=? WHERE id=?", ("daily loss limit reached", first.id))
+    db2._conn.execute("DELETE FROM positions WHERE signal_id=?", (first.id,))
+    rec = run_reconcile(paper_run, db2)
+    row = {(r.symbol, r.candle_ms): r for r in rec.rows}[(first.symbol, first.candle_time)]
+    assert row.paper == "skipped: daily loss limit reached" and row.backtest == "taken"
+    assert row.cause.startswith("first difference: the daily loss limit - paper's equity and the replay's")
+    assert "live-only" not in format_reconciliation(rec, cfg)

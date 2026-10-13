@@ -245,10 +245,15 @@ def today() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def telegram_summary(date: str, code: str, numbers: list[str], needs: list[str]) -> str:
-    """The Monday message: the week's numbers in a few lines, and what needs the owner."""
+def telegram_summary(date: str, code: str, numbers: list[str], needs: list[str],
+                     changed: list[str] | None = None) -> str:
+    """The Monday message: what changed first (learn's selection changes before anything else),
+    then the week's numbers in a few lines, and what needs the owner."""
     keep = [x for x in numbers if not x.startswith("- Full reports")]
-    lines = [f"Weekly check-in {date} (code {code})"] + [x.replace("**", "") for x in keep]
+    lines = [f"Weekly check-in {date} (code {code})"]
+    if changed:
+        lines += ["Changed: " + changed[0]] + [f"  {x}" for x in changed[1:]]
+    lines += [x.replace("**", "") for x in keep]
     lines += ["", "Needs you: " + ("; ".join(needs) if needs else "nothing")]
     text = "\n".join(lines)
     return text if len(text) < 3500 else text[:3500] + "\n... (STATUS.md has the rest)"
