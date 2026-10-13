@@ -1007,6 +1007,9 @@ def _gate_same_trades(args, cfg):
     if golden and golden["dataset_sha256"] != st.dataset_sha256():
         sys.exit("The stored dataset no longer matches the golden file: it must never change.")
     days = golden["replay"]["days"] if golden else st.REPLAY_DAYS
+    unknown = [n for n in (args.record_scenarios or []) if n not in st.SCENARIOS]
+    if unknown:
+        sys.exit(f"unknown scenario(s) {', '.join(unknown)}: the scenarios are {', '.join(st.SCENARIOS)}")
     orders = st.replay(days=days)
     recorded = dict((golden or {}).get("scenarios") or {})
     for name, sc in recorded.items():
@@ -1035,8 +1038,13 @@ def _gate_same_trades(args, cfg):
     if golden is None:
         if not args.init:
             sys.exit("No golden file yet: --init writes the first one from this code.")
-        st.write_golden(orders, None, code_version())
-        print(f"First golden file written: {st.summary(orders)}")
+        first = {}
+        if args.record_scenarios is not None:  # --init --record-scenarios: the scenarios from the start
+            first = {name: {"sha256": st.scenario_sha256(name), "recorded_by_code": code_version(),
+                            "orders": st.replay(days=days, scenario=name)} for name in st.SCENARIOS}
+        st.write_golden(orders, None, code_version(), scenarios=first or None)
+        print(f"First golden file written: {st.summary(orders)}"
+              + (f"; scenarios recorded: {', '.join(first)}" if first else ""))
         return
     diffs = st.differences(golden["orders"], orders)
     if diffs:

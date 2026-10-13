@@ -68,8 +68,11 @@ def test_the_same_trades_command(tmp_path, monkeypatch, capsys):
 
     changed = json.loads(json.dumps(orders))
     changed["positions"][0][6] *= 2  # one entry twice the size
+    changed_scen = {k: json.loads(json.dumps(v)) for k, v in scen.items()}
+    for v in changed_scen.values():
+        v["positions"][0][6] *= 2  # the scenarios see the change too
     monkeypatch.setattr(st, "replay", lambda days=st.REPLAY_DAYS, scenario=None, **_: (
-        json.loads(json.dumps(scen[scenario])) if scenario else changed))
+        json.loads(json.dumps(changed_scen[scenario])) if scenario else changed))
     with pytest.raises(SystemExit) as e:
         main(base)
     assert e.value.code == 1 and "ORDERS DIFFER" in capsys.readouterr().out
@@ -81,7 +84,7 @@ def test_the_same_trades_command(tmp_path, monkeypatch, capsys):
     main(base + ["--accept", "risk-double-v1"])
     new = json.loads(golden.read_text())
     assert new["accepted_by"] == "risk-double-v1" and new["orders"] == changed
-    assert {k: v["orders"] for k, v in new["scenarios"].items()} == scen  # re-recorded, unchanged here
+    assert {k: v["orders"] for k, v in new["scenarios"].items()} == changed_scen  # re-recorded on the changed code
     main(base)
     assert "identical" in capsys.readouterr().out.splitlines()[-1]
     assert any(e.get("kind") == "golden" and e["id"] == "risk-double-v1" for e in protocols.ledger(tmp_path / "state"))
@@ -495,6 +498,24 @@ def test_the_scenarios_run_through_the_real_bot_and_the_model_filters():
     assert any(s[5] == "filtered" and "ML probability" in (s[6] or "") for s in ml["signals"])
     plain = st.replay(days=4)
     assert not any(s[5] == "filtered" for s in plain["signals"])  # off in code, as in paper
+
+
+def test_the_lag_and_the_outages_reach_the_bot(tmp_path):
+    """The stored schedules act late in the replay; schedules inside the first days show the wiring:
+    the first plain signal (BNB 1h, candle 2024-08-28 17:00) is lost to a lag and to an outage."""
+    import shutil
+
+    data = tmp_path / "data"
+    shutil.copytree(st.DATA_DIR, data)
+    st.scenario_path("fetch-failures", data).write_text(json.dumps({"outages": [
+        {"symbol": "*", "methods": ["*"], "from": "2024-08-28T18:00:00Z", "to": "2024-08-28T19:00:00Z"}]}))
+    st.scenario_path("stale-candles", data).write_text(json.dumps({"late": [
+        {"symbol": "BNB/USDT", "from": "2024-08-28T17:00:00Z", "to": "2024-08-28T18:00:00Z", "late_minutes": 120}]}))
+    plain = st.replay(days=4, data_dir=data)
+    assert plain["signals"][0][:2] == ["BNB/USDT", "1h"] and plain["signals"][0][4] == st._iso_ms("2024-08-28T17:00:00Z")
+    for name in ("stale-candles", "fetch-failures"):
+        got = st.replay(days=4, data_dir=data, scenario=name)
+        assert got["signals"] != plain["signals"] and plain["signals"][0] not in got["signals"], name
 
 
 def test_the_same_trades_command_records_and_checks_scenarios(tmp_path, monkeypatch, capsys):
