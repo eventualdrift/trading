@@ -649,3 +649,45 @@ Code 21aab7f deployed; HEAD c20754a (the window-start anchor, agent-side) · set
 2. Live vs backtest candle history (needs four weeks above 95% uptime; the box has two days).
 3. The sleeve-transfer shift (low), the `ml` protocol when the reserve has 100 trades.
 4. Monday 10-19: the first cron weekly, on the pinned reference; its push once credentials exist.
+
+## 2026-10-13 - session (continued): the same-trades scenarios
+
+Code 4dc36df deployed; HEAD two small commits ahead (tests, the gate's output) · settings 75a58dc389 (unchanged)
+
+**What changed**
+- 4dc36df (your BACKLOG item): three stored scenarios run through the real bot after the plain
+  same-trades replay - a feed that publishes candles late (ETH 90 minutes on 09-05, BNB 7 hours
+  across the 09-12 daily close, SOL 45 minutes on 09-24, in the dataset's dates), fetches that
+  fail and recover (SOL's prices for three hours, BTC's daily candles at a core day, everything
+  for half an hour, ETH's candles for an hour) and a stored logistic model (JSON, loads the same
+  on any library version; fitted once on the dataset's 1,748 signals before the replay) that
+  filters and sizes signals with the bot's model path switched on for that run only. Their files
+  live in `tradebot/gates/data/`, hashed into the golden file, never regenerated; each scenario's
+  orders sit in their own golden section. `gate same-trades --record-scenarios [names]` records a
+  missing scenario once or re-records a changed one after review (a change to the failure path);
+  the plain orders stay byte-identical and still decide whether a registered test is needed.
+  Review (two findings confirmed, four refuted as design): the tests pin the schedules' wiring
+  and `--accept`'s re-recording; scenario names are checked; `--init --record-scenarios` records
+  from the start (456901c).
+- Deployed through gate 1: 4dc36df, gate finished 13:35 UTC (lint, both suites, the plain
+  orders identical, the three scenarios recorded and identical, same orders as the running commit;
+  the container ran 45 s without a restart). The gate's same-trades step now takes about five
+  minutes (four replays).
+
+**What the numbers say**
+- Recorded on this code: the lag delays one SOL stop-loss exit by an hour; the half-hour outage
+  loses one scan (259 signals instead of 260) and reshuffles the slots after it; the model filters
+  109 of 260 signals and the bot opens 16 positions instead of 51. From now on a change to any of
+  those paths shows up as different orders in its section.
+- Reproduce:
+    tradebot gate same-trades
+    tradebot gate deploy --dry-run
+
+**What needs you**
+- As above: push credentials (gh not logged in as tradebot at 13:36 UTC; the box is 17 commits
+  ahead of GitHub's a6e31ae); the halt-resume assumption.
+
+**What's next** (BACKLOG.md)
+1. Live vs backtest candle history (needs four weeks above 95% uptime).
+2. The sleeve-transfer shift (low); the `ml` protocol when the reserve has 100 trades.
+3. Monday 10-19: the first cron weekly, on the pinned reference; its push once credentials exist.
