@@ -237,6 +237,9 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
                 else position_fraction(t.stop_pct, r, (t.ml or {}).get("multiplier", 1.0)))
         eq_t = valued(t_ms)
         breaker_checks[id(t)] = {"equity": eq_t, "day_start": day_start, "peak": peak}
+        # a seed's size_frac is paper's notional over the satellite at the window's start, the replay's 1.0;
+        # everything else is sized from the marked equity at the signal
+        base = 1.0 if t.size_frac is not None else eq_t
         if halted_until is not None:  # the live bot's order: halted, the daily limit, then the slot rules
             skipped.setdefault(f"drawdown halt ({r.max_drawdown_pct:g}%)", []).append(t)
             continue
@@ -251,7 +254,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
             at_stake = sum(n_ * ot.stop_pct for ot, n_, _ in holding
                            if ot.protected_time is None or ot.protected_time > t.entry_time)
             # admitted on its 1x risk, then sized with the multiplier: entry_block_reason, then size, as live
-            return at_stake + eq_t * base_frac * t.stop_pct > eq_t * budget / 100.0 + 1e-12
+            return at_stake + base * base_frac * t.stop_pct > base * budget / 100.0 + 1e-12
 
         if full(open_):
             reason = (f"max open positions ({r.max_open_positions})" if budget is None
@@ -267,12 +270,12 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
             continue
         # sized and capped from the satellite's equity as live sees it at the scan: open positions at the
         # last price (here the last closed candle), not realised cash alone
-        room = eq_t * r.max_total_exposure_pct / 100.0 - sum(n_ for _, n_, _ in open_)
+        room = base * r.max_total_exposure_pct / 100.0 - sum(n_ for _, n_, _ in open_)
         if room <= 0:
             skipped.setdefault("total exposure limit", []).append(t)
             continue
-        notional = min(eq_t * frac, room)  # like the live risk manager: shrink to fit
-        frac = notional / eq_t
+        notional = min(base * frac, room)  # like the live risk manager: shrink to fit
+        frac = notional / base
         item = (t, notional, notional * t.return_pct)
         open_.append(item)
         booked.append(item)
