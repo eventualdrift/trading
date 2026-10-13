@@ -52,10 +52,18 @@ def test_each_learn_trains_only_on_trades_closed_by_then_and_keeps_the_model_unt
 
     times = learn_times(int(T0.value // 1_000_000), int(T0.value // 1_000_000) + 60 * DAY)
     assert len(times) == 8 and times[0] == int(T0.value // 1_000_000) + 7 * DAY
+    # one trade exits in the candle open an hour before the third learn: its label is not known yet
+    cands.loc[0, "exit_time"] = pd.Timestamp(times[2], unit="ms", tz="UTC") - pd.Timedelta(hours=1)
     rep = walk_forward(cands, BotConfig(), times, {("momentum", "4h")}, train=train)
     assert len(rep.learns) == 8 and [x.promoted for x in rep.learns] == [False, False, True] + [False] * 5
-    for at, last_exit, n in seen:  # no label from after the learn
-        assert last_exit < pd.Timestamp(at, unit="ms", tz="UTC") and n == (cands["exit_time"] < pd.Timestamp(at, unit="ms", tz="UTC")).sum()
+    stricter = 0
+    for at, last_exit, n in seen:  # no label from after the learn: the exit candle (4h) has closed by then
+        t = pd.Timestamp(at, unit="ms", tz="UTC")
+        assert last_exit + pd.Timedelta(hours=4) <= t
+        closed, opened = (cands["exit_time"] + pd.Timedelta(hours=4) <= t).sum(), (cands["exit_time"] < t).sum()
+        assert n == closed <= opened
+        stricter += closed < opened
+    assert stricter >= 1  # the cut is at the exit candle's close, not its open
     assert rep.model_at(times[1]) is None and rep.model_at(times[2]) is rep.learns[2].model
     assert rep.model_at(times[7] + DAY) is rep.learns[2].model  # kept through the later learns
     assert rep.in_force_from() == times[2]
@@ -152,3 +160,18 @@ def test_portfolio_backtest_replays_the_filter_on_request(tmp_path, monkeypatch,
     main(args + ["--ml-replay"])
     out = capsys.readouterr().out
     assert "ML filter (walk-forward: the model a weekly learn would have had" in out and " learns, " in out
+
+
+def test_the_open_risk_budget_admits_on_the_unmultiplied_risk_then_sizes_up():
+    """Live admits a signal on its 1x risk (entry_block_reason) and only then sizes it with the ML
+    multiplier (size); the replay does the same under the open-risk budget rule."""
+    from tradebot.portfolio import simulate_satellite
+
+    cfg = BotConfig()
+    cfg.risk.max_open_risk_pct = 2.5  # room for two 1% risks plus a bit: a 1.5x one must still be admitted
+    idx = pd.date_range("2024-01-01", periods=40, freq="D", tz="UTC")
+    first = trade("A/USDT", 24)
+    second = trade("B/USDT", 48)
+    second.ml = {"probability": 0.95, "threshold": 0.4, "filtered": False, "multiplier": 1.5, "expected_r": 1.0}
+    run = simulate_satellite([first, second], cfg, idx, open_risk_pct=2.5)
+    assert run.taken == [first, second] and run.sizes == pytest.approx([0.10, 0.15])

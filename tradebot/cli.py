@@ -369,6 +369,7 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
                       f"({', '.join(frozen['selection'])}) - results will differ for that reason.")
         else:
             symbols = select_universe(market, cfg)
+        configured_tfs = list(cfg.timeframes)  # live's learn trains the ML filter on every configured timeframe
         cfg.timeframes = selection.timeframes()
         datasets = load_datasets(market, cfg, symbols, store, now_ms=now, log_fn=lambda *_: None, end_ms=end)
         context = load_context(market, cfg, store, now_ms=now, log_fn=lambda *_: None, end_ms=end)
@@ -394,7 +395,15 @@ def _portfolio_inputs(cfg, selection, synthetic: bool, days: int, universe_file:
             from .ml.replay import apply, learn_times, walk_forward
 
             chosen = {(c.strategy, c.timeframe): c.params for c in selection.combos}
-            cands = build_candidates(datasets, cfg, context, params_for=chosen)
+            extra = [tf for tf in configured_tfs if tf not in datasets]  # the learn's other timeframes
+            datasets_ml = dict(datasets)
+            if extra:
+                cfg.timeframes, kept = extra, cfg.timeframes
+                datasets_ml.update(load_datasets(market, cfg, symbols, store, now_ms=now, log_fn=lambda *_: None,
+                                                 end_ms=end))
+                cfg.timeframes = kept
+                pins = candle_pins(datasets_ml, core_closes)
+            cands = build_candidates(datasets_ml, cfg, context, params_for=chosen)
             focus = {(c.strategy, c.timeframe) for c in selection.selected}
             start = min(int(v.value // 1_000_000) for v in first.values()) if first else data_end
             ml_rep = apply(trades, cands, walk_forward(cands, cfg, learn_times(start, data_end), focus), cfg)

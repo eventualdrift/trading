@@ -416,13 +416,15 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
                                 else ({}, [], {}))
     equity_records = db.equity_curve(mode)  # paper's equity every 15 minutes: its side of a breaker decision
 
-    def paper_vs_day_start(close_ms: int) -> str:
-        """Paper's equity at the scan after ``close_ms`` against its first record of that UTC day."""
+    def paper_vs_day_start(close_ms: int, scan_ms: int | None = None) -> str:
+        """Paper's equity at the scan that decided (its last record by then) against its first record
+        of that UTC day."""
         if not len(equity_records):
             return ""
         ms = index_ms(equity_records.index)
         day0 = close_ms // DAY_MS * DAY_MS
-        start = [i for i in range(len(ms)) if day0 <= ms[i] <= close_ms + 60_000]
+        until = scan_ms if scan_ms else close_ms + 60_000
+        start = [i for i in range(len(ms)) if day0 <= ms[i] <= until]
         if not start:
             return ""
         i0, i1 = start[0], start[-1]
@@ -513,13 +515,13 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
             elif ps.status == "skipped" and not any(m in ps.note for m in MODELLED_SKIPS):
                 row.cause = f"first difference: a live-only check ({ps.note})"
             elif s.trade is None and s.no_trade.startswith("no trade yet"):
-                row.cause = "at the window's end: the backtest has no next candle to enter on (not a difference)"
+                row.note = "at the window's end: the backtest has no next candle to enter on (not a difference)"
             elif "daily loss limit" in ps.note or row.backtest.startswith("daily loss limit"):
                 chk = checks.get(id(s.trade)) if s.trade is not None else None
                 replay = (f"the replay {chk['equity'] / chk['day_start'] - 1:+.1%} vs its own (its path from the "
                           f"window's start, valued at candle closes)" if chk and chk["day_start"] > 0 else
                           "the replay's path from the window's start, valued at candle closes, differs")
-                paper_side = paper_vs_day_start(close_ms)
+                paper_side = paper_vs_day_start(close_ms, ps.created_at)
                 row.cause = (f"first difference: the daily loss limit ({cfg.risk.daily_loss_limit_pct:g}%) - "
                              + (paper_side + "; " if paper_side else "") + replay)
             elif "halted (drawdown" in ps.note or row.backtest.startswith("drawdown halt"):

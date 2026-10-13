@@ -230,6 +230,7 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
         if t.ml and t.ml.get("filtered"):  # the live scan drops it before it competes for anything
             skipped.setdefault("ML filter", []).append(t)
             continue
+        base_frac = t.size_frac if t.size_frac is not None else position_fraction(t.stop_pct, r)  # at 1x
         frac = (t.size_frac if t.size_frac is not None
                 else position_fraction(t.stop_pct, r, (t.ml or {}).get("multiplier", 1.0)))
         eq_t = valued(t_ms)
@@ -247,7 +248,8 @@ def simulate_satellite(trades: list[Trade], cfg: BotConfig, index: pd.DatetimeIn
                 return len(holding) >= r.max_open_positions
             at_stake = sum(n_ * ot.stop_pct for ot, n_, _ in holding
                            if ot.protected_time is None or ot.protected_time > t.entry_time)
-            return at_stake + equity * frac * t.stop_pct > equity * budget / 100.0 + 1e-12
+            # admitted on its 1x risk, then sized with the multiplier: entry_block_reason, then size, as live
+            return at_stake + equity * base_frac * t.stop_pct > equity * budget / 100.0 + 1e-12
 
         if full(open_):
             reason = (f"max open positions ({r.max_open_positions})" if budget is None

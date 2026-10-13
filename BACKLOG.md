@@ -11,65 +11,25 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Open
 
-- [ ] **a. The ML filter: what it did** - the reconciliation over 09-27 to 10-03 found it on (the
-  old "inactive" note here was wrong). It is on whenever a promoted model file exists, and a learn
-  that doesn't promote a new model keeps the old one.
-  - Built (this round): `tradebot report` names the model in force and what the last learn's
-    training decided; the reconcile lists the selections in force with the ML flag for the window,
-    the signals the filter blocked and what the backtest says they were worth, and the trades it
-    sized up; the bot now logs each model's threshold and training end.
-  - Done when: STATUS.md records, from `report` and a reconcile on the bot's data over 09-27 to
-    10-03 and the weekly window, whether the 10-03 learn deployed a model (to "What changed"), how
-    many signals it blocked, and their outcomes.
-  - Recorded (STATUS.md 2026-10-12): the learn of 10-04 01:25 promoted a model (threshold 40%,
-    trained to 10-03); the filter was on from 10-04 02:25 to the deploy of 10-12 22:18. Off in
-    code since 391661c (`ML_IN_REPLAY = False`).
-- [ ] **a2. The ML filter in the account replay.** The replay takes every signal at 1x; with the
-  filter on, paper filtered some and sized others up to 1.5x. Needed before the `ml` protocol
-  decides whether it comes back.
-  - Done when: the replay scores each candidate with the model a weekly learn would have had then
-    (trained only on trades closed before that learn, promoted only if it passed the gate, the old
-    one kept otherwise), filters below the threshold and applies the size multiplier; a test
-    proves no model sees a label from after its learn; a frozen rerun on the reference file and a
-    ledger note follow. Then the `ml` protocol (CLAUDE.md template) on untouched data decides;
-    only a pass sets `ML_IN_REPLAY = True`, through gate 1.
-- [ ] **b. The 6 paper-only signals after 10-03 12:00** (paper 51, both 45 in the first weekly).
-  - Built (this round): each paper-only row now says why the backtest had none (no candles; candle
-    after the data end or missing; history shorter than the warm-up; strategy not in the selection
-    for that time; entry condition false on the full history; not replayed); the reconcile lists
-    the selections in force; the weekly lists learn's changes from the activity log.
-  - Done when: STATUS.md names the reason for each of the six, and whether the 10-03 learn changed
-    the selection.
-  - Recorded (STATUS.md 2026-10-12): coins that joined the list at the scan; the 10-04 learn kept
-    the selection. The reconcile refinement is the "coin list at the scan" item below.
-- [ ] **c. Core targets matched 10 of 12 coin-days in the weekly** (8 of 8 before 10-03).
-  - Built (this round): each mismatch is explained: no daily candles at the bot's check (the fetch
-    failed, e.g. right after waking), or the candle and close the bot used against the backtest's
-    (the bot logs them from now on).
-  - Done when: STATUS.md names the two coin-days and the cause.
-  - Recorded (STATUS.md 2026-10-12): 10-04 BTC and ETH, the backtest side had no 10-04 candle in
-    the Mac's run; the rerun gives 12 of 12. Paper's targets were right.
-  - The fix is built (owner, 2026-10-10): the bot fetches every core price and the daily candle
-    that just closed first, and moves nothing until it has them all, asking again every 5 minutes
-    for up to 6 hours after the close; then it goes ahead with what it has (`core_retry` and
-    `core_day.incomplete` in the activity log). Same-trades: identical orders. It reaches paper
-    with the deploy above.
-- [ ] **Pin the candles behind a frozen rerun.** The reference rerun moved on 2026-10-12 (combined
-  Sharpe 1.07 -> 1.10, satellite 0.50 -> 0.59) with the same universe file and, as a rerun of the
-  old code on the box showed, the same code: the box's candle cache (copied after the bot's 10-10
-  learn) differs from the Mac's of 10-05 before the data end. A frozen rerun is frozen against new
-  candles, not against a cache that was refilled. From now on the agent's `data/` is the reference
-  cache (only unfrozen runs write to it; `learn` refuses in the agent checkout).
-  - Done when: a universe file records a hash of each coin's candles up to its data end, frozen
-    reruns compare it and say so when the cache differs, and the reference file carries the box's
-    hashes (stamped once, a new file name, the ledger told).
-- [ ] **The daily loss limit in the account replay** (fidelity fix, from the 10-04 to 10-12 reconcile:
-  10-08 16:00 OGN momentum@4h, paper "skipped: daily loss limit reached", backtest taken, one knock-on
-  after it). Live stops opening trades for the UTC day after -3% (`risk.daily_loss_limit_pct`); the
-  replay never does. The max-drawdown halt (`risk.max_drawdown_pct`) is the same kind of rule.
-  - Done when: the replay applies both from its own equity path, a test shows a day that trips the
-    limit skips the same signals live would, the frozen reference rerun and ledger notes follow,
-    and the same-trades check stays identical (live is unchanged).
+- [ ] **The `ml` protocol** (CLAUDE.md template, family `ml`): decides whether the ML filter comes
+  back, on untouched data - at least 100 satellite trades after the reference's data end
+  (2026-09-27), so not before the paper reserve has them. The replay models the filter
+  walk-forward since b068c25 (`portfolio-backtest --ml-replay`); on the reference file it is
+  information only (ledger note `ml-replay-a2`: satellite Sharpe 0.58 without, 0.64 with; inside
+  the noise band, and the strategies were selected on that data).
+  - Done when: registered, run once, recorded; only a pass sets `ML_IN_REPLAY = True`, through gate 1.
+- [ ] **Sizing from the marked equity** (fidelity): live sizes a position from the satellite's equity
+  with open positions at the last price (`broker.equity`); the replay sizes from realised equity
+  (cash plus closed trades). Small most days, large after a big open move.
+  - Done when: the replay sizes from the same marked equity the breakers use, a test shows an open
+    position's gain or loss changes the next size as live, the frozen reference rerun and ledger
+    notes follow, and the same-trades check stays identical.
+- [ ] **Sleeve transfers and the breakers' thresholds** (low, from the 2026-10-13 review): live shifts
+  `peak_equity` and `day_start_equity` by the amount moved between sleeves (`_shift_breakers`), so the
+  distance to both thresholds changes with each transfer; the replay's normalised satellite path
+  doesn't see transfers. A few tenths of a percent around the first split and each 30-day reset.
+  - Done when: either the replay carries the sleeve amounts through resets (model live as it is), or
+    the owner decides live should preserve the ratio instead (a live change: stop-and-ask).
 - [ ] **Reconcile: the coin list at the scan, not at the close.** The six paper-only signals of
   BACKLOG b were candles closing at 10-04 00:00 and 08:00 scanned 24-36 minutes later with a coin
   list refreshed on waking (GLMR, STRK, BEAMX had just entered the top 30). The reconcile keys the
@@ -94,7 +54,8 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
     on candles cut like the scanner's with the backtest's, and says whether truncation explains it.
     A fix on the backtest side is a fidelity fix; anything on the live side is a stop-and-ask.
 - [ ] **Weekly automation on the box** - the cron is installed (2026-10-12: Monday weekly, daily
-  drawdown gate, nightly backup). The weekly's push needs a deploy key (Needs the owner).
+  drawdown gate, nightly backup). The weekly's push needs the owner's `gh auth login` for the
+  tradebot user (Needs the owner); the first cron weekly is 2026-10-19.
   - Done when: two Monday entries in STATUS.md came from cron, each with uptime above 95% and a
     Telegram summary sent, and the push went through.
 
@@ -119,9 +80,13 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Needs the owner
 
-- [ ] **A deploy key for the box** (DEPLOY.md step 3): `~/tradebot-agent` has an https remote and no
-  credentials, so nothing pushes from the box: not this session's commits, not Monday's STATUS.md.
-  Until then the owner pulls nothing new from GitHub; the work is committed locally on the box.
+- [ ] **Push credentials for the box** (DEPLOY.md step 3): `~/tradebot-agent` has an https remote and
+  no credentials (2026-10-13: `gh` installed, not logged in as tradebot), so nothing pushes from the
+  box: not the sessions' commits, not Monday's STATUS.md. GitHub is at a6e31ae; the box is ahead.
+- [ ] **The drawdown halt's resume** (an assumption to confirm): live halts new entries at 15% below
+  the satellite's peak until the owner sends /resume (which restarts the peak). The replay assumes
+  the resume at the next daily close. Say if a halt would stay longer in practice; the replay
+  would model that instead.
 - [ ] **Move the bot to an always-on Linux box** (DEPLOY.md) - done except the key above.
 
 ## Later
@@ -137,6 +102,21 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Done
 
+- [x] The daily loss limit and the max-drawdown halt in the account replay, on its own equity path
+  valued at each signal; window replays seeded at paper's sizes and outcomes; the reconcile names a
+  breaker disagreement with both sides' numbers (2362e5f, b068c25; CLAUDE.md rule amended by the
+  owner 2026-10-13). Reference: combined Sharpe 1.10 -> 1.10, satellite 0.59 -> 0.58.
+- [x] Candles pinned behind frozen reruns: universe files record each coin-timeframe's first and
+  last candle, rows and hash; a rerun says identical or lists what differs; the reference re-stamped
+  with the box's pins and the weekly switched to it (2362e5f, b068c25, 2026-10-13)
+- [x] a2. The ML filter in the account replay, walk-forward (b068c25); the `ml` protocol stays open
+- [x] a. The ML filter: what it did - the 10-04 01:25 learn promoted a model (threshold 40%); on
+  until the 10-12 deploy; 89 scored, 65 filtered, 24 sized up over 10-04 to 10-12 (STATUS.md
+  2026-10-12)
+- [x] b. The 6 paper-only signals: coins that joined the list at the scan; the 10-04 learn kept the
+  selection (STATUS.md 2026-10-12). The reconcile refinement is the "coin list at the scan" item.
+- [x] c. Core targets 10 of 12: the Mac's run lacked the 10-04 candle; rerun 12 of 12; the fetch-first
+  core fix (owner, 2026-10-10) deployed 10-12 (STATUS.md 2026-10-12)
 - [x] On the box: deployed 391661c through gate 1 (10-12 22:18 UTC), drawdown limits set from the
   reference backtest watching paper from that deploy, the agent's Telegram, the cron (2026-10-12)
 - [x] BACKLOG a, b, c answered from the bot's data (STATUS.md 2026-10-12)

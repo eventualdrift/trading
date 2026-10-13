@@ -75,16 +75,18 @@ def learn_times(start_ms: int, end_ms: int, every_ms: int = WEEK_MS) -> list[int
 def walk_forward(cands: pd.DataFrame | None, cfg: BotConfig, times: list[int], focus: set | None,
                  train=train_model) -> MLReplay:
     """One learn per time in ``times``: trained on the candidates whose trade had closed by then
-    (never a label from after it), through the live gate; the current model is kept unless the
-    new one is promoted."""
+    (never a label from after it: an outcome counts once its exit candle has closed), through the
+    live gate; the current model is kept unless the new one is promoted."""
     out = MLReplay()
     if cands is None or cands.empty:
         out.learns = [Learn(t, False, "no historical signals", None) for t in times]
         return out
-    exit_ms = _ms(cands["exit_time"])
+    # a label is known when the exit candle has closed (exit_time is that candle's open), as live's
+    # learn sees only closed candles
+    known_ms = _ms(cands["exit_time"]) + cands["timeframe"].map(tf_ms).to_numpy(dtype="int64")
     current = None
     for t in times:
-        known = cands[exit_ms < t]
+        known = cands[known_ms <= t]
         model, rep = train(known, cfg.ml, current, focus=focus or None)
         if model is not None:
             current = model
