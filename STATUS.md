@@ -691,3 +691,80 @@ Code 4dc36df deployed; HEAD two small commits ahead (tests, the gate's output) �
 1. Live vs backtest candle history (needs four weeks above 95% uptime).
 2. The sleeve-transfer shift (low); the `ml` protocol when the reserve has 100 trades.
 3. Monday 10-19: the first cron weekly, on the pinned reference; its push once credentials exist.
+
+## 2026-10-13 - session: the go-live items, built on the testnet path
+
+Code dd399b4, ca4f810, f9d90ad, c750ff8 · settings 75a58dc389 (unchanged) · live trading refused in code
+
+**What changed** (owner authorisation 2026-10-13: build them on the testnet path only, through the
+gates, live still refused, nothing changing in paper)
+- **Modes.** `mode: testnet` runs the live order path against Binance's Spot testnet only: it needs
+  `exchange.sandbox: true`, reads `TESTNET_API_KEY`/`TESTNET_API_SECRET` (never the real keys) and
+  refuses any client whose API URLs aren't `testnet.binance.vision`. `mode: live` is refused in code
+  whatever the config, the paper checklist or `--force-live` say (`config.LIVE_TRADING = False`).
+- **Exits on the exchange.** At entry an OCO pair rests on the exchange: a take-profit trigger at
+  the target and the stop-loss, on one quantity, read back after placing. Breakeven and every
+  trailing step move the exchange stop in one cancel-replace request: Binance cancels the
+  protection and places the new stop straight after, so no moment passes between two requests with
+  no stop. Each failure is handled from the exchange's own answer, or by the new stop's client id
+  when the answer is lost: a move through the price sells at once, a new stop refused after the
+  cancel is put back at once, a crash mid-move is settled at start-up. Sync tells a take-profit fill
+  from a stop fill and names a stop exit by its level.
+- **The core's order path.** On an exchange the core's buys and sells are market orders with a
+  client id saved before sending, booked from their fills, a lost answer resolved by client id. Its
+  cash and coins stay out of the satellite's equity, free cash and coin checks.
+- **`tradebot testnet verify`** runs each mechanism once on the testnet and checks it there, then
+  cleans up; the record goes to `state/testnet/`.
+- **Three reviews** of the order code (five, three and two lenses; every finding put to a skeptic):
+  10, then 7, then 2 distinct findings confirmed, all fixed with a test each; 4 refuted. The ones
+  that mattered most:
+  - an answer whose outcome Binance calls unknown (-1006) is now looked up, not taken as a refusal;
+  - an order read back takes its fees from its trades, so a buy is never booked with coins it
+    didn't get;
+  - a fill is never counted twice;
+  - the stray-order sweep spares a move's new stop;
+  - the exchange's other coins (the testnet's starting balance) don't block an exit fill;
+  - while a core order is unresolved, the breakers, new entries and the core day all wait.
+- Deployed through gate 1: f9d90ad (gate started 16:07 UTC), then c750ff8 (started 16:29 UTC).
+  Each time: same orders as the running commit, and the container up 45 s without a restart.
+  The two gate runs overlapped: I misread the first one's buffered output as a dead process.
+  It was harmless, since both deploys passed every step with identical orders; the gate now
+  runs with unbuffered output. The bot runs c750ff8.
+
+**What the numbers say**
+- Tests: 383 tests pass (lint, the full suite and the suite in a fresh clone in each gate). They run on a fake exchange built from the Binance spot docs: locked coins,
+  OCO legs that expire each other, and cancel-replace's partial failures. The tests prove each move
+  is one request and that no request left the coins without a stop.
+- The same-trades check is identical: the plain orders and all three scenarios (lagging feed,
+  outages, a model in use). Paper is unchanged.
+- A request from the box to Binance takes 0.41-0.45 s (testnet the same). That is the gap an
+  OCO re-placed on each move would leave with no stop.
+- Not yet verified on the testnet: no testnet keys exist (below).
+- Reproduce:
+    tradebot --config config-agent.yaml gate same-trades
+    tradebot --config config-agent.yaml testnet verify      # once the testnet keys are in .env
+
+**What needs you**
+- **Testnet keys** (testnet money only, DEPLOY.md step 10): open testnet.binance.vision, log in
+  with GitHub, Generate HMAC_SHA256 Key, put `TESTNET_API_KEY` and `TESTNET_API_SECRET` in
+  `~/tradebot-agent/.env`. Then I run the verification and record it here. These keys can only
+  reach the testnet; the code refuses any other host.
+- **The take-profit across stop moves, your call.** Binance spot locks the coins of a resting
+  sell, so the stop and the take-profit can only coexist as an OCO pair. No request replaces a pair
+  or moves its prices; cancel-replace places only a single order. So you choose:
+  1. **Built:** the stop is never absent (one-request moves); the take-profit leaves the exchange
+     at the first move, and the bot takes profit while it runs. A trade that reaches its target
+     after breakeven while the bot is down is not sold at the target.
+  2. **Not built:** the take-profit stays on the exchange always, but each move cancels the pair
+     and places a new one, about 0.4 s with no stop per move.
+  The readiness check "every protective exit rests on the exchange" fails until you decide,
+  naming the take-profit as the reason.
+- Still open from before: the halt-resume assumption. Push credentials are done (thank you):
+  this session's commits are pushed; the Monday cron's push is the first unattended one.
+
+**What's next** (BACKLOG.md)
+1. The verification on the testnet as soon as the keys are there.
+2. The take-profit rule in the backtest. Paper sells at a touch of the target; the backtest only
+   on a strategy candle closing above it. Found reading the code; no paper trade has reached its
+   target yet. A fidelity fix, then the frozen rerun.
+3. A testnet instance running for a few weeks, your call (`mode: testnet` exists).

@@ -72,9 +72,6 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Needs the owner
 
-- [ ] **Push credentials for the box** (DEPLOY.md step 3): `~/tradebot-agent` has an https remote and
-  no credentials (2026-10-13: `gh` installed, not logged in as tradebot), so nothing pushes from the
-  box: not the sessions' commits, not Monday's STATUS.md. GitHub is at a6e31ae; the box is ahead.
 - [ ] **Testnet keys** (testnet money only; DEPLOY.md step 10): `TESTNET_API_KEY` and `TESTNET_API_SECRET`
   from testnet.binance.vision in `~/tradebot-agent/.env`, so `tradebot testnet verify` can run.
 - [ ] **The take-profit across stop moves** (a trade-off only the owner can make): keep the stop gap-free
@@ -99,6 +96,7 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Done
 
+- [x] Push credentials for the box: `gh` logged in as tradebot (owner, 2026-10-13); pushes work
 - [x] The same-trades dataset extended (owner's item): three stored scenarios run through the real bot
   after the plain replay - a feed that publishes candles late, fetches that fail and recover, a stored
   logistic model that filters and sizes signals - each recorded in its own golden section
