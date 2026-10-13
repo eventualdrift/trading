@@ -107,3 +107,24 @@ def test_clean_up_touches_only_the_run_s_own_orders():
     step = tn._clean_up(client, rec, {"BTC/USDT"}, {"BTC/USDT": 0.999}, lambda *_: None)
     assert step.ok and rec._ex.orders[mine["id"]]["status"] == "canceled"
     assert rec._ex.orders[other["id"]]["status"] == "open"
+
+
+def test_a_real_lot_step_and_price_leave_dust_that_is_reported_not_failed():
+    client = FakeSpotClient({"BTC/USDT": 63_000.0, "ETH/USDT": 2_500.0}, balances={"BTC": 1.0, "ETH": 100.0}, lot=1e-5)
+    clock = Clock()
+
+    def market_moves(seconds):
+        clock.sleep(seconds)
+        client.ex.set_price("BTC/USDT", client.ex.prices["BTC/USDT"] * 1.0002)
+
+    steps = tn.verify(client, sleep=clock.sleep, clock=clock, wait=market_moves, log=lambda *_: None)
+    assert all(s.ok for s in steps), [(s.name, s.detail) for s in steps if not s.ok]
+    assert steps[-1].name == "clean-up"
+
+
+def test_an_earlier_run_s_leftovers_are_cancelled_not_taken_for_a_bot():
+    client = FakeSpotClient()
+    client.ex.create_order("BTC/USDT", "market", "buy", 0.5, None, {"clientOrderId": "tbveOLD"})
+    old = client.ex.create_order("BTC/USDT", "market", "sell", 0.4, None, {"stopLossPrice": 90.0, "clientOrderId": "tbvsOLD"})
+    steps = run(client)
+    assert steps[0].ok and client.ex.orders[old["id"]]["status"] == "canceled"

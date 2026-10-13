@@ -431,7 +431,12 @@ How orders are handled on the exchange (testnet and live):
 - At start-up it settles a stop move that a crash interrupted, and at start-up and hourly it
   cancels stray bot orders that no position owns.
 - With a core sleeve, the core's buys and sells are market orders with the same client-ID rules;
-  its cash and coins are kept out of the satellite's equity, free cash and coin checks.
+  its cash and coins are kept out of the satellite's equity, free cash and coin checks. While a
+  core order's outcome is unresolved, the drawdown breakers and new entries wait.
+- An order read back from the exchange takes its fees from its trades (Binance's order query has
+  none); a buy whose fees can't be read yet is not booked until they can.
+- Pay fees in the traded coins on the bot's account, not with the BNB discount: equity is measured
+  from the quote and position balances, and BNB spent on the satellite's fees isn't in them.
 - Time stops and exit signals are market orders the bot sends at the current price.
 - If the coins disappear from the account (e.g. sold by hand), the bot halts new entries and
   asks you to check. `/forget <id>` then removes a position from its books without trading.

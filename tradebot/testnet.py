@@ -98,11 +98,15 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
 
     rec = Recorder(client.ex)
     client.ex = rec
-    broker = LiveBroker(client, quote, testnet=True, sleep=sleep, clock=clock)
+    broker = LiveBroker(client, quote, testnet=True, sleep=sleep, clock=clock, id_tag="v")  # its orders: 'tbv...'
     try:
         base = client.market(symbol)["base"]
-        busy = [o for s in {symbol, *core_symbols} for o in rec.fetch_open_orders(s)
-                if str(o.get("clientOrderId") or "").startswith("tb")]
+        opened = [(s, o) for s in sorted({symbol, *core_symbols}) for o in rec.fetch_open_orders(s)]
+        for s, o in opened:  # an earlier run's leftovers (a run killed before its clean-up): cancelled
+            if str(o.get("clientOrderId") or "").startswith("tbv"):
+                rec.cancel_order(str(o["id"]), s)
+        busy = [o for s, o in opened if str(o.get("clientOrderId") or "").startswith("tb")
+                and not str(o.get("clientOrderId") or "").startswith("tbv")]
         if busy:  # a testnet bot on these keys: its orders and the run's would get in each other's way
             step("account", False, f"{len(busy)} bot orders are open on this testnet account - a testnet bot seems "
                  f"to be running on the same keys; stop it before verifying")
@@ -192,13 +196,13 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
                      f"{wait_s / 60:.0f} minutes; sold")
 
         # 7. lost answers
-        cid, sent = new_client_id("v"), clock()
+        cid, sent = new_client_id("vq"), clock()
         bid = client.price_to_precision(symbol, client.fetch_last_price(symbol) * 0.6)
-        rec.create_order(symbol, "limit", "buy", client.amount_to_precision(symbol, 10.0 / bid), bid, {"clientOrderId": cid})
+        rec.create_order(symbol, "limit", "buy", broker._amount(symbol, 10.0 / bid), bid, {"clientOrderId": cid})
         found = broker._lookup(symbol, cid, sent)
         if found:
             broker._cancel(str(found["id"]), symbol)
-        never = broker._lookup(symbol, new_client_id("v"), clock())
+        never = broker._lookup(symbol, new_client_id("vq"), clock())
         step("lost answers are found by client id", bool(found) and never is None,
              f"sent order found: {bool(found)}; an id never sent: {'not found' if never is None else 'FOUND'}")
 
@@ -217,9 +221,9 @@ def verify(client, quote: str = "USDT", symbol: str = "BTC/USDT", core_symbols=(
         coin = lambda b, s: float(b.get(client.market(s)["base"]) or 0)  # noqa: E731
         match = all(abs(coin(now_bal, s) - coin(before, s) - q) <= max(1e-6, 0.01 * q) for s, q in held.items())
         sold = core.rebalance(clock(), prices, {s: 0.0 for s in core_symbols})
-        cid, sent = new_client_id("c"), clock()
+        cid, sent = new_client_id("vc"), clock()
         s0 = core_symbols[0]
-        qty = client.amount_to_precision(s0, 6.0 / prices[s0] * 1.2)
+        qty = broker._amount(s0, 6.0 / prices[s0] * 1.2)
         core._set("pending", {"client_id": cid, "symbol": s0, "side": "buy", "qty": qty, "sent_ms": sent, "reason": "verify"})
         rec.create_order(s0, "market", "buy", qty, None, {"clientOrderId": cid})  # the answer "lost"
         resolved = core.resolve_pending(clock())
@@ -248,11 +252,15 @@ def _clean_up(client, rec, symbols, start_base: dict, log) -> Step:
                     except Exception:  # noqa: BLE001 - recorded below
                         left.append(f"{s} {o['id']}")
             total = float((rec.fetch_balance().get("free") or {}).get(client.market(s)["base"]) or 0.0)
-            extra = client.amount_to_precision(s, total - start_base.get(s, total))
+            leftover = total - start_base.get(s, total)
+            try:  # ccxt refuses to round an amount under one lot step: that is dust
+                extra = client.amount_to_precision(s, leftover) if leftover > 0 else 0.0
+            except Exception:  # noqa: BLE001
+                extra = 0.0
             if extra * client.fetch_last_price(s) >= 6.0:
                 rec.create_order(s, "market", "sell", extra, None, {"clientOrderId": f"tbvCLEAN{s[:3]}{int(time.time()) % 10_000}"})
-            elif extra > 0:
-                dust.append(f"{extra:g} {client.market(s)['base']}")
+            elif leftover > 1e-12:
+                dust.append(f"{leftover:.8g} {client.market(s)['base']}")
         except Exception as exc:  # noqa: BLE001
             left.append(f"{s}: {exc}")
     detail = ("the run's orders cancelled, its coins sold" + (f" (dust under the minimum order left: {', '.join(dust)})"

@@ -139,3 +139,22 @@ def test_a_position_left_by_an_older_bot_gets_the_pair_on_start_up(cfg):
     bot.check_unresolved()
     p = db.get_position(old.id)
     assert p.sl_order_id and p.protection.get("tp_order_id") and client.ex.coverage() == pytest.approx(0.999)
+
+
+def test_an_unresolved_core_order_holds_the_breakers_and_new_entries(cfg):
+    import ccxt
+
+    client, market, db, notes, bot = make_testnet_bot(cfg, [(100, 101, 99, 100)], core=0.65)
+    bot.core.initialize(650.0)
+    client.ex.fail["buy"] = ("after", ccxt.RequestTimeout("timed out"))
+    client.ex.down = 5  # and the lookup can't run yet
+    with pytest.raises(Exception):
+        bot.core.rebalance(T0, {"BTC/USDT": 100.0, "ETH/USDT": 10.0}, {"BTC/USDT": 1.0, "ETH/USDT": 0.0})
+    assert bot.core.pending
+    assert bot._entry_block(signal(), [], 1000.0) == "a core order is unresolved"
+    client.ex.down = 5  # still unreachable at the next tick: the resolution fails again
+    bot.tick(T0 + 30_000)
+    assert bot.core.pending
+    assert db.kv_get("testnet:peak_equity") is None  # no breaker read the half-booked equity
+    bot.tick(T0 + 60_000)  # the order resolves: everything resumes
+    assert not bot.core.pending and bot._entry_block(signal(), [], 1000.0) != "a core order is unresolved"

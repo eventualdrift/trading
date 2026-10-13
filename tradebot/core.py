@@ -106,13 +106,21 @@ class CoreSleeve:
         """An exchange order sent (or about to be) whose fill is not recorded yet."""
         return self._get("pending") or None
 
+    @property
+    def other_fees(self) -> float:
+        """Fees the core paid in a third coin (BNB), valued when paid: charged to its cash, never taken
+        from the quote balance."""
+        return float(self._get("other_fees", 0.0))
+
     def reserved(self) -> tuple[float, dict[str, float]]:
-        """(the core's cash, its coins by base currency): what the satellite must leave alone."""
+        """(the core's share of the quote balance, its coins by base currency): what the satellite must
+        leave alone. The share is its cash plus the fees it paid in BNB - its ledger was charged those,
+        the quote balance never was."""
         coins: dict[str, float] = {}
         for sym, q in self.holdings.items():
             base = sym.split("/")[0]
             coins[base] = coins.get(base, 0.0) + q
-        return (self.cash if self.initialized else 0.0), coins
+        return ((self.cash + self.other_fees) if self.initialized else 0.0), coins
 
     # --------------------------------------------------------- capital moves
     def initialize(self, amount: float) -> None:
@@ -170,16 +178,14 @@ class CoreSleeve:
     def _exchange_trade(self, symbol: str, side: str, qty: float, now_ms: int, reason: str,
                         w_from: float, w_to: float) -> CoreTrade | None:
         """A market order on the exchange; the ledger takes what it filled. None: nothing traded."""
-        from .models import new_client_id
-
         ex = self.executor
         self.resolve_pending(now_ms)  # an earlier order's outcome first: never two in doubt
-        if side == "sell":
-            qty = min(qty, self.holdings.get(symbol, 0.0))
-        qty = ex.client.amount_to_precision(symbol, qty)
+        if side == "sell":  # never more than the ledger holds, nor than the account has free
+            qty = min(qty, self.holdings.get(symbol, 0.0), ex.free_coins(symbol))
+        qty = ex._amount(symbol, qty)
         if qty <= 0:
             return None
-        pending = {"client_id": new_client_id("c"), "symbol": symbol, "side": side, "qty": qty,
+        pending = {"client_id": ex.client_id("c"), "symbol": symbol, "side": side, "qty": qty,
                    "sent_ms": ex.clock(), "reason": reason, "w_from": w_from, "w_to": w_to}
         self._set("pending", pending)  # saved BEFORE the order is sent
         order = ex.core_order(symbol, side, qty, pending["client_id"], pending["sent_ms"])
@@ -202,9 +208,12 @@ class CoreSleeve:
             self._set("pending", None)
             return None
         holdings = self.holdings
-        # the ledger moves as the balances did: a fee taken in the coin is fewer coins, one taken in quote
-        # is less cash; one paid in another coin (BNB) touches neither - it is recorded as the trade's fee
-        quote_fee = fill.get("quote_fee", fill["fee"] - fill["base_fee"] * fill["avg"])
+        # a fee taken in the coin is fewer coins; any other fee is charged to the cash - one paid in a third
+        # coin (BNB) too, and counted in other_fees, as the quote balance never paid it
+        quote_fee = fill["fee"] - fill["base_fee"] * fill["avg"]
+        other = max(quote_fee - fill.get("quote_fee", quote_fee), 0.0)
+        if other:
+            self._set("other_fees", self.other_fees + other)
         if side == "buy":
             got = fill["filled"] - fill["base_fee"]
             self._set("cash", self.cash - fill["filled"] * fill["avg"] - quote_fee)

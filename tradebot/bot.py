@@ -364,6 +364,8 @@ class TradingBot:
     def _entry_block(self, sig: Signal, open_positions: list[Position], equity: float) -> str | None:
         if self._get("paused"):
             return "paused by user"
+        if self.core is not None and self.core.pending:  # its fill could be the satellite's cash meanwhile
+            return "a core order is unresolved"
         if self._get("halted"):
             return f"halted ({self._get('halted')})"
         if self.risk.daily_limit_hit(equity, self._get("day_start_equity", equity)):
@@ -468,7 +470,12 @@ class TradingBot:
                 except Exception as exc:
                     self._notify_error(f"core sleeve: {exc}", key="core")
             equity, prices = self.equity()
-            self._update_breakers(now_ms, equity)
+            if self.core is not None and self.core.pending:
+                # a core order not yet booked shows in the account but not in the core's ledger: the
+                # satellite's equity is off by its fill until it is, so no breaker reads it
+                log.warning("core order %s unresolved: breakers wait", self.core.pending.get("client_id"))
+            else:
+                self._update_breakers(now_ms, equity)
             self._maybe_write_dashboard(now_ms, prices)
             delay = int(self.cfg.candle_close_delay_seconds * 1000)
             for tf in self.active_timeframes():

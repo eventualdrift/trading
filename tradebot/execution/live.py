@@ -58,6 +58,10 @@ MIN_MOVE_R = 0.1  # the exchange stop follows the bot's trailing level in steps 
 BOT_PREFIX = "tb"
 
 
+class FeesUnknown(ExecutionError):
+    """An order filled but its fees can't be read yet (its trades are unavailable): retried."""
+
+
 def _error_body(exc: Exception) -> dict:
     """The JSON body of a Binance error ccxt raised ('binance {...}'); {} when the message has none.
     Never the client's last response: after a timeout that is an earlier request's."""
@@ -93,7 +97,7 @@ class LiveBroker(Broker):
 
     def __init__(self, client: ExchangeClient, quote: str, native_stop_loss: bool = True,
                  fill_timeout_s: float = 30.0, sleep=time.sleep, clock=None, persist=None,
-                 testnet: bool = False, take_profit_orders: bool = True):
+                 testnet: bool = False, take_profit_orders: bool = True, id_tag: str = ""):
         """``testnet``: the exchange's testnet only - refused unless the client points there
         (mode: testnet). Live trading itself is refused by the config (config.LIVE_TRADING)."""
         venue = VENUES.get(client.id)
@@ -114,6 +118,7 @@ class LiveBroker(Broker):
         self.quote = quote
         self.native_stop_loss = native_stop_loss
         self.take_profit_orders = take_profit_orders  # the take-profit on the exchange with the stop (OCO)
+        self.id_tag = id_tag
         self.fill_timeout_s = fill_timeout_s
         self.sleep = sleep
         self.clock = clock or (lambda: int(time.time() * 1000))
@@ -121,6 +126,19 @@ class LiveBroker(Broker):
         self.recv_window_ms = int((getattr(self.ex, "options", None) or {}).get("recvWindow", 10_000))
 
     # ------------------------------------------------------------- helpers
+    def _amount(self, symbol: str, amount: float) -> float:
+        """The amount rounded down to the exchange's lot step; 0 when under one step (ccxt raises)."""
+        if amount <= 0:
+            return 0.0
+        try:
+            return self.client.amount_to_precision(symbol, amount)
+        except ccxt.InvalidOrder:
+            return 0.0
+
+    def client_id(self, kind: str) -> str:
+        """A new client order id; ``id_tag`` marks a run's own orders (testnet verify: 'v')."""
+        return new_client_id(self.id_tag + kind)
+
     def _base(self, symbol: str) -> str:
         return self.client.market(symbol)["base"]
 
@@ -181,9 +199,8 @@ class LiveBroker(Broker):
             return fees
         try:
             trades = with_retries(self.ex.fetch_my_trades, symbol, None, None, {"orderId": str(order["id"])})
-        except Exception as exc:  # noqa: BLE001 - recorded without its fee, said so
-            log.warning("fees of order %s on %s unknown (%s): recorded without them", order.get("id"), symbol, exc)
-            return []
+        except Exception as exc:  # noqa: BLE001 - the caller decides whether it can book without them
+            raise FeesUnknown(f"fees of order {order.get('id')} on {symbol} unknown ({exc})") from exc
         return [t["fee"] for t in trades or [] if t.get("fee")]
 
     def _fees(self, order: dict, base: str, avg: float, symbol: str | None = None) -> tuple[float, float]:
@@ -229,7 +246,13 @@ class LiveBroker(Broker):
         if prev and prev.get("filled") == filled and not (order.get("fees") or order.get("fee")):
             base_fee, quote_fee = prev["base_fee"], prev["fee"]  # read before: its fees are known
         else:
-            base_fee, quote_fee = self._fees(order, self._base(pos.symbol), avg, pos.symbol)
+            try:
+                base_fee, quote_fee = self._fees(order, self._base(pos.symbol), avg, pos.symbol)
+            except FeesUnknown as exc:
+                if kind == "entry":  # a buy's fee is taken in coins: the amount held depends on it
+                    raise
+                log.warning("%s: booked without its fee", exc)  # an exit's fee is quote: only P&L is off
+                base_fee = quote_fee = 0.0
         fills = dict(pos.fills)
         fills[str(order["id"])] = {"kind": kind, "filled": filled, "avg": avg, "base_fee": base_fee, "fee": quote_fee}
         pos.fills = fills
@@ -245,7 +268,7 @@ class LiveBroker(Broker):
         pos.fees = sum(f["fee"] for f in fills.values())
 
     def _is_dust(self, symbol: str, qty: float, price: float) -> bool:
-        if qty <= 0 or self.client.amount_to_precision(symbol, qty) <= 0:
+        if qty <= 0 or self._amount(symbol, qty) <= 0:
             return True
         lim = self.client.limits(symbol)
         return qty < (lim.get("min_amount") or 0.0) or qty * price < (lim.get("min_cost") or 0.0)
@@ -272,6 +295,10 @@ class LiveBroker(Broker):
     def available_cash(self) -> float | None:
         return max(self._held(self.quote, "free") - self.reserved()[0], 0.0)
 
+    def free_coins(self, symbol: str) -> float:
+        """Coins of the symbol's base currency free on the account (not locked by an order)."""
+        return self._held(self._base(symbol), "free")
+
     def transfer(self, delta: float) -> None:
         """Core/satellite moves are bookkeeping in one account: the core's cash ledger is what is
         reserved (``reserved``), so the satellite's equity changes with it."""
@@ -280,7 +307,7 @@ class LiveBroker(Broker):
         return self.client.limits(symbol)
 
     def to_precision(self, symbol: str):
-        return lambda a: self.client.amount_to_precision(symbol, a)
+        return lambda a: self._amount(symbol, a)
 
     # --------------------------------------------------------------- entry
     def open_position(self, pos: Position, price: float, now_ms: int) -> Position:
@@ -289,7 +316,7 @@ class LiveBroker(Broker):
         if not pos.client_order_id:
             raise ValueError("position needs a client_order_id persisted before the order is sent")
         sym = pos.symbol
-        amount = self.client.amount_to_precision(sym, pos.amount)
+        amount = self._amount(sym, pos.amount)
         sent = self.clock()
         try:
             order = self.ex.create_order(sym, "market", "buy", amount, None, {"clientOrderId": pos.client_order_id})
@@ -379,16 +406,17 @@ class LiveBroker(Broker):
         if not self.native_stop_loss:
             return
         sym = pos.symbol
-        qty = self.client.amount_to_precision(sym, pos.open_amount)
+        qty = self._amount(sym, pos.open_amount)
         stop = self.client.price_to_precision(sym, pos.stop_loss)
+        held = self._baseline(pos)  # before anything is placed: an exit that fires later is measured from it
         problems = []
         if self._wants_take_profit(pos):
-            problem = self._protect_oco(pos, qty, stop, now_ms)
+            problem = self._protect_oco(pos, qty, stop, now_ms, held)
             if problem is None:  # in place and checked, or the position closed
                 return
             problems.append(problem)
         for otype, limit in (("market", None), ("limit", self.client.price_to_precision(sym, stop * 0.995))):
-            pos.sl_client_id, pos.sl_sent_ms = new_client_id("s"), self.clock()
+            pos.sl_client_id, pos.sl_sent_ms = self.client_id("s"), self.clock()
             self.persist(pos)
             params = {"stopLossPrice": stop, "clientOrderId": pos.sl_client_id, **self.venue.stop_create}
             try:
@@ -411,7 +439,7 @@ class LiveBroker(Broker):
                 pos.sl_order_id = str(order["id"])
                 self._set_protection(pos, stop=stop, moved=bool(self._protection(pos).get("moved") or pos.breakeven_moved)
                                      or None, tp_order_id=None, tp_client_id=None, list_id=None, list_client_id=None,
-                                     held=self._baseline(pos))
+                                     held=held)
                 self.persist(pos)
                 log.info("verified %s stop for %s %s @ %s (order %s)", otype, qty, sym, stop, order["id"])
                 return
@@ -431,13 +459,13 @@ class LiveBroker(Broker):
             problems.append(f"{otype} stop not protective ({detail})")
         raise ProtectionError("; ".join(problems))
 
-    def _protect_oco(self, pos: Position, qty: float, stop: float, now_ms: int) -> str | None:
+    def _protect_oco(self, pos: Position, qty: float, stop: float, now_ms: int, held: float | None = None) -> str | None:
         """The OCO pair: a TAKE_PROFIT above the market and a STOP_LOSS below it, one quantity.
         None: in place and checked (or the position closed); else why it isn't (the caller falls
         back to a single stop). Raises ProtectionError if a leg executed for part of the position."""
         sym = pos.symbol
         tp = self.client.price_to_precision(sym, pos.take_profit)
-        lcid, tcid, scid = new_client_id("l"), new_client_id("t"), new_client_id("s")
+        lcid, tcid, scid = self.client_id("l"), self.client_id("t"), self.client_id("s")
         pos.sl_client_id, pos.sl_sent_ms = scid, self.clock()
         self._set_protection(pos, list_client_id=lcid, tp_client_id=tcid)
         self.persist(pos)  # the ids are saved BEFORE the pair is sent
@@ -484,7 +512,7 @@ class LiveBroker(Broker):
         if s_state == "ok" and t_state == "ok":
             pos.sl_order_id = str(stop_leg["id"])
             self._set_protection(pos, list_id=list_id, tp_order_id=str(tp_leg["id"]), stop=stop, tp=tp, moved=None,
-                                 held=self._baseline(pos))
+                                 held=held)
             self.persist(pos)
             log.info("verified OCO for %s %s: stop %s, take-profit %s (orders %s, %s)", qty, sym, stop, tp,
                      stop_leg["id"], tp_leg["id"])
@@ -553,9 +581,9 @@ class LiveBroker(Broker):
 
     def _replace_stop(self, pos: Position, level: float, now_ms: int) -> None:
         sym = pos.symbol
-        qty = self.client.amount_to_precision(sym, pos.open_amount)
+        qty = self._amount(sym, pos.open_amount)
         prot = self._protection(pos)
-        move = {"from": pos.sl_order_id, "from_tp": prot.get("tp_order_id"), "cid": new_client_id("s"),
+        move = {"from": pos.sl_order_id, "from_tp": prot.get("tp_order_id"), "cid": self.client_id("s"),
                 "level": level, "sent_ms": self.clock()}
         self._set_protection(pos, move=move)
         self.persist(pos)  # what is about to happen is saved BEFORE the request
@@ -621,12 +649,12 @@ class LiveBroker(Broker):
         sym = pos.symbol
         move = self._protection(pos)["move"]
         self._old_legs_final(pos, move)
-        qty = self.client.amount_to_precision(sym, pos.open_amount)
+        qty = self._amount(sym, pos.open_amount)
         state, detail = self._verify_stop({"id": new_id}, sym, move["level"], qty)
         if state == "ok":
             pos.sl_order_id, pos.sl_client_id = new_id, move["cid"]
             self._set_protection(pos, stop=move["level"], moved=True, move=None, tp_order_id=None, tp_client_id=None,
-                                 list_id=None, list_client_id=None, held=self._baseline(pos))
+                                 list_id=None, list_client_id=None)  # a move changes no coins: the baseline stays
             self.persist(pos)
             log.info("moved the exchange stop of %s to %s (order %s)", sym, move["level"], new_id)
             return
@@ -782,13 +810,13 @@ class LiveBroker(Broker):
     def _sell(self, pos: Position, price: float) -> None:
         sym, base = pos.symbol, self._base(pos.symbol)
         held = self._satellite_coins(base, self._balance().get("free") or {})  # never the core's coins
-        qty = self.client.amount_to_precision(sym, min(pos.open_amount, held))
+        qty = self._amount(sym, min(pos.open_amount, held))
         if self._is_dust(sym, qty, price):
             raise ExecutionError(
                 f"the bot expects {pos.open_amount:g} {base} but only {held:g} is free - sold outside the bot? "
                 f"Not selling. Check the account, then /forget {pos.id}"
             )
-        pos.exit_client_id, pos.exit_sent_ms = new_client_id("x"), self.clock()
+        pos.exit_client_id, pos.exit_sent_ms = self.client_id("x"), self.clock()
         self.persist(pos)
         try:
             order = self.ex.create_order(sym, "market", "sell", qty, None, {"clientOrderId": pos.exit_client_id})

@@ -43,6 +43,7 @@ class FakeSpot:
         self.calls: list[tuple] = []
         self.fail: dict[str, tuple] = {}
         self.down = 0  # the next N reads fail (the exchange unreachable for a while)
+        self.trades_down = False  # the trades endpoint fails (fees of a read-back order unknown)
         self.fee = 0.001
         self.bnb_fees = False  # market buys pay their fee in BNB (Binance's fee discount)
         self.fill_fraction = 1.0  # a triggered or market order fills this share; the rest expires
@@ -66,6 +67,8 @@ class FakeSpot:
 
     def amount_to_precision(self, symbol, a):
         steps = int(float(a) / self.lot + 1e-9)
+        if steps == 0:  # like ccxt: an amount under one lot step is refused, not rounded to 0
+            raise ccxt.InvalidOrder(f"binance amount of {symbol} must be greater than minimum amount precision")
         return f"{steps * self.lot:.8f}"
 
     @staticmethod
@@ -282,6 +285,9 @@ class FakeSpot:
     def fetch_my_trades(self, symbol=None, since=None, limit=None, params=None):
         """The order's trades (GET /api/v3/myTrades?orderId=): where the fees are."""
         self.calls.append(("trades", (params or {}).get("orderId")))
+        self._injected("trades")
+        if self.trades_down:
+            raise ccxt.ExchangeNotAvailable("binance 503 Service Unavailable")
         o = self.orders.get(str((params or {}).get("orderId")))
         if o is None or not o["filled"]:
             return []
