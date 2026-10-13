@@ -18,11 +18,21 @@ Rules this broker follows:
   * an earlier exit order is driven to a final state before any new sell;
   * a stop counts as protection only after it's fetched back and checked:
     open, our symbol, side, trigger and full quantity;
-  * the breakeven stop is enforced by the bot; the exchange stop stays at the
-    initial level (no cancel-then-replace window).
+  * from entry until the stop first moves, the stop and the take-profit rest on the
+    exchange together as an OCO pair (one quantity: whichever triggers expires the other);
+  * the stop is moved (breakeven, then trailing) in ONE cancel-replace request: the
+    exchange cancels the protection and places the new stop straight after, so no moment
+    passes between two requests with no stop. Spot coins can carry one sell order and an
+    OCO can't be replaced by an OCO in one request, so the take-profit leaves the exchange
+    at the first move and the bot takes it from then on; keeping it would mean a gap of a
+    round trip (about 0.4 s from the box) with no stop on every move;
+  * a move is saved before it is sent; if its answer is lost, the new stop is looked up by
+    its client id and the old order read back, and a position the move left without a
+    stop gets one at once or is sold.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -38,8 +48,26 @@ log = logging.getLogger(__name__)
 FINAL = ("closed", "canceled", "expired", "rejected")
 # exits that rest on the exchange as orders, so they still fire while the bot is down. The
 # go-live checklist (report.readiness) requires every protective exit to be here.
-EXCHANGE_SIDE_EXITS = frozenset({"stop_loss"})
+EXCHANGE_SIDE_EXITS = frozenset({"stop_loss", "breakeven_stop", "trailing_stop"})
+# exits on the exchange only for part of a trade, and why
+PARTLY_EXCHANGE_SIDE = {
+    "take_profit": "on the exchange with the stop (an OCO pair) until the stop first moves; after that the bot "
+                   "takes it (Binance spot can't keep it across a stop move without a moment with no stop)",
+}
+MIN_MOVE_R = 0.1  # the exchange stop follows the bot's trailing level in steps of at least this much risk
 BOT_PREFIX = "tb"
+
+
+def _error_body(exc: Exception, ex=None) -> dict:
+    """The JSON body of a Binance error ccxt raised ('binance {...}'), else the last response."""
+    for text in (str(exc), str(getattr(ex, "last_http_response", "") or "")):
+        start = text.find("{")
+        if start >= 0:
+            try:
+                return json.loads(text[start:])
+            except ValueError:
+                continue
+    return {}
 
 
 @dataclass(frozen=True)
@@ -62,18 +90,28 @@ class LiveBroker(Broker):
     mode = "live"
 
     def __init__(self, client: ExchangeClient, quote: str, native_stop_loss: bool = True,
-                 fill_timeout_s: float = 30.0, sleep=time.sleep, clock=None, persist=None):
+                 fill_timeout_s: float = 30.0, sleep=time.sleep, clock=None, persist=None,
+                 testnet: bool = False, take_profit_orders: bool = True):
+        """``testnet``: the exchange's testnet only - refused unless the client points there
+        (mode: testnet). Live trading itself is refused by the config (config.LIVE_TRADING)."""
         venue = VENUES.get(client.id)
         if venue is None:
             raise ValueError(
                 f"Live trading is not supported on {client.id!r}: its order handling has not been verified. "
                 f"Supported: {', '.join(sorted(VENUES))}. Signals and paper trading work on any exchange."
             )
+        self.testnet = testnet
+        if testnet:
+            client.assert_testnet()
+            self.mode = "testnet"
         self.client = client
         self.ex = client.ex
         self.venue = venue
+        # the core sleeve's (cash, coins by base currency) in the same account: not the satellite's
+        self.reserved = lambda: (0.0, {})
         self.quote = quote
         self.native_stop_loss = native_stop_loss
+        self.take_profit_orders = take_profit_orders  # the take-profit on the exchange with the stop (OCO)
         self.fill_timeout_s = fill_timeout_s
         self.sleep = sleep
         self.clock = clock or (lambda: int(time.time() * 1000))
@@ -170,7 +208,7 @@ class LiveBroker(Broker):
         fills[str(order["id"])] = {"kind": kind, "filled": filled, "avg": avg, "base_fee": base_fee, "fee": quote_fee}
         pos.fills = fills
         entry = [f for f in fills.values() if f["kind"] == "entry"]
-        exits = [f for f in fills.values() if f["kind"] in ("exit", "stop")]
+        exits = [f for f in fills.values() if f["kind"] in ("exit", "stop", "tp")]
         if entry:
             gross = sum(f["filled"] for f in entry)
             if gross > 0:
@@ -187,16 +225,30 @@ class LiveBroker(Broker):
         return qty < (lim.get("min_amount") or 0.0) or qty * price < (lim.get("min_cost") or 0.0)
 
     # ------------------------------------------------------------ balances
+    def _satellite_coins(self, base: str, balances: dict) -> float:
+        """Coins of ``base`` in ``balances`` that are not the core sleeve's."""
+        return max(float(balances.get(base) or 0.0) - self.reserved()[1].get(base, 0.0), 0.0)
+
     def equity(self, prices: dict[str, float], positions: list[Position]) -> float:
+        """The satellite's equity: the quote balance less the core's cash, plus the coins of its
+        positions really held (the core's coins of the same currency left out)."""
         totals = self._balance().get("total") or {}
-        value = float(totals.get(self.quote) or 0.0)
+        value = float(totals.get(self.quote) or 0.0) - self.reserved()[0]
+        left: dict[str, float] = {}
         for p in positions:
-            held = float(totals.get(self._base(p.symbol)) or 0.0)
-            value += min(p.open_amount, held) * prices.get(p.symbol, p.entry_price)  # only coins really held
+            base = self._base(p.symbol)
+            held = left.get(base, self._satellite_coins(base, totals))
+            mine = min(p.open_amount, held)  # only coins really held
+            left[base] = held - mine
+            value += mine * prices.get(p.symbol, p.entry_price)
         return value
 
     def available_cash(self) -> float | None:
-        return self._held(self.quote, "free")
+        return max(self._held(self.quote, "free") - self.reserved()[0], 0.0)
+
+    def transfer(self, delta: float) -> None:
+        """Core/satellite moves are bookkeeping in one account: the core's cash ledger is what is
+        reserved (``reserved``), so the satellite's equity changes with it."""
 
     def limits(self, symbol: str) -> dict:
         return self.client.limits(symbol)
@@ -254,13 +306,52 @@ class LiveBroker(Broker):
         return pos.status
 
     # ---------------------------------------------------------- protection
+    def _protection(self, pos: Position) -> dict:
+        return dict(pos.protection or {})
+
+    def _set_protection(self, pos: Position, **values) -> None:
+        prot = self._protection(pos)
+        prot.update(values)
+        pos.protection = {k: v for k, v in prot.items() if v is not None}
+
+    def _clear_protection(self, pos: Position) -> None:
+        """No order protects the position any more (it executed, was cancelled or vanished). Whether
+        its stop had moved is kept: a moved stop is never paired with a take-profit again."""
+        pos.sl_order_id = pos.sl_client_id = None
+        prot = self._protection(pos)
+        pos.protection = {k: v for k, v in prot.items() if k in ("moved", "stop")}
+
+    def _stop_exit_reason(self, pos: Position) -> str:
+        """Why a position whose exchange stop executed was closed: the stop's level decides."""
+        prot = self._protection(pos)
+        if not prot.get("moved"):
+            return "stop_loss"
+        level = float(prot.get("stop", pos.stop_loss))
+        beyond = level > pos.entry_price * (1 + 1e-9) if pos.side == "long" else level < pos.entry_price * (1 - 1e-9)
+        return "trailing_stop" if beyond else "breakeven_stop"
+
+    def _wants_take_profit(self, pos: Position) -> bool:
+        return (self.take_profit_orders and callable(getattr(self.ex, "privatePostOrderListOco", None))
+                and not pos.breakeven_moved and not self._protection(pos).get("moved")
+                and bool(pos.take_profit) and pos.take_profit > pos.stop_loss)
+
     def protect(self, pos: Position, now_ms: int) -> None:
+        """Put the position's exits on the exchange and check them there. Until the stop first
+        moves: an OCO pair - a take-profit trigger at the target and a stop-loss at the stop - so
+        both fire while the bot is down. Once it has moved: a single stop-loss at the bot's level
+        (an OCO can't be moved without a moment with no stop: see ``sync_stop``). A refused pair
+        falls back to a single stop; ProtectionError when no stop could be placed."""
         if not self.native_stop_loss:
             return
         sym = pos.symbol
         qty = self.client.amount_to_precision(sym, pos.open_amount)
-        stop = self.client.price_to_precision(sym, pos.initial_stop)
+        stop = self.client.price_to_precision(sym, pos.stop_loss)
         problems = []
+        if self._wants_take_profit(pos):
+            problem = self._protect_oco(pos, qty, stop, now_ms)
+            if problem is None:  # in place and checked, or the position closed
+                return
+            problems.append(problem)
         for otype, limit in (("market", None), ("limit", self.client.price_to_precision(sym, stop * 0.995))):
             pos.sl_client_id, pos.sl_sent_ms = new_client_id("s"), self.clock()
             self.persist(pos)
@@ -283,13 +374,15 @@ class LiveBroker(Broker):
             state, detail = self._verify_stop(order, sym, stop, qty)
             if state == "ok":
                 pos.sl_order_id = str(order["id"])
+                self._set_protection(pos, stop=stop, moved=bool(self._protection(pos).get("moved") or pos.breakeven_moved)
+                                     or None, tp_order_id=None, tp_client_id=None, list_id=None, list_client_id=None)
                 self.persist(pos)
                 log.info("verified %s stop for %s %s @ %s (order %s)", otype, qty, sym, stop, order["id"])
                 return
             if state == "executed":  # the exchange sold instead of waiting for the trigger
                 self._apply(pos, detail, "stop")
                 pos.sl_client_id = None
-                if self._is_dust(sym, pos.open_amount, pos.initial_stop):
+                if self._is_dust(sym, pos.open_amount, stop):
                     finalize_close(pos, pos.exit_value / pos.exit_filled, 0.0, "stop_order_executed", now_ms)
                     return
                 raise ProtectionError("the stop order executed immediately for part of the position")
@@ -302,11 +395,78 @@ class LiveBroker(Broker):
             problems.append(f"{otype} stop not protective ({detail})")
         raise ProtectionError("; ".join(problems))
 
+    def _protect_oco(self, pos: Position, qty: float, stop: float, now_ms: int) -> str | None:
+        """The OCO pair: a TAKE_PROFIT above the market and a STOP_LOSS below it, one quantity.
+        None: in place and checked (or the position closed); else why it isn't (the caller falls
+        back to a single stop). Raises ProtectionError if a leg executed for part of the position."""
+        sym = pos.symbol
+        tp = self.client.price_to_precision(sym, pos.take_profit)
+        lcid, tcid, scid = new_client_id("l"), new_client_id("t"), new_client_id("s")
+        pos.sl_client_id, pos.sl_sent_ms = scid, self.clock()
+        self._set_protection(pos, list_client_id=lcid, tp_client_id=tcid)
+        self.persist(pos)  # the ids are saved BEFORE the pair is sent
+        params = {"symbol": self.client.market(sym)["id"], "side": "SELL",
+                  "quantity": self.ex.amount_to_precision(sym, qty),
+                  "aboveType": "TAKE_PROFIT", "aboveStopPrice": self.ex.price_to_precision(sym, tp),
+                  "belowType": "STOP_LOSS", "belowStopPrice": self.ex.price_to_precision(sym, stop),
+                  "listClientOrderId": lcid, "aboveClientOrderId": tcid, "belowClientOrderId": scid}
+        list_id = None
+        try:
+            resp = self.ex.privatePostOrderListOco(params)
+            ids = {o.get("clientOrderId"): str(o.get("orderId")) for o in (resp or {}).get("orders") or []}
+            list_id = (resp or {}).get("orderListId")
+            stop_leg = self._fetch(ids[scid], sym, stop=True)
+            tp_leg = self._fetch(ids[tcid], sym, stop=True)
+        except ccxt.NetworkError as exc:  # sent, answer lost: the legs are found by their client ids or never existed
+            try:
+                stop_leg = self._lookup(sym, scid, pos.sl_sent_ms, stop=True)
+                tp_leg = self._lookup(sym, tcid, pos.sl_sent_ms, stop=True) if stop_leg is not None else None
+            except ccxt.BaseError as exc2:
+                raise ProtectionError(f"OCO outcome unknown ({exc}; lookup: {exc2})") from exc2
+            if stop_leg is None:
+                self._clear_protection(pos)
+                return f"OCO not placed ({exc})"
+            if tp_leg is None:  # can't happen for a pair; treat the stop leg as a lone order to replace
+                tp_leg = {"id": None, "status": "canceled", "filled": 0.0}
+        except (ccxt.BaseError, KeyError) as exc:
+            self._clear_protection(pos)
+            return f"OCO refused: {exc}"
+        s_state, s_detail = self._verify_stop(stop_leg, sym, stop, qty)
+        t_state, t_detail = (self._verify_stop(tp_leg, sym, tp, qty) if tp_leg.get("id")
+                             else ("bad", "take-profit leg missing"))
+        if "executed" in (s_state, t_state):  # the market moved through a level as the pair was placed
+            for leg, kind in ((stop_leg, "stop"), (tp_leg, "tp")):
+                if leg.get("id") and float(leg.get("filled") or 0.0) > 0:
+                    self._apply(pos, leg, kind)
+            self._clear_protection(pos)
+            if self._is_dust(sym, pos.open_amount, stop):
+                reason = "take_profit" if t_state == "executed" else "stop_order_executed"
+                finalize_close(pos, pos.exit_value / pos.exit_filled, 0.0, reason, now_ms)
+                return None
+            raise ProtectionError("an exit order executed immediately for part of the position")
+        if s_state == "ok" and t_state == "ok":
+            pos.sl_order_id = str(stop_leg["id"])
+            self._set_protection(pos, list_id=list_id, tp_order_id=str(tp_leg["id"]), stop=stop, tp=tp, moved=None)
+            self.persist(pos)
+            log.info("verified OCO for %s %s: stop %s, take-profit %s (orders %s, %s)", qty, sym, stop, tp,
+                     stop_leg["id"], tp_leg["id"])
+            return None
+        self._cancel(str(stop_leg["id"]), sym, stop=True)  # one leg cancels the pair
+        for leg, kind in ((stop_leg, "stop"), (tp_leg, "tp")):
+            if leg.get("id"):
+                final = self._fetch(str(leg["id"]), sym, stop=True)
+                if final.get("status") not in FINAL:
+                    raise ProtectionError(f"a non-protective order {leg['id']} could not be cancelled")
+                self._apply(pos, final, kind)
+        self._clear_protection(pos)
+        return f"OCO not protective (stop: {s_detail if s_state != 'ok' else 'ok'}; take-profit: " \
+               f"{t_detail if t_state != 'ok' else 'ok'})"
+
     def _verify_stop(self, order: dict, symbol: str, stop: float, qty: float) -> tuple[str, object]:
         try:
             o = self._fetch(order["id"], symbol, stop=True)
         except ccxt.BaseError as exc:
-            raise ProtectionError(f"could not read back stop order {order.get('id')}: {exc}") from exc
+            raise ProtectionError(f"could not read back order {order.get('id')}: {exc}") from exc
         if float(o.get("filled") or 0.0) > 0:
             return "executed", o
         if o.get("status") != "open":
@@ -315,13 +475,171 @@ class LiveBroker(Broker):
             return "bad", f"symbol {o.get('symbol')}"
         if (o.get("side") or "sell") != "sell":
             return "bad", f"side {o.get('side')}"
-        trig = next((o.get(k) for k in ("triggerPrice", "stopLossPrice", "stopPrice") if o.get(k)), None)
+        trig = next((o.get(k) for k in ("triggerPrice", "stopLossPrice", "stopPrice", "takeProfitPrice") if o.get(k)), None)
         if trig is None or abs(float(trig) - stop) > 0.002 * stop:
             return "bad", f"trigger {trig} instead of {stop}"
         remaining = float(o.get("remaining") if o.get("remaining") is not None else (o.get("amount") or 0.0))
         if remaining < qty * 0.999:
             return "bad", f"covers {remaining:g} of {qty:g}"
         return "ok", o
+
+    # ---------------------------------------------------------- moving the stop
+    def sync_stop(self, pos: Position, now_ms: int) -> None:
+        """Bring the exchange stop up to the bot's level (breakeven, then trailing) in ONE request:
+        Binance's cancel-replace cancels the order that protects the position - a single stop, or
+        the OCO pair through its stop leg - and places the new single stop straight after, in the
+        same request. No moment passes between two requests with nothing protecting the coins.
+        The take-profit leaves the exchange at the first move (an OCO can't be replaced by an OCO in
+        one request, and spot coins can't carry two sell orders): the bot takes it from then on.
+        Trailing steps smaller than MIN_MOVE_R of the initial risk wait for a bigger one; while the
+        bot runs it enforces its own level, so the exchange stop only has to be close."""
+        if not self.native_stop_loss or pos.status != "open" or pos.closing_reason:
+            return
+        if self._protection(pos).get("move"):  # a move whose answer was lost: settle it first
+            self._resolve_move(pos, now_ms)
+            if pos.status != "open" or pos.closing_reason or self._protection(pos).get("move"):
+                return
+        if not pos.sl_order_id:
+            return  # nothing to move: protect() puts a stop in place (start-up, sync)
+        sym = pos.symbol
+        prot = self._protection(pos)
+        exchange_level = float(prot.get("stop", pos.initial_stop))
+        want = self.client.price_to_precision(sym, pos.stop_loss)
+        if pos.side != "long" or want <= exchange_level:
+            return
+        per_unit = abs(pos.entry_price - pos.initial_stop)
+        to_breakeven = pos.breakeven_moved and exchange_level < pos.entry_price * (1 - 1e-9)
+        if not to_breakeven and want - exchange_level < MIN_MOVE_R * per_unit:
+            return
+        self._replace_stop(pos, want, now_ms)
+
+    def _replace_stop(self, pos: Position, level: float, now_ms: int) -> None:
+        sym = pos.symbol
+        qty = self.client.amount_to_precision(sym, pos.open_amount)
+        prot = self._protection(pos)
+        move = {"from": pos.sl_order_id, "from_tp": prot.get("tp_order_id"), "cid": new_client_id("s"),
+                "level": level, "sent_ms": self.clock()}
+        self._set_protection(pos, move=move)
+        self.persist(pos)  # what is about to happen is saved BEFORE the request
+        params = {"symbol": self.client.market(sym)["id"], "side": "SELL", "type": "STOP_LOSS",
+                  "quantity": self.ex.amount_to_precision(sym, qty), "stopPrice": self.ex.price_to_precision(sym, level),
+                  "cancelReplaceMode": "STOP_ON_FAILURE", "cancelOrderId": move["from"], "newClientOrderId": move["cid"]}
+        try:
+            resp = self.ex.privatePostOrderCancelReplace(params)
+        except ccxt.BadResponse as exc:  # -2021 / -2022: one half or both failed - the body says which
+            self._replace_failed(pos, _error_body(exc, self.ex), now_ms)
+            return
+        except ccxt.NetworkError as exc:  # the answer was lost: the exchange is asked what happened
+            log.error("moving the stop of %s: %s - resolving it by order ids", sym, exc)
+            self._resolve_move(pos, now_ms)
+            return
+        except ccxt.BaseError as exc:  # refused as a whole (a filter): the old order should stand - checked
+            log.warning("moving the stop of %s to %s refused: %s", sym, level, exc)
+            old = self._fetch(move["from"], sym, stop=True)
+            if old.get("status") == "open":
+                self._set_protection(pos, move=None)
+                self.persist(pos)
+            else:
+                self._resolve_move(pos, now_ms)
+            return
+        new_id = str(((resp or {}).get("newOrderResponse") or {}).get("orderId"))
+        self._adopt_stop(pos, new_id, now_ms)
+
+    def _old_legs_final(self, pos: Position, move: dict) -> list[dict]:
+        """The orders a move replaced, read back and recorded (any fill they made counts)."""
+        out = []
+        for oid, kind in ((move.get("from"), "stop"), (move.get("from_tp"), "tp")):
+            if oid:
+                o = self._fetch(str(oid), pos.symbol, stop=True)
+                if o.get("status") in FINAL:
+                    self._apply(pos, o, kind)
+                out.append(o)
+        return out
+
+    def _adopt_stop(self, pos: Position, new_id: str, now_ms: int) -> None:
+        """The replacing stop exists: check it on the exchange and make it the position's protection."""
+        sym = pos.symbol
+        move = self._protection(pos)["move"]
+        qty = self.client.amount_to_precision(sym, pos.open_amount)
+        self._old_legs_final(pos, move)
+        state, detail = self._verify_stop({"id": new_id}, sym, move["level"], qty)
+        if state == "ok":
+            pos.sl_order_id, pos.sl_client_id = new_id, move["cid"]
+            self._set_protection(pos, stop=move["level"], moved=True, move=None, tp_order_id=None, tp_client_id=None,
+                                 list_id=None, list_client_id=None)
+            self.persist(pos)
+            log.info("moved the exchange stop of %s to %s (order %s)", sym, move["level"], new_id)
+            return
+        if state == "executed":  # it triggered at once: the bot sells whatever it left
+            self._apply(pos, detail, "stop")
+            self._set_protection(pos, stop=move["level"], moved=True)
+            reason = self._stop_exit_reason(pos)
+            self._clear_protection(pos)
+            if self._is_dust(sym, pos.open_amount, move["level"]):
+                finalize_close(pos, pos.exit_value / pos.exit_filled, 0.0, reason, now_ms)
+            else:
+                pos.closing_reason = reason
+            self.persist(pos)
+            return
+        self._cancel(new_id, sym, stop=True)
+        self._apply(pos, self._fetch(new_id, sym, stop=True), "stop")
+        self._unprotected_after_move(pos, move, f"the replacing stop is not protective ({detail})", now_ms)
+
+    def _unprotected_after_move(self, pos: Position, move: dict, why: str, now_ms: int) -> None:
+        """The old protection is gone and no new stop stands: put one in place at once, or sell."""
+        self._set_protection(pos, stop=move["level"], moved=True)
+        self._clear_protection(pos)
+        log.error("%s: %s - placing a stop again", pos.symbol, why)
+        try:
+            self.protect(pos, now_ms)
+        except ProtectionError as exc:
+            pos.closing_reason = "no_protection"
+            log.error("%s: no stop could be placed (%s) - selling", pos.symbol, exc)
+        self.persist(pos)
+
+    def _replace_failed(self, pos: Position, body: dict, now_ms: int) -> None:
+        data = body.get("data") or {}
+        move = self._protection(pos)["move"]
+        if data.get("cancelResult") != "SUCCESS":  # the old order was no longer open: it executed or vanished
+            self._set_protection(pos, move=None)  # sync reads what happened to it
+            self.persist(pos)
+            return
+        legs = self._old_legs_final(pos, move)  # cancelled: the position has no stop now
+        if any(float(o.get("filled") or 0.0) > 0 for o in legs):
+            self._set_protection(pos, move=None)
+            self.persist(pos)
+            return
+        msg = str(((data.get("newOrderResponse") or {}).get("msg")) or "")
+        if "trigger immediately" in msg.lower():  # the market is already through the new level: the stop is hit
+            self._set_protection(pos, stop=move["level"], moved=True)
+            pos.closing_reason = self._stop_exit_reason(pos)
+            self._clear_protection(pos)
+            self.persist(pos)
+            log.warning("%s: price is through the new stop %s - selling", pos.symbol, move["level"])
+            return
+        self._unprotected_after_move(pos, move, f"new stop refused after the cancel ({msg})", now_ms)
+
+    def _resolve_move(self, pos: Position, now_ms: int) -> None:
+        """A move whose outcome is unknown: the new stop is looked up by its client id (it exists,
+        or - once the exchange's recvWindow has passed - it was never placed) and the old order is
+        read back. Raises while the exchange can't be asked; retried on the next check."""
+        sym = pos.symbol
+        move = self._protection(pos)["move"]
+        new = self._lookup(sym, move["cid"], move["sent_ms"], stop=True)
+        if new is not None:
+            self._adopt_stop(pos, str(new["id"]), now_ms)
+            return
+        old = self._fetch(move["from"], sym, stop=True)
+        if old.get("status") == "open":  # nothing happened: the next check moves it again
+            self._set_protection(pos, move=None)
+            self.persist(pos)
+            return
+        legs = self._old_legs_final(pos, move)
+        if any(float(o.get("filled") or 0.0) > 0 for o in legs):  # it executed meanwhile: sync records it
+            self._set_protection(pos, move=None)
+            self.persist(pos)
+            return
+        self._unprotected_after_move(pos, move, "the old protection was cancelled and no new stop was placed", now_ms)
 
     # ---------------------------------------------------------------- exit
     def _resolve_exit_order(self, pos: Position) -> None:
@@ -344,38 +662,60 @@ class LiveBroker(Broker):
         self.persist(pos)
 
     def _release_stop(self, pos: Position) -> None:
-        """Cancel our exchange stop (known or only sent) and record whatever it sold."""
+        """Cancel the position's exchange protection - the single stop or the OCO pair (one leg
+        cancels both) - known or only sent, and record whatever it sold."""
         sym = pos.symbol
+        prot = self._protection(pos)
+        if prot.get("move"):  # a move in flight: know which order protects before cancelling anything
+            self._resolve_move(pos, self.clock())
+            prot = self._protection(pos)
         if not pos.sl_order_id and pos.sl_client_id:  # sent, outcome never confirmed
             found = self._lookup(sym, pos.sl_client_id, pos.sl_sent_ms, stop=True)
             if found is None:
-                pos.sl_client_id = None
+                self._clear_protection(pos)
                 self.persist(pos)
                 return
             pos.sl_order_id = str(found["id"])
+            if prot.get("tp_client_id") and not prot.get("tp_order_id"):
+                tp = self._lookup(sym, prot["tp_client_id"], pos.sl_sent_ms, stop=True)
+                if tp is not None:
+                    self._set_protection(pos, tp_order_id=str(tp["id"]))
         if not pos.sl_order_id:
             return
-        oid = pos.sl_order_id
+        oid, tp_id = pos.sl_order_id, self._protection(pos).get("tp_order_id")
         self._cancel(oid, sym, stop=True)
-        try:
-            final = self._fetch(oid, sym, stop=True)
-        except ccxt.BaseError as exc:
-            raise ExecutionError(f"could not confirm stop {oid} for {sym} is cancelled ({exc}); not selling") from exc
-        if final.get("status") not in FINAL:
-            raise ExecutionError(f"stop {oid} for {sym} is still {final.get('status')}; not selling")
-        self._apply(pos, final, "stop")
-        pos.sl_order_id = pos.sl_client_id = None
+        legs = []
+        for leg_id, kind in ((oid, "stop"), (tp_id, "tp")):
+            if not leg_id:
+                continue
+            try:
+                final = self._fetch(str(leg_id), sym, stop=True)
+            except ccxt.BaseError as exc:
+                raise ExecutionError(f"could not confirm order {leg_id} for {sym} is cancelled ({exc}); not selling") from exc
+            if final.get("status") not in FINAL:
+                raise ExecutionError(f"order {leg_id} for {sym} is still {final.get('status')}; not selling")
+            legs.append((final, kind))
+        for final, kind in legs:
+            self._apply(pos, final, kind)
+        self._clear_protection(pos)
         self.persist(pos)
 
     def close_position(self, pos: Position, price: float, reason: str, now_ms: int) -> Position:
         sym = pos.symbol
         pos.closing_reason = reason
         self._resolve_exit_order(pos)
-        had_stop_fill = any(f["kind"] == "stop" and f["filled"] > 0 for f in pos.fills.values())
+
+        def executed(kind):
+            return any(f["kind"] == kind and f["filled"] > 0 for f in pos.fills.values())
+
+        before = {k: executed(k) for k in ("stop", "tp")}
+        stop_reason = self._stop_exit_reason(pos)  # before the release clears what the stop's level was
         self._release_stop(pos)
-        stopped = not had_stop_fill and any(f["kind"] == "stop" and f["filled"] > 0 for f in pos.fills.values())
-        if stopped and self._is_dust(sym, pos.open_amount, price):
-            reason = "stop_loss"  # the exchange stop got there first and sold everything
+        if self._is_dust(sym, pos.open_amount, price):  # the exchange got there first and sold everything
+            if executed("tp") and not before["tp"]:
+                reason = "take_profit"
+            elif executed("stop") and not before["stop"]:
+                reason = stop_reason
         if not self._is_dust(sym, pos.open_amount, price):
             self._sell(pos, price)
         if not self._is_dust(sym, pos.open_amount, price):
@@ -385,7 +725,7 @@ class LiveBroker(Broker):
 
     def _sell(self, pos: Position, price: float) -> None:
         sym, base = pos.symbol, self._base(pos.symbol)
-        held = self._held(base, "free")
+        held = self._satellite_coins(base, self._balance().get("free") or {})  # never the core's coins
         qty = self.client.amount_to_precision(sym, min(pos.open_amount, held))
         if self._is_dust(sym, qty, price):
             raise ExecutionError(
@@ -418,38 +758,82 @@ class LiveBroker(Broker):
             return [SyncIssue(live[0], "error", f"balance unavailable: {exc}")]
         for pos in live:
             sym, base = pos.symbol, self._base(pos.symbol)
-            held = float(totals.get(base) or 0.0)
+            held = self._satellite_coins(base, totals)
+            prot = self._protection(pos)
+            if prot.get("move"):  # a stop move whose answer was lost: sync_stop settles it first
+                continue
             if pos.sl_order_id and not pos.closing_reason:
                 try:
                     o = self._fetch(pos.sl_order_id, sym, stop=True)
+                    t = self._fetch(prot["tp_order_id"], sym, stop=True) if prot.get("tp_order_id") else None
                 except ccxt.BaseError as exc:
                     issues.append(SyncIssue(pos, "error", f"could not check the exchange stop: {exc}"))
                     continue
-                filled, status = float(o.get("filled") or 0.0), o.get("status")
-                if filled > 0 and status in FINAL:
+                # an OCO: the leg that executed expires the other, so the take-profit is read first
+                done = next(((leg, kind) for leg, kind in ((t, "tp"), (o, "stop"))
+                             if leg is not None and float(leg.get("filled") or 0.0) > 0 and leg.get("status") in FINAL),
+                            None)
+                if done is not None:
+                    leg, kind = done
+                    filled = float(leg.get("filled") or 0.0)
                     left = pos.open_amount - filled
                     if held > left + max(0.02 * pos.open_amount, 1e-12):  # order says sold, coins say not
-                        issues.append(SyncIssue(pos, "error", f"stop {pos.sl_order_id} reports {filled:g} sold "
+                        issues.append(SyncIssue(pos, "error", f"order {leg.get('id')} reports {filled:g} sold "
                                                                f"but the account still holds {held:g} {base}"))
                         continue
-                    self._apply(pos, o, "stop")
-                    pos.sl_order_id = pos.sl_client_id = None
-                    if self._is_dust(sym, pos.open_amount, pos.initial_stop):
-                        finalize_close(pos, pos.exit_value / pos.exit_filled, 0.0, "stop_loss", now_ms)
+                    reason = "take_profit" if kind == "tp" else self._stop_exit_reason(pos)
+                    self._apply(pos, leg, kind)
+                    self._clear_protection(pos)
+                    if self._is_dust(sym, pos.open_amount, pos.stop_loss):
+                        finalize_close(pos, pos.exit_value / pos.exit_filled, 0.0, reason, now_ms)
                     else:
-                        pos.closing_reason = "stop_loss"  # sell what the stop left
+                        pos.closing_reason = reason  # sell what the exchange order left
                     continue
-                if status in FINAL:  # cancelled/expired/rejected without filling
-                    pos.sl_order_id = pos.sl_client_id = None
+                if o.get("status") in FINAL and (t is None or t.get("status") in FINAL):  # gone, nothing sold
+                    status = o.get("status")
+                    self._clear_protection(pos)
                     try:
                         self.protect(pos, now_ms)
                     except ProtectionError as exc:
                         issues.append(SyncIssue(pos, "unprotected", f"exchange stop was {status} and could not be replaced: {exc}"))
                     continue
-                held += filled  # a stop-limit partly filled and still working is ours
+                held += float(o.get("filled") or 0.0)  # a stop-limit partly filled and still working is ours
             if held < pos.open_amount * 0.98:
                 issues.append(SyncIssue(pos, "mismatch", f"account holds {held:g} {base} but the bot expects {pos.open_amount:g}"))
         return issues
+
+    # ---------------------------------------------------------- core orders
+    def core_order(self, symbol: str, side: str, qty: float, client_id: str, sent_ms: int) -> dict | None:
+        """A core sleeve market order (its client id saved by the caller before this is called),
+        driven to a final state. None: it was definitely never placed or was rejected.
+        Raises ExecutionError while its outcome is unknown."""
+        try:
+            order = self.ex.create_order(symbol, "market", side, qty, None, {"clientOrderId": client_id})
+        except ccxt.NetworkError as exc:
+            log.error("core %s %s: %s - looking it up by client id", side, symbol, exc)
+            return self.core_lookup(symbol, client_id, sent_ms)
+        except ccxt.BaseError as exc:
+            log.warning("core %s %s %g rejected: %s", side, symbol, qty, exc)
+            return None
+        return self._settle(order, symbol)
+
+    def core_lookup(self, symbol: str, client_id: str, sent_ms: int) -> dict | None:
+        """The core order with this client id, settled; None if the exchange never received it."""
+        try:
+            order = self._lookup(symbol, client_id, sent_ms)
+        except ccxt.BaseError as exc:
+            raise ExecutionError(f"core order {client_id} on {symbol}: outcome unknown ({exc})") from exc
+        return None if order is None else self._settle(order, symbol)
+
+    def core_fill(self, symbol: str, order: dict) -> dict:
+        """What a settled order filled: quantity, average price, the fee taken in the coin, and
+        all fees valued in quote."""
+        filled = float(order.get("filled") or 0.0)
+        avg = float(order.get("average") or 0.0) or (float(order.get("cost") or 0.0) / filled if filled else 0.0)
+        if filled > 0 and avg <= 0:
+            raise ExecutionError(f"core order {order.get('id')} filled {filled} but reports no price")
+        base_fee, fee = self._fees(order, self._base(symbol), avg)
+        return {"filled": filled, "avg": avg, "base_fee": base_fee, "fee": fee}
 
     def cancel_orphans(self, symbols: set[str], known_ids: set[str]) -> list[str]:
         """Cancel open orders the bot created (client id prefix) that no position owns."""

@@ -91,7 +91,8 @@ def test_go_live_needs_every_protective_exit_on_the_exchange(monkeypatch):
     from tradebot.report import exchange_protection_check
 
     check = exchange_protection_check()
-    assert not check.passed and "breakeven stop, trailing stop, take profit" in check.detail
+    assert not check.passed and "exchange orders: stop loss, breakeven stop, trailing stop" in check.detail
+    assert "take profit: on the exchange with the stop (an OCO pair) until the stop first moves" in check.detail
     monkeypatch.setattr(live, "EXCHANGE_SIDE_EXITS",
                         frozenset({"stop_loss", "breakeven_stop", "trailing_stop", "take_profit"}))
     assert exchange_protection_check().passed

@@ -54,6 +54,10 @@ class Broker(ABC):
     def move_stop(self, pos: Position, new_stop: float) -> None:
         pos.stop_loss = new_stop
 
+    def sync_stop(self, pos: Position, now_ms: int) -> None:
+        """Bring an exchange-side stop up to ``pos.stop_loss`` (paper: nothing to do). May set
+        ``pos.closing_reason`` when the position must be sold now."""
+
     def sync(self, positions: list[Position], now_ms: int) -> list[SyncIssue]:
         """Reconcile with the exchange: record stops that filled (closing those
         positions in place) and report anything that needs attention."""

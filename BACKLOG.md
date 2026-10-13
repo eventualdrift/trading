@@ -11,6 +11,14 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Open
 
+- [ ] **The take-profit rule in the backtest** (fidelity, found reading the code 2026-10-13; no paper
+  trade has reached its target yet). Paper takes profit as soon as the polled price touches the target
+  (`bot._check_position`, every 30 s); the backtest only when a candle of the strategy's timeframe closes
+  at or above it (`engine.simulate_trade`), so a 4h or daily wick through the target is an exit in paper
+  and not in the backtest. On the exchange the take-profit trigger is the touch rule too.
+  - Done when: the backtest models the touch rule (with the same-candle order of stop and target stated),
+    a test shows a wick through the target exits, the frozen reference rerun and ledger notes follow, and
+    the same-trades check stays identical (live is unchanged).
 - [ ] **The `ml` protocol** (CLAUDE.md template, family `ml`): decides whether the ML filter comes
   back, on untouched data - at least 100 satellite trades after the reference's data end
   (2026-09-27), so not before the paper reserve has them. The replay models the filter
@@ -40,21 +48,26 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Go-live (stop and ask: the owner decides each)
 
-- [ ] **Every protective exit on the exchange.** Breakeven, trailing and take-profit stops are
-  bot-managed, so they don't fire while the bot is down.
-  - The real case: PUMP momentum@4h's trailing stop was hit at 09-27 16:00 while the Mac was asleep
-    (15:28-16:53). Paper sold on waking, 385 bps lower, and +0.27R became -0.12R.
-  - Done when: live keeps each one as an exchange order, moved without a window in which the
-    position is unprotected, verified on the testnet; the `tradebot report` check "every
-    protective exit rests on the exchange" passes.
+- [ ] **Every protective exit on the exchange.** Built for the testnet path (2026-10-13, see STATUS.md):
+  at entry an OCO pair on the exchange - a take-profit trigger and the stop-loss; breakeven and trailing
+  move the exchange stop in one cancel-replace request (no gap between requests; a move through the price
+  sells at once, a refused one puts a stop back at once, a lost answer is resolved by client id, a crash
+  mid-move is settled at start-up). The take-profit leaves the exchange at the first move: Binance spot
+  can't keep it across a move without about 0.4 s with no stop (your call, under Needs the owner).
+  - Done when: `tradebot testnet verify` passes on the testnet (waits for the testnet keys), and the
+    owner accepts the take-profit trade-off (the readiness check reports it until then).
+- [ ] **Core sleeve live order path.** Built for the testnet path (2026-10-13): market orders with a
+  client id saved before sending, the ledger from the fills, a lost answer resolved by client id; the
+  core's cash and coins kept out of the satellite's equity, free cash and coin checks. `mode: live` is
+  refused in code (`config.LIVE_TRADING`).
+  - Done when: `tradebot testnet verify` passes its core step on the testnet.
 - [ ] **The ML filter**: off in code since 2026-10-10. It comes back only through a2 and a passed
   `ml` protocol; until then paper and the backtest take the same signals at the same size.
-- [ ] **Core sleeve live order path** - the core is paper-only today.
-  - Done when: built, reviewed, testnet-verified, and live mode no longer refuses it.
 - [ ] **The core/satellite split before live.** The restated finding (STATUS.md, 2026-10-07): no
   measurable effect of the satellite either way. The case for a larger core is simplicity and the
   same-regime structure, not a measured cost.
-- [ ] **Testnet run** with the final settings, before any real money.
+- [ ] **Testnet run** with the final settings, before any real money: `mode: testnet` exists (its own
+  config and state, the paper bot's strategies); running an instance for a few weeks is the owner's call.
 - [ ] **Paper track record** - the readiness checks in `tradebot report` pass.
 
 ## Needs the owner
@@ -62,6 +75,11 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 - [ ] **Push credentials for the box** (DEPLOY.md step 3): `~/tradebot-agent` has an https remote and
   no credentials (2026-10-13: `gh` installed, not logged in as tradebot), so nothing pushes from the
   box: not the sessions' commits, not Monday's STATUS.md. GitHub is at a6e31ae; the box is ahead.
+- [ ] **Testnet keys** (testnet money only; DEPLOY.md step 10): `TESTNET_API_KEY` and `TESTNET_API_SECRET`
+  from testnet.binance.vision in `~/tradebot-agent/.env`, so `tradebot testnet verify` can run.
+- [ ] **The take-profit across stop moves** (a trade-off only the owner can make): keep the stop gap-free
+  and the take-profit off the exchange after the first move (built), or keep the take-profit on the
+  exchange and accept about 0.4 s with no stop on every move (not built).
 - [ ] **The drawdown halt's resume** (an assumption to confirm): live halts new entries at 15% below
   the satellite's peak until the owner sends /resume (which restarts the peak). The replay assumes
   the resume at the next daily close. Say if a halt would stay longer in practice; the replay

@@ -153,7 +153,26 @@ it runs. Each deploy is appended to `state/deploys.jsonl`. Docker sends SIGTERM:
 its tick and records a clean stop; the new container records the start. Never `git pull` or
 edit files in `~/tradebot` by hand: the gate refuses a bot checkout with local changes.
 
-## 10. After the move
+## 10. The testnet (go-live items, testnet money only)
+
+The go-live order paths are built and run on Binance's Spot testnet; `mode: live` stays refused.
+Make the testnet keys once (on the box, as tradebot):
+
+1. Open https://testnet.binance.vision, log in with GitHub, *Generate HMAC_SHA256 Key*.
+2. Add them to the agent's `.env` (never the bot's, never real keys):
+
+```
+cat >> ~/tradebot-agent/.env <<'KEYS'
+TESTNET_API_KEY=<the testnet key>
+TESTNET_API_SECRET=<the testnet secret>
+KEYS
+chmod 600 ~/tradebot-agent/.env
+```
+
+3. The agent runs `tradebot --config config-agent.yaml testnet verify` (about 15 minutes) and
+   records the result in `state/testnet/` and STATUS.md.
+
+## 11. After the move
 
 - `docker compose ps` shows the container up. A day later the agent's
   `reconcile --since "<move time>"` shows the Mac's stop, the box's start, and uptime near 100%.

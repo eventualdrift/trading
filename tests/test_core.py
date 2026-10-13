@@ -92,13 +92,19 @@ def test_status_shows_sleeves(core_bot):
     assert "Core:" in text and "Satellite:" in text and "Total equity" in text
 
 
-def test_core_is_paper_only(tmp_path, monkeypatch):
+def test_the_core_runs_on_the_testnet_and_live_is_refused(tmp_path, monkeypatch):
     from tradebot.config import load_config
 
     monkeypatch.delenv("TRADEBOT_MODE", raising=False)
     p = tmp_path / "c.yaml"
     p.write_text("mode: live\ncore:\n  fraction: 0.65\n")
-    with pytest.raises(ValueError, match="paper-only"):
+    with pytest.raises(ValueError, match="go-live is the owner's decision"):
+        load_config(p, env_file=None)
+    p.write_text("mode: testnet\nexchange:\n  sandbox: true\ncore:\n  fraction: 0.65\n")
+    cfg = load_config(p, env_file=None)
+    assert cfg.mode == "testnet" and cfg.on_exchange and cfg.core.fraction == 0.65
+    p.write_text("mode: testnet\ncore:\n  fraction: 0.65\n")  # the real exchange: no
+    with pytest.raises(ValueError, match="sandbox: true"):
         load_config(p, env_file=None)
 
 

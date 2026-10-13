@@ -15,7 +15,7 @@ from .timeframes import TF_SECONDS
 class ExchangeConfig:
     id: str = "binance"
     market_type: str = "spot"  # spot only for live trading in this version
-    sandbox: bool = False  # use the exchange testnet (supported by binance, bybit, okx, ...)
+    sandbox: bool = False  # use the exchange testnet; mode: testnet requires it, mode: live forbids it
     quote: str = "USDT"
     data_exchange_id: str | None = None  # optionally pull market data from a different exchange
 
@@ -66,7 +66,7 @@ class RiskConfig:
 
 @dataclass
 class CoreConfig:
-    fraction: float = 0.0  # share of the account in the core sleeve (0 = off, e.g. 0.65); paper only
+    fraction: float = 0.0  # share of the account in the core sleeve (0 = off, e.g. 0.65)
     symbols: list[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])  # equal slots
     sma_days: list[int] = field(default_factory=lambda: [50, 100, 150, 200])
     min_trade_usd: float = 10.0
@@ -108,6 +108,12 @@ class SelectionConfig:
 # (BACKLOG a2) and a registered test that passed sets this to True.
 ML_IN_REPLAY = False
 
+# Go-live is the owner's decision (CLAUDE.md). ``mode: live`` - real money on the real exchange -
+# is refused whatever the config, the paper checklist or --force-live say, until the owner sets this
+# to True. ``mode: testnet`` runs the same live order path against the exchange's testnet only.
+LIVE_TRADING = False
+TESTNET_HOSTS = {"binance": "testnet.binance.vision"}  # the testnet API host per supported venue
+
 
 @dataclass
 class MLConfig:
@@ -145,6 +151,8 @@ class PaperConfig:
 class LiveConfig:
     native_stop_loss: bool = True  # keep a stop-loss order on the exchange (protects if the bot is down)
     require_exchange_stop: bool = True  # sell at once if that stop can't be placed and verified
+    # the take-profit on the exchange with the stop (an OCO pair) until the stop first moves
+    take_profit_order: bool = True
     fill_timeout_seconds: float = 30  # cancel any unfilled part of a market order after this
 
 
@@ -168,6 +176,9 @@ class Secrets:
     api_key: str | None = None
     api_secret: str | None = None
     api_password: str | None = None
+    # testnet keys only (testnet.binance.vision): mode: testnet never reads the real ones above
+    testnet_api_key: str | None = None
+    testnet_api_secret: str | None = None
     telegram_token: str | None = None
     telegram_chat_id: str | None = None
 
@@ -177,6 +188,8 @@ class Secrets:
             api_key=os.getenv("EXCHANGE_API_KEY") or None,
             api_secret=os.getenv("EXCHANGE_API_SECRET") or None,
             api_password=os.getenv("EXCHANGE_API_PASSWORD") or None,
+            testnet_api_key=os.getenv("TESTNET_API_KEY") or None,
+            testnet_api_secret=os.getenv("TESTNET_API_SECRET") or None,
             telegram_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
         )
@@ -185,7 +198,7 @@ class Secrets:
 @dataclass
 class BotConfig:
     name: str = ""  # instance label for messages and the dashboard (side-by-side paper configs)
-    mode: str = "paper"  # paper | live
+    mode: str = "paper"  # paper | testnet (the live order path on the exchange testnet) | live (refused)
     timeframes: list[str] = field(default_factory=lambda: ["15m", "1h", "4h", "1d"])
     strategies: dict[str, dict] = field(
         default_factory=lambda: {"trend": {}, "breakout": {}, "meanrev": {}, "momentum": {}}
@@ -213,6 +226,11 @@ class BotConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     secrets: Secrets = field(default_factory=Secrets, repr=False)
+
+    @property
+    def on_exchange(self) -> bool:
+        """Orders go to an exchange (its testnet or the real one), not to the paper broker."""
+        return self.mode in ("testnet", "live")
 
     @property
     def state_path(self) -> Path:
@@ -257,8 +275,17 @@ class BotConfig:
         from .strategies import STRATEGIES
 
         errors = []
-        if self.mode not in ("paper", "live"):
-            errors.append(f"mode must be 'paper' or 'live', got {self.mode!r}")
+        if self.mode not in ("paper", "testnet", "live"):
+            errors.append(f"mode must be 'paper', 'testnet' or 'live', got {self.mode!r}")
+        if self.mode == "live" and not LIVE_TRADING:
+            errors.append("mode: live is refused: go-live is the owner's decision (config.LIVE_TRADING). "
+                          "Use mode: paper, or mode: testnet with exchange.sandbox: true")
+        if self.mode == "testnet" and not self.exchange.sandbox:
+            errors.append("mode: testnet needs exchange.sandbox: true (orders go to the exchange's testnet only)")
+        if self.mode == "testnet" and self.exchange.id not in TESTNET_HOSTS:
+            errors.append(f"mode: testnet supports {', '.join(sorted(TESTNET_HOSTS))} only (got {self.exchange.id!r})")
+        if self.mode == "live" and self.exchange.sandbox:
+            errors.append("mode: live with exchange.sandbox: true is the testnet - use mode: testnet")
         for tf in self.timeframes:
             if tf not in TF_SECONDS:
                 errors.append(f"unknown timeframe {tf!r}")
@@ -274,7 +301,7 @@ class BotConfig:
             errors.append("risk.max_open_positions must be >= 1")
         if r.max_open_risk_pct is not None and not r.risk_per_trade_pct <= r.max_open_risk_pct <= 20:
             errors.append("risk.max_open_risk_pct must be between risk.risk_per_trade_pct and 20 (or null)")
-        if r.max_open_risk_pct is not None and self.mode == "live":
+        if r.max_open_risk_pct is not None and self.on_exchange:
             # live keeps the exchange stop at the original level as a safety net, so a "protected"
             # trade can still lose its full risk if the bot is offline
             errors.append("risk.max_open_risk_pct is paper-only in this version (live exchange stops stay at "
@@ -283,11 +310,11 @@ class BotConfig:
             errors.append("risk.max_position_pct must be in (0, 100]")
         if r.min_reward_risk <= 0:
             errors.append("risk.min_reward_risk must be > 0")
-        if self.mode == "live" and self.allow_short and self.exchange.market_type == "spot":
+        if self.on_exchange and self.allow_short and self.exchange.market_type == "spot":
             errors.append("allow_short cannot be used for live spot trading")
         if self.live.require_exchange_stop and not self.live.native_stop_loss:
             errors.append("live.require_exchange_stop needs live.native_stop_loss: true")
-        if self.mode == "live":
+        if self.on_exchange:
             from .execution.live import VENUES
 
             if self.exchange.id not in VENUES:
@@ -295,13 +322,11 @@ class BotConfig:
                               f"signals and paper trading work with any exchange")
         if not 0.0 <= self.core.fraction < 1.0:
             errors.append("core.fraction must be in [0, 1)")
-        if self.core.fraction > 0 and self.mode == "live":
-            errors.append("the core sleeve (core.fraction > 0) is paper-only in this version")
         if self.core.fraction > 0 and (not self.core.symbols or not self.core.sma_days):
             errors.append("core.symbols and core.sma_days must not be empty")
         if self.costs.entry_order not in ("market", "limit"):
             errors.append("costs.entry_order must be 'market' or 'limit'")
-        if self.mode == "live" and self.costs.entry_order == "limit":
+        if self.on_exchange and self.costs.entry_order == "limit":
             errors.append("costs.entry_order: limit is paper-only in this version (live uses market entries)")
         if self.selection.btc_filter not in ("off", "auto"):
             errors.append("selection.btc_filter must be 'off' or 'auto'")

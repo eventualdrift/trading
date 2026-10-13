@@ -190,7 +190,7 @@ section then shows:
   the time, so coins that collapsed or were delisted are missing and the satellite's results
   are flattered.
 
-The core sleeve is **paper-only** in this version: `mode: live` refuses `core.fraction > 0`.
+On an exchange (`mode: testnet`) the core trades with market orders; `mode: live` is refused.
 
 ## Quick start
 
@@ -386,38 +386,53 @@ tradebot reconcile [--since "2026-10-01"] [--end "2026-12-31 00:00"] [--csv reco
 
 Reporting only: nothing changes what the bot trades.
 
-### 6. Go live (only when ready)
+### 6. The testnet, then go live (the owner's decision)
 
-Live trading is supported on **Binance spot** only. Signals and paper trading work with any
-ccxt exchange, but automatic trading needs exchange-specific handling of stop orders, order
-lookups and fills that must be verified on a testnet first. OKX's trigger orders and Bybit's
-account modes, for example, behave differently. Other exchanges are refused until they get
-that treatment.
+Live trading is supported on **Binance spot** only, and `mode: live` is refused in this version
+whatever the config says (`config.LIVE_TRADING = False`): going live is the owner's decision.
+The same live order path runs on Binance's **Spot testnet** with testnet money:
 
-1. Use a **dedicated account or sub-account** for the bot, and don't hold or trade the same
-   coins there by hand - the bot reconciles positions against the account balance.
-2. Create an API key with **trade permission only**, **withdrawals disabled**, and
-   **IP-whitelisted** to your server. Put it in `.env`.
-3. Run on the exchange **testnet** first (`exchange.sandbox: true`) and watch a few full
-   trades: entry, stop order visible on the exchange, exit.
-4. Set `mode: live`, fund the account with a small amount and `tradebot run`.
-   The bot refuses to start live if the paper checklist fails (`--force-live` overrides; don't).
+- `mode: testnet` with `exchange.sandbox: true` runs the bot against `testnet.binance.vision`.
+  It reads `TESTNET_API_KEY` / `TESTNET_API_SECRET` from `.env` (keys made on the testnet site:
+  log in with GitHub, *Generate HMAC_SHA256 Key*) and never the real ones, and it refuses any
+  client whose API URLs aren't the testnet's. Use its own config (`extends:` the paper one, its
+  own `state_dir`, `learning.follow_state_dir` pointing at the paper bot) so it trades the same
+  strategies without learning twice.
+- `tradebot testnet verify` runs each go-live mechanism on the testnet once and checks it there
+  (exits on the exchange, stop moves, a move through the price, a lost answer, the core's orders);
+  the record goes to `state/testnet/`. The testnet is wiped about once a month.
 
-How live orders are handled:
+When the owner decides to go live: a **dedicated account or sub-account** (don't hold or trade
+the same coins there by hand), an API key with **trade permission only**, **withdrawals
+disabled** and **IP-whitelisted**, a small amount, and the paper checklist passing.
+
+How orders are handled on the exchange (testnet and live):
 - Every order gets a client ID that's saved to the database *before* the order is sent. If
   the response is lost (e.g. a network timeout), the bot looks the order up by that ID once
   Binance's 10-second request window has passed. It never guesses from balance changes. If it
   still can't tell, it halts new entries, keeps checking, and `/resume` is refused until resolved.
-- After each buy it places a stop-loss **on the exchange**, reads it back and checks it's a real,
-  open stop at the right price. If that fails, the position is sold immediately
-  (`live.require_exchange_stop`). So your downside stays protected even if the bot goes offline.
-- To exit, it cancels the exchange stop, reads its final state and sells only what's still held,
-  so a stop that fills at the same moment never causes a second sale. A sell whose outcome is
-  unclear is resolved before any new sell. Partial fills are tracked per order and the rest retried.
-- If a required stop can't be placed and verified, the position is sold and new entries halt.
-- At start-up and hourly it cancels stray bot orders that no position owns.
-- Take-profit, breakeven and time exits are market orders the bot sends at the current price.
-  The exchange stop stays at the original level as a safety net.
+- After each buy it puts the exits **on the exchange** and reads them back: until the stop first
+  moves, an **OCO pair** - a take-profit trigger at the target and a stop-loss at the stop on the
+  same coins, whichever fires first expires the other. If the pair is refused it places a single
+  stop; if no stop can be placed and verified, the position is sold and new entries halt
+  (`live.require_exchange_stop`).
+- **Breakeven and trailing** move the exchange stop in **one cancel-replace request**: Binance
+  cancels the protection and places the new stop straight after, so no moment passes between two
+  requests with no stop. Small trailing steps (under 0.1R) wait for a bigger one; while the bot
+  runs it enforces its own level. If the price is already through the new level, the position is
+  sold at once; if the new stop is refused for another reason, a stop is put back at once.
+- The **take-profit leaves the exchange at the first stop move**: spot coins can carry one sell
+  order, and an OCO can't be replaced by an OCO in one request, so keeping it would mean a gap of
+  a round trip (about 0.4 s from the box) with no stop on every move. From then on the bot takes
+  profit at the target while it runs (`live.take_profit_order: false` keeps it off the exchange
+  from the start).
+- To exit, it cancels the exchange orders, reads their final state and sells only what's still
+  held, so an exchange exit that fills at the same moment never causes a second sale.
+- At start-up it settles a stop move that a crash interrupted, and at start-up and hourly it
+  cancels stray bot orders that no position owns.
+- With a core sleeve, the core's buys and sells are market orders with the same client-ID rules;
+  its cash and coins are kept out of the satellite's equity, free cash and coin checks.
+- Time stops and exit signals are market orders the bot sends at the current price.
 - If the coins disappear from the account (e.g. sold by hand), the bot halts new entries and
   asks you to check. `/forget <id>` then removes a position from its books without trading.
 

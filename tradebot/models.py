@@ -117,6 +117,10 @@ class Position:
     exit_value: float = 0.0  # quote proceeds of those sales
     closing_reason: str | None = None  # a close was started but not completed; retried
     fills: dict = field(default_factory=dict, repr=False)  # live: order id -> recorded fill
+    # live/testnet: the exchange orders protecting the position beyond sl_order_id (the take-profit leg
+    # and order list of an OCO pair), the stop's level on the exchange, whether it has moved, and a move
+    # in flight (saved before it is sent). Paper: empty.
+    protection: dict = field(default_factory=dict, repr=False)
     features: dict = field(default_factory=dict, repr=False)
     id: int | None = None
 

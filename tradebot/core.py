@@ -1,4 +1,4 @@
-"""The core sleeve: a long-only BTC+ETH trend-ensemble allocation (paper only for now).
+"""The core sleeve: a long-only BTC+ETH trend-ensemble allocation.
 
 Each coin gets an equal slot of the core sleeve's equity. At every daily close its
 weight is the share of its 50/100/150/200-day averages that the close is above -
@@ -9,6 +9,13 @@ than every day. Fills pay the taker fee plus slippage, like any market order.
 
 The sleeve has its own cash and holdings, so its P&L is tracked separately from the
 signal strategies ("satellite"), and it compounds on its own equity.
+
+On an exchange (``mode: testnet``; live is refused) each trade is a real market order through
+the live broker (``executor``): its client order id is saved before it is sent, an order whose
+outcome is unclear is resolved by that id before the core trades again, and the ledger records
+what the order actually filled and paid. The sleeve's cash is a reserved part of the account's
+quote balance and its coins sit beside the satellite's; the broker leaves both out of the
+satellite's equity, free cash and coin checks.
 """
 from __future__ import annotations
 
@@ -53,8 +60,11 @@ class CoreTrade:
 
 
 class CoreSleeve:
-    def __init__(self, db, cfg: CoreConfig, costs: Costs, mode: str, market):
+    def __init__(self, db, cfg: CoreConfig, costs: Costs, mode: str, market, executor=None):
+        """``executor``: the live broker that places the core's orders on an exchange; None (paper):
+        fills are simulated at the price plus slippage, with the taker fee."""
         self.db, self.cfg, self.costs, self.mode, self.market = db, cfg, costs, mode, market
+        self.executor = executor
         self.last_closes: dict[str, tuple[int, float]] = {}  # the daily candle each target came from (logged)
 
     # ------------------------------------------------------------- state
@@ -91,6 +101,19 @@ class CoreSleeve:
     def equity(self, prices: dict[str, float]) -> float:
         return self.cash + sum(q * prices.get(s, 0.0) for s, q in self.holdings.items())
 
+    @property
+    def pending(self) -> dict | None:
+        """An exchange order sent (or about to be) whose fill is not recorded yet."""
+        return self._get("pending") or None
+
+    def reserved(self) -> tuple[float, dict[str, float]]:
+        """(the core's cash, its coins by base currency): what the satellite must leave alone."""
+        coins: dict[str, float] = {}
+        for sym, q in self.holdings.items():
+            base = sym.split("/")[0]
+            coins[base] = coins.get(base, 0.0) + q
+        return (self.cash if self.initialized else 0.0), coins
+
     # --------------------------------------------------------- capital moves
     def initialize(self, amount: float) -> None:
         self._set("cash", float(amount))
@@ -111,7 +134,9 @@ class CoreSleeve:
             frac = min(short / value * (1 + self.costs.fee_rate + self.costs.slippage_rate), 1.0)
             for s, q in self.holdings.items():
                 if q > 0 and prices.get(s):
-                    trades.append(self._trade(s, "sell", q * frac, prices[s], now_ms, "sleeve rebalance"))
+                    t = self._trade(s, "sell", q * frac, prices[s], now_ms, "sleeve rebalance")
+                    if t is not None:
+                        trades.append(t)
         out = min(amount, self.cash)
         self._set("cash", self.cash - out)
         self._set("contributed", self.contributed - out)
@@ -119,7 +144,9 @@ class CoreSleeve:
 
     # ------------------------------------------------------------- trading
     def _trade(self, symbol: str, side: str, qty: float, price: float, now_ms: int, reason: str,
-               w_from: float = 0.0, w_to: float = 0.0) -> CoreTrade:
+               w_from: float = 0.0, w_to: float = 0.0) -> CoreTrade | None:
+        if self.executor is not None:
+            return self._exchange_trade(symbol, side, qty, now_ms, reason, w_from, w_to)
         prec = getattr(self.market, "amount_to_precision", None)
         if callable(prec):
             qty = prec(symbol, qty)
@@ -137,6 +164,58 @@ class CoreSleeve:
         self._set("holdings", {k: v for k, v in holdings.items() if v > 1e-12})
         t = CoreTrade(symbol, side, qty, fill, fee, w_from, w_to)
         self.db.insert_core_trade(now_ms, self.mode, t, reason)
+        return t
+
+    # ------------------------------------------------------- exchange orders
+    def _exchange_trade(self, symbol: str, side: str, qty: float, now_ms: int, reason: str,
+                        w_from: float, w_to: float) -> CoreTrade | None:
+        """A market order on the exchange; the ledger takes what it filled. None: nothing traded."""
+        from .models import new_client_id
+
+        ex = self.executor
+        self.resolve_pending(now_ms)  # an earlier order's outcome first: never two in doubt
+        if side == "sell":
+            qty = min(qty, self.holdings.get(symbol, 0.0))
+        qty = ex.client.amount_to_precision(symbol, qty)
+        if qty <= 0:
+            return None
+        pending = {"client_id": new_client_id("c"), "symbol": symbol, "side": side, "qty": qty,
+                   "sent_ms": ex.clock(), "reason": reason, "w_from": w_from, "w_to": w_to}
+        self._set("pending", pending)  # saved BEFORE the order is sent
+        order = ex.core_order(symbol, side, qty, pending["client_id"], pending["sent_ms"])
+        return self._record_fill(pending, order, now_ms)
+
+    def resolve_pending(self, now_ms: int) -> CoreTrade | None:
+        """Settle an order sent before a crash or a lost response: by its client id, which the
+        exchange either knows (record what it filled) or, once its recvWindow has passed, never
+        received (forget it). Raises while the exchange can't tell."""
+        pending = self.pending
+        if pending is None or self.executor is None:
+            return None
+        order = self.executor.core_lookup(pending["symbol"], pending["client_id"], pending["sent_ms"])
+        return self._record_fill(pending, order, now_ms)
+
+    def _record_fill(self, pending: dict, order: dict | None, now_ms: int) -> CoreTrade | None:
+        symbol, side = pending["symbol"], pending["side"]
+        fill = self.executor.core_fill(symbol, order) if order is not None else None
+        if fill is None or fill["filled"] <= 0:
+            self._set("pending", None)
+            return None
+        holdings = self.holdings
+        if side == "buy":  # a fee taken in the coin arrives as fewer coins; any other is a cost in quote
+            got = fill["filled"] - fill["base_fee"]
+            other_fees = fill["fee"] - fill["base_fee"] * fill["avg"]
+            self._set("cash", self.cash - fill["filled"] * fill["avg"] - other_fees)
+            holdings[symbol] = holdings.get(symbol, 0.0) + got
+            qty = got
+        else:
+            self._set("cash", self.cash + fill["filled"] * fill["avg"] - fill["fee"])
+            holdings[symbol] = holdings.get(symbol, 0.0) - fill["filled"]
+            qty = fill["filled"]
+        self._set("holdings", {k: v for k, v in holdings.items() if v > 1e-12})
+        t = CoreTrade(symbol, side, qty, fill["avg"], fill["fee"], pending.get("w_from", 0.0), pending.get("w_to", 0.0))
+        self.db.insert_core_trade(now_ms, self.mode, t, pending.get("reason", ""))
+        self._set("pending", None)
         return t
 
     def target_weights(self, now_ms: int) -> dict[str, float | None]:
@@ -172,12 +251,14 @@ class CoreSleeve:
         trades = []
         for sym, delta, px, w0, w1 in sorted(plans, key=lambda p: p[1]):  # sells first free the cash
             if delta < 0:
-                trades.append(self._trade(sym, "sell", -delta / px, px, now_ms, "trend weights", w0, w1))
+                t = self._trade(sym, "sell", -delta / px, px, now_ms, "trend weights", w0, w1)
             else:
                 budget = self.cash / ((1 + self.costs.fee_rate) * (1 + self.costs.slippage_rate))
                 qty = min(delta, budget) / px
-                if qty * px >= self.cfg.min_trade_usd:
-                    trades.append(self._trade(sym, "buy", qty, px, now_ms, "trend weights", w0, w1))
+                t = (self._trade(sym, "buy", qty, px, now_ms, "trend weights", w0, w1)
+                     if qty * px >= self.cfg.min_trade_usd else None)
+            if t is not None:
+                trades.append(t)
         self._set("weights", {**previous, **{s: w for s, w in weights.items() if w is not None}})
         return trades
 

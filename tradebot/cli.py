@@ -25,15 +25,19 @@ def _market(cfg: BotConfig, synthetic: bool = False, authenticated: bool = False
     from .data import ExchangeClient
 
     s = cfg.secrets
+    testnet = cfg.mode == "testnet"  # testnet keys only: the real ones are never read in this mode
     if authenticated or not cfg.exchange.data_exchange_id:
-        return ExchangeClient(
+        client = ExchangeClient(
             cfg.exchange.id,
-            api_key=s.api_key if authenticated else None,
-            secret=s.api_secret if authenticated else None,
-            password=s.api_password if authenticated else None,
+            api_key=(s.testnet_api_key if testnet else s.api_key) if authenticated else None,
+            secret=(s.testnet_api_secret if testnet else s.api_secret) if authenticated else None,
+            password=None if testnet else (s.api_password if authenticated else None),
             sandbox=cfg.exchange.sandbox,
             market_type=cfg.exchange.market_type,
         )
+        if testnet:
+            client.assert_testnet()
+        return client
     return ExchangeClient(cfg.exchange.data_exchange_id, market_type=cfg.exchange.market_type)
 
 
@@ -157,7 +161,13 @@ def cmd_run(args, cfg):
     if cfg.observe_state_dir:
         sys.exit("This config observes another bot (observe_state_dir): it reports, it never runs a bot.")
     db = Database(cfg.state_path / "tradebot.db")
-    live = cfg.mode == "live"
+    live = cfg.mode == "live"  # refused at config load unless the owner set config.LIVE_TRADING
+    testnet = cfg.mode == "testnet"
+    if testnet:
+        s = cfg.secrets
+        if not (s.testnet_api_key and s.testnet_api_secret):
+            sys.exit("mode: testnet needs TESTNET_API_KEY and TESTNET_API_SECRET in .env - keys made on "
+                     "testnet.binance.vision, never the real exchange's")
     if live:
         s = cfg.secrets
         if not (s.api_key and s.api_secret):
@@ -166,14 +176,18 @@ def cmd_run(args, cfg):
         if not all(c.passed for c in checks) and not args.force_live:
             print("Paper-trading track record:\n" + format_readiness(checks))
             sys.exit("\nRefusing to trade real money. Keep paper trading, or pass --force-live if you accept the risk.")
-    market = _market(cfg, authenticated=live)
+    try:
+        market = _market(cfg, authenticated=cfg.on_exchange)
+    except RuntimeError as exc:  # a testnet config whose client would not reach the testnet
+        sys.exit(str(exc))
     learn_market = _market(cfg)  # separate connection: learning runs in a background thread
     store = _store(cfg, learn_market)
     try:
-        broker = (LiveBroker(market, cfg.exchange.quote, cfg.live.native_stop_loss, cfg.live.fill_timeout_seconds)
-                  if live else
+        broker = (LiveBroker(market, cfg.exchange.quote, cfg.live.native_stop_loss, cfg.live.fill_timeout_seconds,
+                             testnet=testnet, take_profit_orders=cfg.live.take_profit_order)
+                  if cfg.on_exchange else
                   PaperBroker(db, cfg.costs_model(), cfg.paper.starting_balance, market))
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         sys.exit(str(exc))
 
     def learn_now(current):
@@ -731,6 +745,34 @@ def _telegram_send(cfg, text: str) -> str | None:
     return None
 
 
+def cmd_testnet(args, cfg):
+    """The go-live order paths on the exchange's testnet (tradebot/testnet.py): never the real exchange."""
+    from . import testnet as tn
+    from .config import TESTNET_HOSTS
+    from .data import ExchangeClient
+    from .provenance import code_version
+
+    s = cfg.secrets
+    if cfg.exchange.id not in TESTNET_HOSTS:
+        sys.exit(f"no testnet known for {cfg.exchange.id!r} (supported: {', '.join(sorted(TESTNET_HOSTS))})")
+    if not (s.testnet_api_key and s.testnet_api_secret):
+        sys.exit("testnet verify needs TESTNET_API_KEY and TESTNET_API_SECRET in the --env file: keys made on "
+                 "testnet.binance.vision (log in with GitHub, then Generate HMAC_SHA256 Key), never the real exchange's")
+    client = ExchangeClient(cfg.exchange.id, api_key=s.testnet_api_key, secret=s.testnet_api_secret, sandbox=True,
+                            market_type="spot")
+    try:
+        client.assert_testnet()
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+    print(f"Testnet verification on {TESTNET_HOSTS[cfg.exchange.id]} (testnet money only), code {code_version()}:")
+    steps = tn.verify(client, cfg.exchange.quote, args.symbol, budget=args.budget, wait_s=args.wait_minutes * 60)
+    path = tn.save(steps, cfg.state_path, code_version())
+    failed = [st.name for st in steps if st.ok is False]
+    print(("PASSED" if not failed else "FAILED: " + ", ".join(failed)) + f". Record: {path}")
+    if failed:
+        sys.exit(1)
+
+
 def cmd_notify(args, cfg):
     """Gate 4: a Telegram message to the owner (the weekly summary, or a gate that can't resolve)."""
     text = args.text if args.text is not None else Path(args.file).read_text() if args.file else ""
@@ -1228,6 +1270,13 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--notify", action="store_true",
                     help="drawdown: Telegram the owner when a hit needs work (outside range, mechanics differ)")
     sp.add_argument("--synthetic", action="store_true")
+    sp = sub.add_parser("testnet", help="run the go-live order paths on the exchange's testnet (never the real "
+                                       "exchange): exits on the exchange, stop moves, core orders")
+    sp.add_argument("action", choices=["verify"])
+    sp.add_argument("--symbol", default="BTC/USDT", help="the coin the exit checks trade (default BTC/USDT)")
+    sp.add_argument("--budget", type=float, default=20.0, help="quote spent per test trade (default 20)")
+    sp.add_argument("--wait-minutes", type=float, default=10.0,
+                    help="how long to wait for the testnet price to reach a resting exit (default 10)")
     sp = sub.add_parser("notify", help="send the owner a Telegram message (weekly summary, unresolved gate)")
     sp.add_argument("--text", default=None)
     sp.add_argument("--file", default=None, help="send this file's text")
@@ -1249,7 +1298,7 @@ def main(argv: list[str] | None = None) -> None:
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
         "compare-entries": cmd_compare_entries, "config-set": cmd_config_set, "reconcile": cmd_reconcile,
-        "weekly": cmd_weekly, "gate": cmd_gate, "notify": cmd_notify,
+        "weekly": cmd_weekly, "gate": cmd_gate, "notify": cmd_notify, "testnet": cmd_testnet,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,
     }[args.command]

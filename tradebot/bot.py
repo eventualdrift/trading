@@ -119,8 +119,16 @@ class TradingBot:
         self._log_selection()
         if hasattr(broker, "persist"):  # live broker saves order ids BEFORE each order is sent
             broker.persist = self.db.update_position
-        self.core = (CoreSleeve(db, cfg.core, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate), self.mode, market)
-                     if cfg.core.fraction > 0 and self.mode == "paper" else None)
+        self.core = None
+        if cfg.core.fraction > 0:
+            # paper simulates the core's fills; on an exchange the live broker places its orders and leaves
+            # the core's cash and coins out of the satellite's equity, free cash and coin checks
+            executor = broker if self.mode != "paper" and hasattr(broker, "core_order") else None
+            if self.mode == "paper" or executor is not None:
+                self.core = CoreSleeve(db, cfg.core, Costs(cfg.costs.fee_rate, cfg.costs.slippage_rate),
+                                       self.mode, market, executor=executor)
+                if executor is not None:
+                    broker.reserved = self.core.reserved
 
     # ----------------------------------------------------------------- state
     def _k(self, key: str) -> str:
@@ -626,11 +634,21 @@ class TradingBot:
             self.db.update_position(pos)
             self._halt(f"entry #{pos.id} {pos.symbol} (client order id {pos.client_order_id}) was never confirmed")
         self._reconcile_unknown(self.market.now_ms())
+        self._resolve_core_order(self.market.now_ms())
+        if getattr(self.broker, "native_stop_loss", False):
+            now = self.market.now_ms()
+            for pos in self.db.open_positions(self.mode):
+                if (pos.protection or {}).get("move"):  # a stop move the bot died during: settle it first
+                    try:
+                        self.broker.sync_stop(pos, now)
+                    except Exception as exc:
+                        self._notify_error(f"#{pos.id} {pos.symbol}: a stop move is unresolved ({exc})", key=f"move:{pos.id}")
+                    self.db.update_position(pos)
         self._sweep_orphans(self.market.now_ms(), force=True)
         if getattr(self.broker, "native_stop_loss", False):
             now = self.market.now_ms()
             for pos in self.db.open_positions(self.mode):
-                if not pos.sl_order_id and not pos.closing_reason:
+                if not pos.sl_order_id and not pos.closing_reason and not (pos.protection or {}).get("move"):
                     self._protect(pos, now)
 
     def _reconcile_unknown(self, now_ms: int) -> None:
@@ -664,7 +682,11 @@ class TradingBot:
         recent = self.db.positions_since(self.mode, now_ms - 14 * 86_400_000)
         active = [p for p in recent if p.status in ("open", "pending", "unknown")]
         known = {str(v) for p in active for v in (p.entry_order_id, p.sl_order_id, p.exit_order_id,
-                                                   p.client_order_id, p.sl_client_id, p.exit_client_id) if v}
+                                                   p.client_order_id, p.sl_client_id, p.exit_client_id,
+                                                   *(p.protection or {}).get("move", {}).values(),
+                                                   *((p.protection or {}).get(k) for k in
+                                                     ("tp_order_id", "tp_client_id", "list_client_id")))
+                 if v and not isinstance(v, (int, float))}
         try:
             cancelled = sweep({p.symbol for p in recent}, known)
         except Exception as exc:
@@ -710,7 +732,20 @@ class TradingBot:
             else:
                 self.db.update_position(pos)
 
+    def _resolve_core_order(self, now_ms: int) -> None:
+        """A core order whose outcome was never recorded (a crash, a lost response): settle it."""
+        if self.core is None or self.core.executor is None or not self.core.pending:
+            return
+        try:
+            t = self.core.resolve_pending(now_ms)
+        except Exception as exc:
+            self._notify_error(f"core order {self.core.pending.get('client_id')} still unresolved: {exc}", key="core-order")
+            return
+        self.notify("✅ Core order confirmed on the exchange: " + (
+            f"{t.side} {t.qty:g} {fmt.esc(t.symbol)} @ {fmt.fmt_price(t.price)}" if t else "it was never filled"))
+
     def manage_positions(self, now_ms: int) -> None:
+        self._resolve_core_order(now_ms)
         self._reconcile_unknown(now_ms)
         self._sweep_orphans(now_ms)
         if hasattr(self.broker, "fill_limit"):
@@ -819,6 +854,16 @@ class TradingBot:
             current = self._guarded_price(pos.symbol, now_ms)
             if current is None:
                 current = pos.stop_loss  # price unconfirmed: book the stop level itself
+        if reason is None:
+            # an exchange-side stop follows the bot's level (paper: nothing to do); a move the exchange
+            # refuses because the price is already through it, or that leaves no stop, sells now
+            self.broker.sync_stop(pos, now_ms)
+            if pos.status == "closed":
+                self.db.update_position(pos)
+                self.notify(fmt.format_exit(pos, self.cfg.exchange.quote))
+                return
+            if pos.closing_reason:
+                reason = pos.closing_reason
         if reason is not None:
             self._close(pos, price if price is not None else current, reason, now_ms)
         else:

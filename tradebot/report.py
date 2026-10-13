@@ -40,13 +40,15 @@ PROTECTIVE_EXITS = ("stop_loss", "breakeven_stop", "trailing_stop", "take_profit
 def exchange_protection_check() -> Check:
     """Go-live item: every protective exit must exist on the exchange. An exit the bot manages
     itself does not fire while the bot is down (asleep, crashed, offline)."""
-    from .execution.live import EXCHANGE_SIDE_EXITS
+    from .execution.live import EXCHANGE_SIDE_EXITS, PARTLY_EXCHANGE_SIDE
 
     missing = [e for e in PROTECTIVE_EXITS if e not in EXCHANGE_SIDE_EXITS]
-    return Check("every protective exit rests on the exchange", not missing,
-                 "stop-loss, breakeven, trailing and take-profit are all exchange orders" if not missing else
-                 f"{', '.join(e.replace('_', ' ') for e in missing)} are managed by the bot and don't fire while it is "
-                 f"down - build and testnet-verify exchange-side orders for them first")
+    on = ", ".join(e.replace("_", " ") for e in PROTECTIVE_EXITS if e in EXCHANGE_SIDE_EXITS)
+    detail = ("stop-loss, breakeven, trailing and take-profit are all exchange orders" if not missing else
+              f"exchange orders: {on}; " + "; ".join(
+                  f"{e.replace('_', ' ')}: " + PARTLY_EXCHANGE_SIDE.get(e, "managed by the bot, doesn't fire while it is down")
+                  for e in missing))
+    return Check("every protective exit rests on the exchange", not missing, detail)
 
 
 def format_readiness(checks: list[Check]) -> str:

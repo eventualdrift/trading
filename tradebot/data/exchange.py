@@ -81,7 +81,22 @@ class ExchangeClient:
         if sandbox:
             self.ex.set_sandbox_mode(True)
         self.id = exchange_id
+        self.sandbox = bool(sandbox)
         self._markets: dict | None = None
+
+    def assert_testnet(self) -> None:
+        """Refuse unless every API URL this client can call is the exchange's testnet: orders sent
+        through it can then never reach the real exchange."""
+        from ..config import TESTNET_HOSTS
+
+        host = TESTNET_HOSTS.get(self.id)
+        api = (getattr(self.ex, "urls", None) or {}).get("api")
+        urls = [str(u) for u in (api.values() if isinstance(api, dict) else [api])]
+        spot = [str(api.get(k)) for k in ("public", "private")] if isinstance(api, dict) else urls
+        if (not host or not self.sandbox or not urls or any("testnet" not in u for u in urls)
+                or any(host not in u for u in spot)):
+            raise RuntimeError(f"refusing: this {self.id} client is not on the testnet ({host or 'no testnet known'}); "
+                               f"its API URLs are {urls[:3]}")
 
     # ------------------------------------------------------------------ data
     @property
