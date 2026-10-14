@@ -16,6 +16,8 @@ from tradebot.reconcile import (Reconciliation, Timeline, format_reconciliation,
                                 selection_timeline, uptime, write_csv)
 from tradebot.timeframes import drop_unclosed
 
+from .conftest import bars
+
 DAY = 86_400_000
 HOUR = 3_600_000
 
@@ -143,7 +145,9 @@ def test_reconciliation_names_what_differs(paper_run, tmp_path):
     rec = run_reconcile(paper_run, db2)
     rows = {(r.symbol, r.candle_ms): r for r in rec.rows}
     assert rows[(opened[0].symbol, opened[0].candle_time)].entry_bps == pytest.approx(100, abs=15)
-    assert rows[(gone.symbol, gone.candle_time)].paper == "(no signal: scanned, live found no signal (its candles differ))"
+    assert rows[(gone.symbol, gone.candle_time)].paper == ("(no signal: scanned, live found no signal (true on the last "
+                                                           "999 candles, as the scan had them, too: its candles differ))")
+    assert rows[(gone.symbol, gone.candle_time)].candle_window == "doesn't explain"
     assert rows[(errored.symbol, errored.candle_time)].paper.startswith("(no signal: scan error: ")
     assert rows[(down.symbol, down.candle_time)].paper.startswith("(no signal: bot not running at the close")
     assert rows[(stale.symbol, stale.candle_time)].paper == \
@@ -316,7 +320,8 @@ def test_ml_filter_selections_in_force_and_paper_only_reasons(paper_run, tmp_pat
     assert "sized up by confidence: 1 signals, risk x1.40" in text
     row = next(r for r in rec.rows if r.candle_ms == int(quiet.value // 1_000_000) and r.symbol == "BTC/USDT")
     assert row.backtest == ("(no signal: the entry condition is false there on the full history "
-                            "(live used its last 1000 candles at most))")
+                            "(false on the last 999 candles the scan had too: not live's candle window))")
+    assert row.candle_window == "doesn't explain"
     from tradebot.weekly import selection_changes
 
     changes = selection_changes(rec)
@@ -435,3 +440,78 @@ def test_the_coin_list_at_the_scan_decides_what_is_replayed(paper_run, tmp_path)
     db3.log_bot(scan_ts + HOUR, "paper", "universe", list(market.symbols))
     gone = {(r.symbol, r.candle_ms): r for r in run_reconcile(paper_run, db3).rows}[(row.symbol, row.candle_ms)]
     assert gone.backtest.startswith("(not replayed")
+
+
+def test_the_scans_candle_window_explains_a_signal_only_one_side_had(paper_run, tmp_path, monkeypatch):
+    """Live computes on the candles its scan fetched, the backtest on the full history: a signal only
+    one side had is re-checked on the scan's window, which says whether that explains it."""
+    from tradebot import reconcile as rc
+    from tradebot.weekly import reconcile_summary
+
+    cfg, market, db, *_ = paper_run
+    db2 = copy_db(db, tmp_path / "window.db")
+    gone = sorted(db2.signals_since(0), key=lambda s: s.candle_time)[-3]
+    db2._conn.execute("DELETE FROM signals WHERE id=?", (gone.id,))
+    asked = []
+
+    def window(strategies):
+        asked.append(sorted(s.name for s in strategies))
+        return 10  # 9 closed candles: shorter than breakout's warm-up, so the scan finds nothing
+
+    monkeypatch.setattr(rc, "scan_candles", window)
+    rec = run_reconcile(paper_run, db2)
+    row = next(r for r in rec.rows if (r.symbol, r.candle_ms) == (gone.symbol, gone.candle_time))
+    assert row.candle_window == "explains" and asked and set(map(tuple, asked)) == {("breakout",)}
+    assert row.paper == ("(no signal: scanned, live found no signal (false on the last 9 candles, as the scan had "
+                         "them: live's candle window explains it))")
+    assert sum(bool(r.candle_window) for r in rec.rows) == 1  # rows both sides had are not re-checked
+    lines, nums = reconcile_summary(rec)
+    assert nums["candle_window"] == {"checked": 1, "explains": 1}
+    assert nums["signal_data_differences"] == 0  # the candles agree: live used fewer of them
+    assert any("explains 1 of these 1" in x for x in lines)
+    assert "Backtest only: 1 scanned, live found no signal" in "\n".join(lines)
+    assert "Live's candle window: of the 1 signals" in format_reconciliation(rec, cfg)
+
+
+def test_a_paper_signal_the_window_explains(paper_run, tmp_path, monkeypatch):
+    """The other side: paper's signal, false on the full history, true on the scan's window."""
+    from tradebot import reconcile as rc
+    from tradebot.models import Signal
+
+    cfg, market, db, data, *_ = paper_run
+    db2 = copy_db(db, tmp_path / "paper-window.db")
+    base = {(r.symbol, r.candle_ms) for r in run_reconcile(paper_run, db2).rows}
+    quiet = next(t for t in data["1h"]["ETH/USDT"].index[-80:] if ("ETH/USDT", int(t.value // 1_000_000)) not in base)
+    candle = int(quiet.value // 1_000_000)
+    db2.insert_signal(Signal("ETH/USDT", "1h", "breakout", "long", 100.0, 95.0, 110.0, candle, candle + HOUR + 30_000,
+                             0, 0, status="skipped", note="test"))
+    seen = []
+
+    def on_window(df, i, strategy, closed, context, tf, side, min_rr):
+        seen.append((int(df.index[i].value // 1_000_000), strategy.name, closed, tf, side))
+        return True
+
+    monkeypatch.setattr(rc, "entry_on_window", on_window)
+    row = next(r for r in run_reconcile(paper_run, db2).rows if (r.symbol, r.candle_ms) == ("ETH/USDT", candle))
+    assert (candle, "breakout", 999, "1h", "long") in seen
+    assert row.candle_window == "explains"
+    assert row.backtest == ("(no signal: the entry condition is false there on the full history (true on the last "
+                            "999 candles, as the scan had them: live's candle window explains it))")
+
+
+def test_the_entry_condition_on_the_scans_window_can_differ_from_the_full_history():
+    """A long EMA computed on the scan's window starts from its first candle: here the full history's
+    EMA200 still remembers an older, higher price, so only the window sees a breakout above it."""
+    from tradebot.reconcile import entry_on_window
+    from tradebot.strategies import make_strategy
+
+    rows = [(200.0, 200.2, 199.8, 200.0)] * 600 + [(100.0, 100.2, 99.8, 100.0)] * 300 + [(100.0, 104.5, 99.5, 104.0)]
+    df = bars(rows)
+    df.iloc[-1, df.columns.get_loc("volume")] = 3000.0
+    breakout, i = make_strategy("breakout", {}), len(rows) - 1
+    full = breakout.populate(df, None, "1h").iloc[-1]
+    assert not full["enter_long"] and full["ema_trend"] > 104.0  # the backtest: no signal
+    assert entry_on_window(df, i, breakout, 260, None, "1h", "long", 1.0)  # 260 candles, all at 100: a breakout
+    assert not entry_on_window(df, i, breakout, len(df), None, "1h", "long", 1.0)  # the whole history: none
+    assert not entry_on_window(df, i, breakout, 249, None, "1h", "long", 1.0)  # under the warm-up: the scan skips
+    assert not entry_on_window(df, i, breakout, 260, None, "1h", "long", 3.0)  # reward:risk 2.5 under the floor

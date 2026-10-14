@@ -27,6 +27,7 @@ from .backtest.engine import Trade, candidate_trades, flat_at, refine_flat_times
 from .config import BotConfig
 from .core import trend_weights_series
 from .db import Database
+from .scanner import scan_candles
 from .strategies import make_strategy
 from .bot import CORE_RETRY_HOURS
 from .timeframes import index_ms, last_closed_open_ms, tf_ms
@@ -287,6 +288,7 @@ class Row:
     ml_probability: float | None = None  # paper's ML score, when the filter was on
     size_multiplier: float | None = None  # paper's risk multiplier from the ML score (1 = none)
     note: str = ""
+    candle_window: str = ""  # a signal one side had: "explains" / "doesn't explain" (live's candle window)
 
 
 @dataclass
@@ -313,6 +315,18 @@ class Reconciliation:
     core_waits: list[dict] = field(default_factory=list)  # days the core waited for the day's data (core_retry)
     header: list[str] = field(default_factory=list)
     reproduce: str = ""  # the command that reruns this report
+
+
+def entry_on_window(df: pd.DataFrame, i: int, strategy, closed: int, context, tf: str, side: str,
+                    min_rr: float) -> bool:
+    """The entry condition at candle ``i`` computed on its last ``closed`` candles only, as a scan has
+    them (an exchange returns the candle still forming last, which the scan drops)."""
+    cut = df.iloc[max(0, i + 1 - closed):i + 1]
+    if len(cut) < strategy.warmup:  # the scanner skips the coin
+        return False
+    row = strategy.populate(cut, context, tf).iloc[-1]
+    return bool(row[f"enter_{side}"]) and reward_risk(
+        side, float(row["close"]), float(row[f"{side}_sl"]), float(row[f"{side}_tp"])) >= min_rr
 
 
 def selection_timeline(entries: list[tuple[int, object]], fallback) -> Timeline:
@@ -457,7 +471,27 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         ts = pd.Timestamp(m, unit="ms", tz="UTC")
         return {t.symbol for t in taken if t.entry_time < ts < flat_at(t)}
 
-    def no_backtest_signal(sym: str, tf: str, strat: str, candle: int, close_ms: int) -> str:
+    def on_scanned_candles(sym: str, tf: str, strat: str, side: str, candle: int) -> tuple[bool, int] | None:
+        """The entry condition on the candles the scan had (its fetch, less the candle still forming),
+        not the full history: (true?, candles), or None if it can't be evaluated. The BTC context needs
+        no cut: its rolling windows fit inside what the scanner fetches for it."""
+        df = datasets.get(tf, {}).get(sym)
+        if df is None or not len(df):
+            return None
+        opens = index_ms(df.index)
+        i = int(np.searchsorted(opens, candle))
+        if i >= len(opens) or int(opens[i]) != candle:
+            return None
+        combos = list(_combos(selections.at(scan_time(tf, candle))).values())
+        combo = next((v for v in combos if v[:2] == (strat, tf)), None)
+        if combo is None:
+            return None
+        closed = scan_candles([make_strategy(n, p) for n, t, p in combos if t == tf]) - 1  # less the forming one
+        return (entry_on_window(df, i, make_strategy(combo[0], combo[2]), closed, context, tf, side,
+                                cfg.risk.min_reward_risk), min(closed, i + 1))
+
+    def no_backtest_signal(sym: str, tf: str, strat: str, side: str, candle: int, close_ms: int,
+                           row: Row) -> str:
         df = datasets.get(tf, {}).get(sym)
         if df is None or not len(df):
             return "no candles for it in the frozen data"
@@ -472,9 +506,17 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
             return "that strategy is not in the selection assumed for that time"
         if i < make_strategy(combo[0], combo[2]).warmup:
             return "the coin's history is shorter than the strategy's warm-up"
-        return "the entry condition is false there on the full history (live used its last 1000 candles at most)"
+        cut = on_scanned_candles(sym, tf, strat, side, candle)
+        if cut is None:
+            return "the entry condition is false there on the full history (live used its last 1000 candles at most)"
+        fires, n = cut
+        row.candle_window = "explains" if fires else "doesn't explain"
+        return (f"the entry condition is false there on the full history (true on the last {n} candles, as the scan "
+                f"had them: live's candle window explains it)" if fires else
+                f"the entry condition is false there on the full history (false on the last {n} candles the scan had "
+                f"too: not live's candle window)")
 
-    def no_signal_reason(sym: str, tf: str, candle: int, close_ms: int) -> str:
+    def no_signal_reason(sym: str, tf: str, strat: str, side: str, candle: int, close_ms: int, row: Row) -> str:
         if (sym, tf, candle) in scan_errors:
             return f"scan error: {scan_errors[(sym, tf, candle)]}"
         if (tf, candle) in stale:
@@ -482,7 +524,15 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
             return ("candle skipped: the bot reached it " + (_dur(age * 1000) + " " if age else "")
                     + "after the close (stale-candle rule)")
         if (tf, candle) in scanned:
-            return "scanned, live found no signal (its candles differ)"
+            cut = on_scanned_candles(sym, tf, strat, side, candle)
+            if cut is None:
+                return "scanned, live found no signal (its candles differ)"
+            fires, n = cut
+            row.candle_window = "doesn't explain" if fires else "explains"
+            return (f"scanned, live found no signal (true on the last {n} candles, as the scan had them, too: "
+                    f"its candles differ)" if fires else
+                    f"scanned, live found no signal (false on the last {n} candles, as the scan had them: live's "
+                    f"candle window explains it)")
         if not up.up(close_ms + 60_000):
             g = up.gap_at(close_ms + 60_000)
             return "bot not running at the close" + (f" ({g.cause})" if g and g.cause else "")
@@ -502,7 +552,7 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         # paper side
         pos = positions.get(ps.id) if ps is not None else None
         if ps is None:
-            row.paper = f"(no signal: {no_signal_reason(sym, tf, candle, close_ms)})"
+            row.paper = f"(no signal: {no_signal_reason(sym, tf, strat, side, candle, close_ms, row)})"
         elif ps.status == "opened" and pos is not None:
             row.paper = {"open": "opened (still open)", "closed": "opened", "missed": "limit missed",
                          "working": "limit working", "failed": "entry failed"}.get(pos.status, pos.status)
@@ -514,7 +564,8 @@ def reconcile(db: Database, cfg: BotConfig, datasets, context, daily_closes: dic
         if s is not None and s.trade is not None and s.trade.reason != "end_of_data":
             row.r_if_taken = s.trade.r_multiple
         if s is None:
-            row.backtest = (f"(no signal: {no_backtest_signal(sym, tf, strat, candle, close_ms)})" if key not in outside
+            row.backtest = (f"(no signal: {no_backtest_signal(sym, tf, strat, side, candle, close_ms, row)})"
+                            if key not in outside
                             else "(not replayed: coin outside paper's logged list, or strategy not active then)")
         elif s.trade is None:
             row.backtest = s.no_trade
@@ -837,6 +888,11 @@ def format_reconciliation(rec: Reconciliation, cfg: BotConfig, limit: int = 25) 
         lines.append("  Paper only:")
         for k, n in reasons.value_counts().items():
             lines.append(f"    {n:>3}  {k}")
+    window = [r for r in rows if r.candle_window]
+    if window:
+        lines.append(f"  Live's candle window: of the {len(window)} signals only one side had that the scan's candles "
+                     f"can re-check, {sum(r.candle_window == 'explains' for r in window)} are explained by live "
+                     f"computing on its last 1000 candles at most (the backtest uses the full history)")
     agree = [r for r in both if not r.cause]
     disagree = [r for r in both if r.cause]
     if both:

@@ -20,6 +20,15 @@ from .timeframes import drop_unclosed, index_ms, tf_ms
 log = logging.getLogger(__name__)
 
 
+MAX_FETCH = 1000  # the most candles most exchanges return at once
+
+
+def scan_candles(strategies) -> int:
+    """How many candles a scan fetches for a timeframe: EMAs need several multiples of their length
+    to converge to the values the backtest saw on full history."""
+    return min(MAX_FETCH, 4 * max([s.warmup for s in strategies] + [250]))
+
+
 @dataclass
 class ScanResult:
     accepted: list[Signal] = field(default_factory=list)
@@ -85,9 +94,7 @@ class Scanner:
         for p in open_positions:
             if p.timeframe == tf:
                 by_symbol.setdefault(p.symbol, []).append(p)
-        # EMAs need several multiples of their length to converge to the values the
-        # backtest saw on full history; 1000 is the max most exchanges return at once.
-        need = min(1000, 4 * max([s.warmup for s in strategies] + [250]))
+        need = scan_candles(strategies)
         ctx = self.context(now_ms)
         for symbol in dict.fromkeys([*symbols, *by_symbol]):
             try:

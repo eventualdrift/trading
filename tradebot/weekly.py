@@ -105,8 +105,12 @@ def reconcile_summary(rec) -> tuple[list[str], dict]:
     if len(reasons):
         lines.append("  Backtest only: " + ", ".join(f"{n} {k}" for k, n in reasons.items()))
     if paper_only:
-        why = pd.Series([r.backtest[1:-1].split(" (live")[0] for r in paper_only]).value_counts()
+        why = pd.Series([r.backtest[1:-1].split(" (")[0] for r in paper_only]).value_counts()
         lines.append("  Paper only: " + ", ".join(f"{n} {k}" for k, n in why.items()))
+    window = [r for r in rows if r.candle_window]
+    if window:
+        lines.append(f"  Live's candle window (its last 1000 candles at most, the backtest the full history) explains "
+                     f"{sum(r.candle_window == 'explains' for r in window)} of these {len(window)}")
     scored = [r for r in rows if r.ml_probability is not None]
     if rec.ml_active or scored:
         filtered = [r for r in scored if r.paper.startswith("filtered")]
@@ -138,10 +142,13 @@ def reconcile_summary(rec) -> tuple[list[str], dict]:
                         + (f" ({sum(bool(w['incomplete']) for w in rec.core_waits)} went ahead without it)"
                            if any(w["incomplete"] for w in rec.core_waits) else "")
                         if getattr(rec, "core_waits", None) else ""))
-    unexplained = int(sum(n for k, n in reasons.items() if k.startswith(("no scan recorded", "scanned"))))
+    unexplained = sum(r.paper.startswith(("(no signal: no scan recorded", "(no signal: scanned"))
+                      and r.candle_window != "explains" for r in bt_only)  # the window is the backtest's gap
     return lines, {"first_differences": len(first), "core_target_mismatch": len(days) - same,
                    "core_rule_diffs": len(rec.core_rule_diffs), "late_exits": len(late),
-                   "signal_data_differences": unexplained, "shared": len(both), "ml_active": bool(rec.ml_active)}
+                   "signal_data_differences": unexplained, "shared": len(both), "ml_active": bool(rec.ml_active),
+                   "candle_window": {"checked": len(window),
+                                     "explains": sum(r.candle_window == "explains" for r in window)}}
 
 
 def portfolio_summary(res) -> tuple[list[str], dict]:
