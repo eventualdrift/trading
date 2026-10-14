@@ -11,14 +11,14 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Open
 
-- [ ] **The take-profit rule in the backtest** (fidelity, found reading the code 2026-10-13; no paper
-  trade has reached its target yet). Paper takes profit as soon as the polled price touches the target
-  (`bot._check_position`, every 30 s); the backtest only when a candle of the strategy's timeframe closes
-  at or above it (`engine.simulate_trade`), so a 4h or daily wick through the target is an exit in paper
-  and not in the backtest. On the exchange the take-profit trigger is the touch rule too.
-  - Done when: the backtest models the touch rule (with the same-candle order of stop and target stated),
-    a test shows a wick through the target exits, the frozen reference rerun and ledger notes follow, and
-    the same-trades check stays identical (live is unchanged).
+- [ ] **The take-profit rule in the backtest** (fidelity; built 2026-10-13 on the local branch
+  `tp-touch-rule`, 6e61491, held for the owner: under Needs the owner). The backtest counts a target
+  when a candle closes beyond it; paper sells when its 30-second poll sees the price there. The fix
+  (a touch, the stop winning a shared candle after its open) is measured against 1-minute candles: of
+  the 99 exits it adds on the reference, 82 had a full minute beyond the target, 17 only a spike under
+  a minute.
+  - Done when: the owner decides how it reaches paper (it changes learn's selection), then the frozen
+    rerun, ledger notes and gate 1.
 - [ ] **The `ml` protocol** (CLAUDE.md template, family `ml`): decides whether the ML filter comes
   back, on untouched data - at least 100 satellite trades after the reference's data end
   (2026-09-27), so not before the paper reserve has them. The replay models the filter
@@ -53,7 +53,12 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Needs the owner
 
-Nothing open (2026-10-13).
+- [ ] **The take-profit touch rule changes learn's selection** (2026-10-13). On the frozen reference
+  the account replay barely moves, but learn's strategy-alone scores do: run_selection adds
+  breakout@4h (in-sample +0.001R -> +0.090R against the 0.05 floor). Deploying it would change what
+  paper trades at the next weekly learn, and CLAUDE.md makes a registered test the only path to that.
+  Either it lands as a fidelity fix through the weekly learn, or the replay and reconcile take it
+  while learn keeps the close rule until a registered satellite test passes on untouched data.
 
 ## Later
 

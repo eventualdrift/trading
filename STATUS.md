@@ -768,3 +768,119 @@ gates, live still refused, nothing changing in paper)
    on a strategy candle closing above it. Found reading the code; no paper trade has reached its
    target yet. A fidelity fix, then the frozen rerun.
 3. A testnet instance running for a few weeks, your call (`mode: testnet` exists).
+
+## 2026-10-13 - session (continued): your decisions applied; testnet-verified; the take-profit rule held for you
+
+Code 65a1b81 deployed at 22:52 UTC · settings 75a58dc389 (unchanged) · live trading refused in code
+
+**What changed** (your decisions of 2026-10-13, all applied)
+- **Testnet verified.** `tradebot testnet verify` passed all nine steps, twice: at 21:22 UTC
+  (labelled 63b01bd+uncommitted: I had edited files while it ran; the order code was 63b01bd's)
+  and again at 23:09 UTC on the deployed 65a1b81. In both, the stop fired on the exchange while
+  the bot wasn't looking (step 6). Each stop move was one cancel-replace request with one stop
+  standing after it (steps 3, 4). A move through the price sold at once (step 5). Lost answers were
+  found by client id (step 7), and the core's orders matched the exchange balances (step 8).
+  Records: `state/testnet/verify-2026-10-13-2122.json`, `verify-2026-10-13-2309.json`.
+- **The take-profit: the built option.** The go-live check now reads "the stop rests on the
+  exchange at all times" and checks your rule: stop-loss, breakeven and trailing stops are exchange
+  orders, each move one request; the take-profit is an exchange order until the stop first moves,
+  bot-managed after. It also fails if `live.native_stop_loss` or `live.require_exchange_stop` is
+  off. A passing checklist now says "going live is the owner's decision (live trading is off in
+  code)" instead of "READY".
+- **Risk policy in CLAUDE.md** (a new section, the hard rules untouched). e98d271:
+  - A drawdown halt resumes at the next daily close with the peak restarted. Live and the replay
+    now run one function for it (`risk.drawdown_step`).
+  - The drawdown halt has its own state, so the daily close never ends an operational halt (an
+    order the bot couldn't verify); that still waits for /resume.
+  - /resume restarts the peak only when it ends a drawdown halt. The resume message says when
+    /pause or an operational halt still blocks entries.
+- **Under the policy's three conditions, two more risk mechanics now match the replay** (e98d271,
+  from the review):
+  - Sleeve transfers scale the breakers' peak and day start instead of shifting them, so the
+    satellite stays as far from both limits in percent as the replay's rescaled path. This was the
+    BACKLOG sleeve-transfer item.
+  - A fall the replay first sees at a 00:00 close belongs to the day that ended: live, checking
+    every loop, halted inside that candle and resumed before the 00:00 scan.
+- **The same-trades check covers the breakers** (1f50e39). A fourth stored scenario runs the code's
+  default limits divided by fixed factors (3% and 1% today). A change to how either breaker acts,
+  or to a default limit, moves its orders. It was recorded under the old rule first (the halt never
+  ended: every later signal blocked), then re-recorded with the daily-close resume: both halts end
+  at the first loop after 00:00 UTC, 31 -> 49 positions.
+- **BACKLOG "Later": the social-attention signal**, with your note; not pursued until a priced
+  historical source exists.
+- **BACKLOG's top item, the take-profit rule in the backtest: built, measured, reviewed, and held
+  for you** (local branch `tp-touch-rule`, 6e61491; not deployed). It makes the target a touch: a
+  candle reaching the target exits there, a gap beyond it exits at the open, and the stop wins a
+  shared candle after its open. Before, the backtest needed a candle to close beyond the target,
+  while paper sells when its 30-second poll sees the price there. It changes what learn selects
+  (below), so it waits for you.
+- **Reviews.**
+  - The halt change: three lenses and a skeptic per finding. 16 candidates, 11 confirmed (9
+    distinct), all fixed with tests; 5 refuted.
+  - The take-profit change: two lenses and a skeptic per finding. 10 candidates, 8 confirmed (5
+    distinct), all fixed; 1 refuted. The main one: once the stop moves (+1R, before any target),
+    live takes profit by the same 30-second poll as paper, so the exchange trigger rarely decides,
+    and the rule's one optimistic element (spikes shorter than a poll) applies to live too.
+- **Deployed through gate 1:** 65a1b81 at 22:52 UTC: lint, the suite, the suite in a fresh clone,
+  same-trades identical (the plain orders and all four scenarios), same orders as the running
+  commit, the container up 45 s.
+- **Ledger notes** (`research note`): sizing-open-risk-budget-v1, core-robustness,
+  drawdown-limits-v1, ml-replay-a2 (the halt's midnight rule).
+
+**What the numbers say** (`--config config-agent.yaml`; the pinned reference
+`reports/universe-20260927-1513@b068c25-75a58dc389.json`; numbers from the satellite's first
+trade, 2023-01-14)
+- **The halt's midnight rule:**
+  - The 2024-05-09 halt was first seen at a 00:00 close (the reference's marks are 4h closes). It
+    now ends at once, so 1 signal is blocked in 3.7 years instead of 6.
+  - Combined Sharpe 1.10 -> 1.10, satellite 0.58 -> 0.59.
+  - Like-for-like worst dips 24.53% -> 24.34% (account) and 21.76% -> 21.16% (satellite).
+  - The gate's limits from this replay would be 36.51% / 31.74% / 11. The set 36.48% / 31.71% / 11
+    stand: changing them is a registered test, and they are still the tighter.
+- **The take-profit touch rule** (branch `tp-touch-rule`; not deployed):
+  - On the frozen reference the account replay barely moves: combined 1.10 -> 1.10, satellite 0.59
+    -> 0.59, dips unchanged (24.34% / 21.16%), 512 trades taken instead of 511. Target exits are
+    rare there: 4 of 512 taken trades.
+  - Learn's strategy-alone scores move more, and on the same data its selection changes. Learn's own
+    `run_selection` on the reference's 30 coins and data end, read-only:
+    - current rule: breakout@1d and momentum@1d;
+    - touch rule: those two plus breakout@4h (in-sample +0.001R -> +0.090R against the 0.05 floor,
+      out-of-sample +0.029R -> +0.114R; breakout@1d +0.124R -> +0.168R).
+- **Would paper's poll see the touches the rule adds?** For each exit candle I used Binance's
+  1-minute candles, over all 5,195 candidate trades of the reference. The touch rule gives 199
+  target exits, and 100 of them closed beyond the target anyway. Of the 99 it adds:
+  - 82 (83%) had at least one full minute closing beyond the target (median 26 minutes). A 30-second
+    poll sees those, and the current rule counts none of them.
+  - 17 (17%) had only a spike under a minute. The backtest would count those; paper may miss them,
+    and so would live once the stop has moved.
+- Reproduce:
+    tradebot --config config-agent.yaml testnet verify
+    tradebot --config config-agent.yaml gate same-trades
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@b068c25-75a58dc389.json
+
+**What needs you**
+- **The take-profit rule reaches learn's selection: your call** (CLAUDE.md: a registered test is the
+  only path to changing what the bot trades). The fix is a fidelity fix: the backtest would model
+  what paper does. But learn scores strategies with the same backtest, and on the reference data its
+  selection gains breakout@4h. So deploying it would likely change what paper trades at the next
+  weekly learn, and the same-trades gate can't see that (it runs a fixed selection). Two ways:
+  1. **Deploy it as a fidelity fix** (my recommendation): the replay, the reconcile and learn all
+     use the touch rule, and the weekly learn picks with it; the weekly summary leads with any
+     selection change. The rule comes from reading the code (the BACKLOG item predates any
+     rerun), and the 1-minute check measures what a poll sees, not what pays, so it isn't tuned on
+     results. Today paper runs strategies scored under a rule that misses 82 of these 99 exits.
+  2. **The replay and reconcile take the touch rule, and learn keeps the close rule** until a
+     registered satellite test passes on untouched data (candles after 2026-09-27, at least 100
+     satellite trades). That spends a reserve and leaves learn scoring under a rule paper doesn't use.
+  Until you say, it stays on the local branch, and nothing deployed changes.
+- `~/tradebot/config.yaml` (your file, not in git) still says `# halt (until /resume)` on the
+  max_drawdown_pct line. The code now resumes at the next daily close whatever the comment says;
+  `config.example.yaml` has the new wording.
+
+**What's next** (BACKLOG.md)
+1. Monday 10-19: the first cron weekly. It reruns the reference with today's code (the halt's
+   midnight rule moves it slightly; the entry will say so), and its push is the first unattended one.
+2. The take-profit rule, as soon as you choose.
+3. The `ml` protocol, once the paper reserve has 100 trades after 2026-09-27.
+4. Live vs backtest candle history, which needs four weeks above 95% uptime.
+5. A testnet instance running for a few weeks: your call (`mode: testnet` exists, verified).
