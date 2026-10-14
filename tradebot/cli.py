@@ -304,6 +304,8 @@ def cmd_research(args, cfg):
         return _research_oos(args, cfg)
     if args.topic in ("register", "protocols", "run", "record"):
         return _research_protocols(args, cfg)
+    if args.topic == "fidelity":
+        return _research_fidelity(args, cfg)
     if args.topic == "note":
         if not args.id or not args.text:
             sys.exit("usage: tradebot research note --id <test id> --text \"...\"")
@@ -883,6 +885,7 @@ def cmd_weekly(args, cfg):
 
     import pandas as pd
 
+    from . import fidelity
     from . import weekly as wk
     from .learning import load_brain
     from .portfolio import format_portfolio_backtest
@@ -959,7 +962,10 @@ def cmd_weekly(args, cfg):
     today, _ = load_brain(cfg)
     sel_now = {"keys": sorted(c.key for c in today.selected) if today else [],
                "created": today.created_at if today else None}
-    changed = []
+    fixes = [(e, fidelity.deployed_in(cfg.state_path, e["fix"]))
+             for e in fidelity.unreported(cfg.state_path, state.get("fidelity_reported"))]
+    fixes = [(e, d) for e, d in fixes if d]  # a fix reaches learn once it is deployed: reported from then on
+    changed = [fidelity.lead_line(e, d) for e, d in fixes if e["added"] or e["dropped"]]  # they lead (CLAUDE.md)
     logged = wk.selection_changes(rec) if rec is not None else []
     changed += logged  # learn's changes during the week, from the bot's activity log: first, they change what trades
     prev_sel = state.get("selection")
@@ -985,7 +991,9 @@ def cmd_weekly(args, cfg):
     status = Path(args.status_file) if args.status_file else wk.REPO / "STATUS.md"
     wk.append_status(status, entry)
     wk.save_state(cfg.state_path, {"reference": reference, "code": code, "settings": snap, "selection": sel_now,
-                                   "numbers": nums, "ran_at": wk.today()})
+                                   "numbers": nums, "ran_at": wk.today(),
+                                   "fidelity_reported": sorted({*(state.get("fidelity_reported") or []),
+                                                                *(e["id"] for e, _ in fixes)})})
     print(entry)
     print(f"Appended to {status}; full reports in {out_dir}")
     if args.notify:
@@ -993,6 +1001,39 @@ def cmd_weekly(args, cfg):
         print(err or "Telegram summary sent")
         if err:
             sys.exit(3)  # written, not sent: scripts/weekly.sh still commits and pushes
+
+
+def _research_fidelity(args, cfg):
+    """A fidelity fix's effect on learn's selection, on the weekly reference's frozen data: recorded in
+    the ledger once per fix; the next `tradebot weekly` leads with a change (CLAUDE.md, working rules)."""
+    from . import fidelity
+    from . import weekly as wk
+    from .provenance import config_hash, settings_snapshot
+
+    if not args.fix:
+        sys.exit("usage: tradebot research fidelity --fix <commit> [--universe-file reports/universe-<run>.json]")
+    reference = args.universe_file or wk.load_state(cfg.state_path).get("reference")
+    if not reference:
+        sys.exit("No weekly reference yet: pass --universe-file reports/universe-<run>.json")
+    if not Path(reference).exists():
+        sys.exit(f"reference universe file not found: {reference}")
+    try:
+        before, after, subject = fidelity.fix_commits(args.fix)
+        done = fidelity.recorded(cfg.state_path, after)
+        if done:
+            sys.exit(f"{done['id']} is already in the ledger ({done['at']}): {fidelity.change_text(done)}")
+        print(f"Learn's selection with {before[:7]} (before) and {after[:7]} (the fix), side by side "
+              f"(a few minutes)...", flush=True)
+        rec = fidelity.measure(before, after, args.config, reference, cfg.data.dir)
+    except (RuntimeError, ValueError, OSError) as exc:
+        sys.exit(str(exc))
+    rec = {"fix": after, "subject": subject, "before_code": before, "universe_file": reference,
+           "settings": config_hash(settings_snapshot(cfg)), **rec}
+    print(fidelity.format_comparison(rec))
+    entry = fidelity.record(cfg.state_path, rec)
+    print(f"\nRecorded as {entry['id']} (research/ledger.jsonl)"
+          + ("; the first weekly check-in after the fix is deployed leads with it." if rec["added"] or rec["dropped"]
+             else "."))
 
 
 def _research_protocols(args, cfg):
@@ -1203,19 +1244,21 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--synthetic", action="store_true")
     sp = sub.add_parser("research", help="evaluate optional rules on real data before enabling them")
     sp.add_argument("topic", choices=["breaker", "sizing", "core", "note", "oos-fetch", "oos-register", "oos-run",
-                                      "oos-show", "register", "protocols", "run", "record"],
+                                      "oos-show", "register", "protocols", "run", "record", "fidelity"],
                     help="breaker: the BTC volatility circuit breaker; sizing: the pre-registered open-risk budget "
                          "test; core: robustness of the core (reset timing, trend lengths) - reporting only; "
                          "note: annotate a recorded test (--id, --text); oos-fetch / oos-register / oos-run / "
                          "oos-show: the pre-2017 BTC out-of-sample test of the core, in that order; "
                          "register (--file) / run (--id) / record (--id --verdict --numbers): a protocol from the "
-                         "CLAUDE.md template, once each; protocols: every test in the ledger with trial counts")
+                         "CLAUDE.md template, once each; protocols: every test in the ledger with trial counts; "
+                         "fidelity (--fix): a fidelity fix's effect on learn's selection, recorded in the ledger")
     sp.add_argument("--id", default=None, help="the test id, e.g. sizing-open-risk-budget-v1")
     sp.add_argument("--file", default=None, help="register: the protocol (YAML or JSON, the CLAUDE.md template)")
     sp.add_argument("--verdict", choices=["pass", "fail", "inconclusive"], default=None,
                     help="record: the verdict, from the registered pass rule")
     sp.add_argument("--numbers", default=None, help="record: the metric and supporting numbers, as JSON")
     sp.add_argument("--text", default=None, help="note: the text to add")
+    sp.add_argument("--fix", default=None, help="fidelity: the fix's commit (compared with the commit before it)")
     sp.add_argument("--ratios", type=float, nargs="+", default=[2.0, 2.5, 3.0])
     sp.add_argument("--capital", type=float, default=1000.0, help="sizing: account size")
     sp.add_argument("--days", type=int, default=3200, help="sizing: daily history for the core")

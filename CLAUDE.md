@@ -167,7 +167,10 @@ Everything else: do.
   `learn` refuse there). Code reaches `~/tradebot` only through gate 1; nothing is edited there.
 - **Fidelity fixes** make the backtest model what live does. Each is followed by a frozen rerun
   on the reference universe file and a ledger note (`research note --id ... --text ...`) on every
-  recorded result it affects.
+  recorded result it affects. A fidelity fix applies to every use of the backtest, learn included
+  (the owner's, 2026-10-14). A selection change it causes is recorded in the ledger (`tradebot
+  research fidelity --fix <commit>`: learn's selection on the weekly reference's frozen data, with
+  the code before the fix and with it) and leads the Monday summary; it is not a stop-and-ask.
 - **Research discipline.** New rules are judged on untouched data. One run per protocol. Every
   variant tried is a trial in the ledger, failures included, and results are reported with the
   number of trials. Never pick the best variant out of a sensitivity or robustness report. Swings

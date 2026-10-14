@@ -166,6 +166,16 @@ when it is registered. `tradebot research note --id <test> --text "..."` annotat
 (for example, how it was run). The note is appended to `research/ledger.jsonl`, and the recorded
 result is never edited.
 
+A fidelity fix (the backtest made to model what live does) applies to every use of the backtest,
+learn's strategy selection included. `tradebot research fidelity --fix <commit>` runs learn's
+selection on the weekly reference's frozen data (its coins and data end; candles the cache lacks
+are fetched, never saved) twice, with the code just before the fix and with the fix (each from a
+clean copy of its commit, side by side, about a minute). It prints the coins each timeframe had,
+what each strategy/timeframe scores either way, and records the difference in the ledger, once
+per fix; a filter switched on or off for a selected strategy counts as a change. It isn't a test
+(nothing is chosen on it). The first weekly check-in after the fix is deployed (gate 1) leads with
+a change.
+
 The satellite is replayed as one account, the way the live bot trades it: every signal of the
 selected strategies is a candidate. A signal is skipped if its coin is already held, or if the
 slots (or the open-risk budget) are full. A position holds its slot until it is flat, which is the close of
@@ -571,6 +581,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot gate drawdown [--set-limits --reference f --paper-from t] [--notify]` | the drawdown limits (set once) and the daily check: on a hit, reconcile and range check |
 | `tradebot research register --file p.yaml` → `run --id` → `record --id --verdict --numbers` | a registered test from the CLAUDE.md template: registered, run and recorded once each; three a quarter, each on its own untouched reserve; a pass holds on each half of the period |
 | `tradebot research protocols` | every test in the ledger, with the trial count |
+| `tradebot research fidelity --fix <commit> [--universe-file f]` | a fidelity fix's effect on learn's selection (the commit before it vs the fix, on the weekly reference's frozen data), recorded in the ledger; the first weekly check-in after its deploy leads with a change |
 | `tradebot notify --text "..."` (or `--file`) | a Telegram message to the owner |
 | `tradebot telegram-test` | Telegram setup helper |
 | `tradebot demo` | offline demo on synthetic data |
@@ -629,9 +640,10 @@ tradebot/
   reconcile.py    paper vs backtest, trade by trade (signals, slots, fills, core, uptime)
   weekly.py       the weekly check-in, its STATUS.md entry and Telegram summary
   protocols.py    registered tests: template check, register, run once, record once, trial counts
+  fidelity.py     a fidelity fix's effect on learn's selection (the commit before vs the fix), for the ledger
   gates/          same-trades replay (fixed dataset + golden orders), deploy gate, drawdown gate
 scripts/          weekly.sh (Monday), daily.sh (drawdown gate), backup.sh (nightly), install-cron.sh
-tests/            293 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            404 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 CLAUDE.md         rules for the agent working on this repo (hard rules, the gates, protocol template, when to ask)
 BACKLOG.md        open work with acceptance criteria; STATUS.md: one entry per session or week
