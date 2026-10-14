@@ -1,17 +1,21 @@
 """Bar-by-bar trade simulation shared by backtests, ML labelling and selection.
 
-Execution model (kept deliberately conservative):
+Execution model (conservative where the candles can't tell, otherwise live's rules):
   * a signal is generated on the close of bar i; the order fills at the open of
     bar i+1 plus slippage - or, with limit entries, a buy limit rests at bar i's close
     for one bar and fills (at that price, maker fee, no slippage) only if bar i+1
     trades THROUGH it; otherwise the trade is missed;
   * if bar i+1 already gaps past the stop or target, the trade is skipped;
-  * if the stop and target are both inside the same bar, the STOP wins;
+  * a bar that opens beyond the stop or the target exits at that open (the open comes first);
+    after the open, if the stop and the target are both inside the same bar, the STOP wins;
   * a stop that gaps is filled at the (worse) open price;
-  * the take-profit is a market sell the bot sends when it SEES the price at the
-    target. A bar's high may be a brief wick the bot never saw, so the target only
-    counts when the bar closes at or beyond it (filled at the target less slippage).
-    This is deliberately pessimistic: live, the bot also catches some wicks;
+  * the take-profit is a touch: a bar that reaches the target exits there, less slippage.
+    Paper sells when its 30-second poll sees the price at the target, and so does live once
+    the stop has first moved (breakeven at +1R, before any target in practice; until then an
+    exchange trigger). The one optimistic element: a spike beyond the target shorter than a
+    poll is counted here and missed by both (17 of 99 such exits on the 2026-10-13 reference,
+    measured with 1-minute candles). A limit entry's own bar needs a close beyond the target;
+    ``target_on_close`` models a bot that looks once per bar (tests on hourly prices);
   * breakeven: once a bar trades +1R the stop moves to entry for later bars, and if
     that same bar closes back at/below entry the trade exits at the close (the close
     is observed after the high);
@@ -80,9 +84,9 @@ class Trade:
     signal_rr: float = 0.0  # reward:risk at the signal close - how the live bot ranks same-time signals
     protected_time: pd.Timestamp | None = None  # when the stop reached entry (None: never)
     signal_volume: float = 0.0  # quote volume of the 24h up to the signal close (known then; live ranks ties by it)
-    exit_at: str = "close"  # "open" (gapped through the stop), "intrabar" (stop touched) or "close"
+    exit_at: str = "close"  # "open" (gapped beyond the stop or target), "intrabar" (one touched) or "close"
     # when the position is flat and its slot is free: the exit bar's close, its open for a gap
-    # through the stop, or (refine_flat_times) the close of the finer candle that touched the stop.
+    # beyond the stop or target, or (refine_flat_times) the close of the finer candle that touched it.
     # None (hand-built trades): exit_time
     flat_time: pd.Timestamp | None = None
     # the notional as a fraction of the satellite's equity when it is known (a paper position seeding a
@@ -121,7 +125,11 @@ def simulate_trade(
     costs: Costs,
     breakeven_at_r: float = 0.0,
     trail: float = 0.0,
+    target_on_close: bool = False,
 ) -> TradeOutcome | None:
+    """One trade from the bar after ``signal_idx``. ``target_on_close``: count the target only when
+    a candle closes beyond it - what a bot that looks once per candle sees (tests of the live loop on
+    hourly prices); the default is live's touch rule."""
     n = len(c)
     e = signal_idx + 1
     if e >= n:
@@ -157,25 +165,40 @@ def simulate_trade(
     exit_idx, exit_price, reason, exit_at = last, c[last], "", "close"
     for j in range(e, last + 1):
         stop_reason = _stop_reason(at_breakeven, long, stop, entry)
+        # the target is a touch rule: paper's poll every 30 s (and live's, once the stop has moved) sells
+        # once it sees the price there; a spike shorter than a poll is the one thing counted here and
+        # missed live. The order inside a candle is unknown: its open comes first (a gap beyond the stop
+        # or the target fills there); after that, when the stop and the target share the candle the stop
+        # wins. A limit entry's own candle needs a close beyond the target (its high may have come before
+        # the fill); so does every candle with target_on_close (a bot that looks once per candle).
+        on_close = target_on_close or (j == e and costs.limit_entry)
+        touched = ((c[j] >= tp) if long else (c[j] <= tp)) if on_close else ((h[j] >= tp) if long else (lows[j] <= tp))
+        tp_at = "close" if on_close else "intrabar"  # a close-decided exit holds its slot to the close
         if long:
             if j > e and o[j] <= stop:
                 exit_idx, exit_price, reason, exit_at = j, o[j] * (1 - slip), stop_reason, "open"
                 break
+            if j > e and o[j] >= tp and not target_on_close:
+                exit_idx, exit_price, reason, exit_at = j, o[j] * (1 - slip), "take_profit", "open"
+                break
             if lows[j] <= stop:
                 exit_idx, exit_price, reason, exit_at = j, stop * (1 - slip), stop_reason, "intrabar"
                 break
-            if c[j] >= tp:
-                exit_idx, exit_price, reason = j, tp * (1 - slip), "take_profit"
+            if touched:
+                exit_idx, exit_price, reason, exit_at = j, tp * (1 - slip), "take_profit", tp_at
                 break
         else:
             if j > e and o[j] >= stop:
                 exit_idx, exit_price, reason, exit_at = j, o[j] * (1 + slip), stop_reason, "open"
                 break
+            if j > e and o[j] <= tp and not target_on_close:
+                exit_idx, exit_price, reason, exit_at = j, o[j] * (1 + slip), "take_profit", "open"
+                break
             if h[j] >= stop:
                 exit_idx, exit_price, reason, exit_at = j, stop * (1 + slip), stop_reason, "intrabar"
                 break
-            if c[j] <= tp:
-                exit_idx, exit_price, reason = j, tp * (1 + slip), "take_profit"
+            if touched:
+                exit_idx, exit_price, reason, exit_at = j, tp * (1 + slip), "take_profit", tp_at
                 break
         if exit_flags is not None and exit_flags[j]:
             exit_idx, exit_price, reason = j, c[j] * (1 - sign * slip), "exit_signal"
@@ -250,7 +273,7 @@ def _prepared(pop: pd.DataFrame, timeframe: str) -> dict:
 
 
 def _trade_at(p: dict, i: int, strategy: Strategy, costs: Costs, symbol: str, timeframe: str, allow_short: bool,
-              breakeven_at_r: float, min_reward_risk: float) -> tuple[Trade | None, bool]:
+              breakeven_at_r: float, min_reward_risk: float, target_on_close: bool = False) -> tuple[Trade | None, bool]:
     """The trade a signal on bar ``i`` makes if it is taken -> (trade or None, was there a signal)."""
     o, h, lo, c = p["ohlc"]
     go_long = bool(p["el"][i])
@@ -262,7 +285,7 @@ def _trade_at(p: dict, i: int, strategy: Strategy, costs: Costs, symbol: str, ti
     if reward_risk(side, c[i], sl, tp) < min_reward_risk:
         return None, False
     out = simulate_trade(o, h, lo, c, p["xl"] if go_long else p["xs"], i, side, sl, tp,
-                         strategy.max_hold_bars, costs, breakeven_at_r, p["trail"][i])
+                         strategy.max_hold_bars, costs, breakeven_at_r, p["trail"][i], target_on_close)
     if out is None:
         return None, True
     idx, bar, vol = p["idx"], p["bar"], p["vol24"][i]
@@ -305,15 +328,18 @@ def backtest_populated(
     min_reward_risk: float = 0.0,
     start_idx: int | None = None,
     end_idx: int | None = None,
+    target_on_close: bool = False,
 ) -> list[Trade]:
     """Sequential (one position at a time) backtest over an already-populated frame: the
-    strategy on its own, as selection scores it. Account replays use ``candidate_trades``."""
+    strategy on its own, as selection scores it. Account replays use ``candidate_trades``.
+    ``target_on_close``: see simulate_trade."""
     p = _prepared(pop, timeframe)
     i = strategy.warmup if start_idx is None else max(start_idx, strategy.warmup)
     end = p["n"] - 1 if end_idx is None else min(end_idx, p["n"] - 1)
     trades: list[Trade] = []
     while i < end:
-        t, _ = _trade_at(p, i, strategy, costs, symbol, timeframe, allow_short, breakeven_at_r, min_reward_risk)
+        t, _ = _trade_at(p, i, strategy, costs, symbol, timeframe, allow_short, breakeven_at_r, min_reward_risk,
+                         target_on_close)
         if t is None:
             i += 1
             continue
@@ -355,10 +381,10 @@ def flat_at(t: Trade) -> pd.Timestamp:
 
 
 def refine_flat_times(trades: list[Trade], datasets: dict[str, dict[str, pd.DataFrame]], slippage: float) -> None:
-    """A stop touched inside a long candle (a 1d trade) freed its slot when it was touched, not at
-    the candle's close: where a shorter timeframe of the same coin is loaded, find the first of its
-    candles that reached the stop and free the slot at that candle's close (when the next scan of
-    that timeframe could use it)."""
+    """A stop or target touched inside a long candle (a 1d trade) freed its slot when it was touched,
+    not at the candle's close: where a shorter timeframe of the same coin is loaded, find the first of
+    its candles that reached the level and free the slot at that candle's close (when the next scan
+    of that timeframe could use it)."""
     by_tf = sorted(datasets, key=tf_ms)
     for t in trades:
         if t.exit_at != "intrabar":
@@ -371,7 +397,10 @@ def refine_flat_times(trades: list[Trade], datasets: dict[str, dict[str, pd.Data
         part = df.iloc[df.index.searchsorted(t.exit_time):df.index.searchsorted(t.exit_time + pd.Timedelta(milliseconds=bar))]
         long = t.side == "long"
         level = t.exit_price / (1 - slippage) if long else t.exit_price / (1 + slippage)
-        hit = part["low"] <= level * (1 + 1e-9) if long else part["high"] >= level * (1 - 1e-9)
+        if t.reason == "take_profit":  # the target is above a long's price, below a short's
+            hit = part["high"] >= level * (1 - 1e-9) if long else part["low"] <= level * (1 + 1e-9)
+        else:
+            hit = part["low"] <= level * (1 + 1e-9) if long else part["high"] >= level * (1 - 1e-9)
         if hit.any():
             t.flat_time = hit.idxmax() + pd.Timedelta(milliseconds=tf_ms(finer))
 

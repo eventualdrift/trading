@@ -169,8 +169,9 @@ result is never edited.
 The satellite is replayed as one account, the way the live bot trades it: every signal of the
 selected strategies is a candidate. A signal is skipped if its coin is already held, or if the
 slots (or the open-risk budget) are full. A position holds its slot until it is flat, which is the close of
-its exit candle. There are two exceptions: a gap through the stop frees the slot at that candle's
-open, and a stop touched inside a daily candle frees it at the close of the 4h candle that touched it.
+its exit candle. There are two exceptions: a gap through the stop or beyond the target frees the slot
+at that candle's open, and a stop or target touched inside a daily candle frees it at the close of
+the 4h candle that reached it.
 (Before this version each strategy was first replayed on its own, one trade at a time, so a
 trade the account then skipped still blocked that coin's next signals, and a slot was freed at
 the open of the exit candle. The reconciliation found both. Results recorded before then used
@@ -642,20 +643,27 @@ DEPLOY.md         moving the bot to an always-on Linux box
 - Live trading is **spot, long-only**. Shorts only exist in paper/signal mode (`allow_short: true`).
 - Live execution is tested against a simulated exchange that mimics each venue's order routing,
   not against the real exchanges. **Run on the testnet before real money.**
-- Backtests are deliberately pessimistic: the stop wins when stop and target share a candle, a
-  take-profit only counts when the candle closes beyond the target (wicks don't), and all exits
-  pay slippage. They can't model order-book depth on small coins.
+- Backtests lean pessimistic where the candles can't tell: the stop wins when stop and target share
+  a candle (after its open), and all exits pay slippage. One element is optimistic: a spike beyond
+  the target shorter than the bot's 30-second poll counts as a take-profit in the backtest and is
+  missed live and in paper (17 of the 99 target exits the touch rule added on the reference,
+  measured with 1-minute candles, 2026-10-13). They can't model order-book depth on small coins.
 - How exits are executed, backtest vs live/paper. The backtest checks each candle of the
   trade's timeframe. A stop touched inside it fills at the stop less slippage (0.05%), or at the
   open if the candle opened beyond it. This holds for breakeven and trailing stops too. A target
-  needs a close beyond it. Exit signals and time stops fill at the close. Live and paper check
-  every poll (30 s), replaying each completed 1-minute candle since the last check:
+  touched inside the candle fills at the target less slippage, or at the open if the candle opened
+  beyond it: live's rule (since 2026-10-13; before, the backtest needed a close beyond the
+  target). Exit signals and time stops fill at the close. Live and paper check every poll (30 s),
+  replaying each completed 1-minute candle since the last check:
   - The original stop (an exchange stop-market order in live) fills at the stop, or at the
     1-minute open if it gapped, like the backtest.
   - Breakeven and trailing stops: the bot moves its level when a 1-minute candle reaches it. In
     paper it sells at the price when it looks; on the exchange (testnet) the stop order itself is
     moved there in one request, so it fires while the bot is down too.
-  - The take-profit sells as soon as the current price is beyond the target, not at a close.
+  - The take-profit sells as soon as the current price is beyond the target, not at a close. In
+    paper it is the bot's poll. On the exchange (testnet) it is a trigger order only until the stop
+    first moves, and that move (breakeven at +1R) comes before any target in practice, so live
+    takes profit by the same poll. The trigger counts only while the bot is down before that move.
 
   While the bot runs, these exits sell within about a minute of the level. After downtime (a
   sleeping laptop) they sell at the price on waking, which can be far worse. The original stop

@@ -24,6 +24,25 @@ def selection():
     return Selection(0.0, [ComboResult("breakout", "1h", {}, {}, {}, 1, 1.0, True)])
 
 
+@pytest.fixture(autouse=True)
+def hourly_bot_sees_targets_at_closes(monkeypatch):
+    """The paper bots here run on hourly synthetic prices, so they see a target only at a candle's
+    close; the replay they are reconciled with counts it the same way. (The real bot polls every
+    30 s, which the backtest's default touch rule models, a spike shorter than a poll aside.)"""
+    import inspect
+
+    from tradebot.backtest import engine
+
+    real = engine.simulate_trade
+
+    def on_close(*args, **kwargs):
+        bound = inspect.signature(real).bind(*args, **kwargs)
+        bound.arguments["target_on_close"] = True
+        return real(*bound.args, **bound.kwargs)
+
+    monkeypatch.setattr(engine, "simulate_trade", on_close)
+
+
 @pytest.fixture(scope="module")
 def paper_run(tmp_path_factory):
     """A paper bot on synthetic candles for two weeks with one slot, so slots are contested."""

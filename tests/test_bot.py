@@ -548,9 +548,11 @@ def test_live_loop_matches_backtest(cfg):
     expected = {}
     for sym in market.symbols:
         df = market.fetch_ohlcv_df(sym, "1h", limit=100_000)
+        # this bot looks once an hour, so it sees a target only at a close; the real one polls every
+        # 30 s, which the backtest's default touch rule models (a spike shorter than a poll aside)
         for t in backtest_populated(strat.populate(df), strat, Costs(), symbol=sym,
                                     breakeven_at_r=cfg.risk.breakeven_at_r,
-                                    min_reward_risk=cfg.risk.min_reward_risk):
+                                    min_reward_risk=cfg.risk.min_reward_risk, target_on_close=True):
             sig_ms = int(t.signal_time.value // 1_000_000)
             first_scan = (start // hour + 1) * hour  # the bot's first candle close
             if t.reason == "end_of_data":  # still open when the simulation stopped

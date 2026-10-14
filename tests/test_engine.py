@@ -75,10 +75,47 @@ def test_breakeven_stop():
     assert run(rows, be=0.0).reason == "end_of_data"
 
 
-def test_target_wick_that_reverses_is_not_a_fill():
-    """Review: open 100, high 111, close 100 - a polling bot would likely never see 110."""
+def test_a_wick_through_the_target_is_a_fill_at_the_target():
+    """Live's rule: the exchange's take-profit trigger, and paper's poll every 30 s, sell once the
+    price trades at the target - a candle that reaches it and closes back below is an exit there."""
     out = run(BASE + [(100, 111, 99.5, 100), (100, 100.5, 99.5, 100)], max_hold=10)
-    assert out.reason != "take_profit"
+    assert out.reason == "take_profit" and out.exit_idx == 2 and out.exit_at == "intrabar"
+    assert out.exit_price == pytest.approx(110 * (1 - 0.0005))
+    short = run(BASE + [(100, 100.5, 89, 100)], side="short", sl=105, tp=90)
+    assert short.reason == "take_profit" and short.exit_price == pytest.approx(90 * (1 + 0.0005))
+
+
+def test_a_bot_that_looks_once_per_candle_sees_the_target_only_at_a_close():
+    df = bars(BASE + [(100, 111, 99.5, 100), (100, 110.5, 99.5, 110.2)])
+    o, h, lows, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    out = simulate_trade(o, h, lows, c, None, 0, "long", 95.0, 110.0, 10, COSTS, target_on_close=True)
+    assert out.reason == "take_profit" and out.exit_idx == 3  # the wick on bar 2 is not seen
+    assert out.exit_at == "close"  # decided at the close: the slot is held to it
+
+
+def test_a_gap_beyond_the_target_fills_at_the_open():
+    out = run(BASE + [(113, 114, 112, 113)])
+    assert out.reason == "take_profit" and out.exit_at == "open"
+    assert out.exit_price == pytest.approx(113 * (1 - 0.0005))
+
+
+def test_the_stop_wins_when_the_target_and_the_stop_share_a_candle_but_the_open_comes_first():
+    assert run(BASE + [(101, 111, 94, 100)]).reason == "stop_loss"  # the order inside is unknown: the stop
+    out = run(BASE + [(112, 113, 94, 100)])  # opened beyond the target: sold at the open, before any fall
+    assert out.reason == "take_profit" and out.exit_at == "open"
+
+
+def test_a_limit_entrys_own_candle_needs_a_close_beyond_the_target():
+    """The high of the candle a limit order filled in may have come before the fill."""
+    limit = Costs(fee_rate=0.001, slippage_rate=0.0005, limit_entry=True)
+    df = bars([(100, 101, 99, 100), (100, 111, 99, 100), (100, 111, 99.5, 100)])
+    o, h, lows, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    out = simulate_trade(o, h, lows, c, None, 0, "long", 95.0, 110.0, 10, limit)
+    assert out.reason == "take_profit" and out.exit_idx == 2  # not on the fill's own candle
+    df = bars([(100, 101, 99, 100), (100, 111, 99, 110.5)])  # the fill's candle closes beyond the target
+    o, h, lows, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    out = simulate_trade(o, h, lows, c, None, 0, "long", 95.0, 110.0, 10, limit)
+    assert out.reason == "take_profit" and out.exit_idx == 1 and out.exit_at == "close"
 
 
 def test_breakeven_bar_closing_below_entry_exits_at_close():
@@ -229,11 +266,16 @@ def test_flat_time_says_when_the_slot_is_free():
     hour = np.timedelta64(1, "h")
     for exit_bar, exit_at, extra in (((101, 103, 94, 100), "intrabar", 1),  # stop touched inside the candle
                                      ((90, 91, 89, 90), "open", 0),  # gapped through the stop at the open
-                                     ((101, 111, 100, 110), "close", 1)):  # target: decided at the close
+                                     ((101, 111, 100, 110), "intrabar", 1),  # target touched inside it
+                                     ((112, 113, 111, 112), "open", 0)):  # gapped beyond the target
         pop, _ = _pop([FLAT, FLAT, exit_bar, FLAT], [0])
         (t,) = backtest_populated(pop, _Strat(), COSTS, symbol="A", timeframe="1h")
         assert t.exit_at == exit_at and t.exit_time == pop.index[2]
         assert t.flat_time == pop.index[2] + extra * hour
+    pop, _ = _pop([FLAT, FLAT, (101, 102, 100, 101.5), FLAT], [0])
+    pop.loc[pop.index[2], "exit_long"] = True  # an exit signal: decided at the close
+    (t,) = backtest_populated(pop, _Strat(), COSTS, symbol="A", timeframe="1h")
+    assert t.reason == "exit_signal" and t.exit_at == "close" and t.flat_time == pop.index[2] + hour
 
 
 def test_candidates_include_signals_the_strategy_alone_would_skip():
@@ -296,3 +338,18 @@ def test_a_stop_inside_a_daily_candle_frees_the_slot_at_the_finer_candle():
                 freq="4h")  # the 4h candle from 2024-01-03 04:00 reaches the stop
     refine_flat_times([t], {"1d": {"A": pop}, "4h": {"A": four}}, COSTS.slippage_rate)
     assert t.flat_time == pd.Timestamp("2024-01-03 08:00", tz="UTC")
+
+
+def test_a_target_inside_a_daily_candle_frees_the_slot_at_the_finer_candle_that_reached_it():
+    import pandas as pd
+
+    from tradebot.backtest.engine import backtest_populated, refine_flat_times
+
+    day = [FLAT, FLAT, (100, 111, 99, 104), FLAT]  # target (110) touched on day 2, closed below it
+    pop, _ = _pop(day, [0], start="2024-01-01", freq="1D")
+    (t,) = backtest_populated(pop, _Strat(), COSTS, symbol="A", timeframe="1d")
+    assert t.reason == "take_profit" and t.exit_at == "intrabar"
+    four = bars([(100, 101, 99, 100)] * 14 + [(100, 110.5, 99.5, 104)] + [(104, 105, 103, 104)] * 3,
+                start="2024-01-01", freq="4h")  # the 4h candle from 2024-01-03 08:00 reaches 110
+    refine_flat_times([t], {"1d": {"A": pop}, "4h": {"A": four}}, COSTS.slippage_rate)
+    assert t.flat_time == pd.Timestamp("2024-01-03 12:00", tz="UTC")  # not the first 4h candle (its low)
