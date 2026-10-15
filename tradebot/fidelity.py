@@ -257,5 +257,5 @@ def deployed_in(state_dir, fix: str) -> dict | None:
 def lead_line(e: dict, deploy: dict) -> str:
     """The Monday summary's first line for a deployed fix that changes learn's selection."""
     return (f"fidelity fix {e['fix'][:7]} ({e['subject']}) changes learn's selection on the frozen reference: "
-            f"{change_text(e)} (ledger {e['id']}; deployed {deploy['at'][:16]} UTC in {deploy['commit']}: learn picks "
-            f"with it from its first weekly run after that)")
+            f"{change_text(e)} (ledger {e['id']}; deployed in {deploy['commit']} by the gate run started "
+            f"{deploy['at'][:16]} UTC: learn picks with it from its first weekly run after that)")

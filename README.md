@@ -643,7 +643,7 @@ tradebot/
   fidelity.py     a fidelity fix's effect on learn's selection (the commit before vs the fix), for the ledger
   gates/          same-trades replay (fixed dataset + golden orders), deploy gate, drawdown gate
 scripts/          weekly.sh (Monday), daily.sh (drawdown gate), backup.sh (nightly), install-cron.sh
-tests/            404 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            410 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 CLAUDE.md         rules for the agent working on this repo (hard rules, the gates, protocol template, when to ask)
 BACKLOG.md        open work with acceptance criteria; STATUS.md: one entry per session or week

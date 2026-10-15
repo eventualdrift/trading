@@ -82,7 +82,7 @@ def test_a_fix_is_recorded_once_and_is_not_a_trial(tmp_path):
     line = fidelity.lead_line(entry, DEPLOY)
     assert line.startswith("fidelity fix 48d1c02 (Backtest: the take-profit is a touch) changes learn's selection")
     assert "added breakout@4h" in line and "ledger fidelity-48d1c02" in line
-    assert "deployed 2026-10-14 23:40 UTC in 51c0a0b" in line
+    assert "deployed in 51c0a0b by the gate run started 2026-10-14 23:40 UTC" in line
 
 
 def test_deployed_in_finds_the_first_deploy_that_contains_the_fix(tmp_path, monkeypatch):

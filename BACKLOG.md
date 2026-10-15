@@ -23,6 +23,9 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   most, the backtest on the full history. Signals reported as "scanned, live found no signal" (and
   paper-only "entry condition false on the full history") measure the difference.
   - Counts only weeks with uptime above 95%.
+  - The report does the comparison since 45a30ab: each signal only one side had is re-checked on the
+    candles the scan had, and the row says whether live's candle window explains it; the weekly
+    summary counts them. What's left is the four weeks.
   - Done when: for each such signal over four such weeks, the report compares the entry condition
     on candles cut like the scanner's with the backtest's, and says whether truncation explains it.
     A fix on the backtest side is a fidelity fix; anything on the live side is a stop-and-ask.
