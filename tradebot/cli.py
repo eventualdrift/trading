@@ -694,6 +694,55 @@ def _reconcile_run(cfg, since_ms: int | None, end_ms: int | None, synthetic: boo
     return rec, format_reconciliation(rec, cfg)
 
 
+def cmd_universe_history(args, cfg):
+    """A point-in-time universe from Binance's archive of daily candles, delisted coins included
+    (reporting only: a verdict that uses it is a registered protocol)."""
+    import pandas as pd
+
+    from . import pit_universe as pit
+    from .data import OHLCVStore
+    from .provenance import code_version, config_hash, settings_snapshot
+    from .universe import load_universe
+
+    if (cfg.exchange.data_exchange_id or cfg.exchange.id) != "binance":
+        sys.exit("The archive is Binance's: this needs exchange.id binance.")
+    q, u = cfg.exchange.quote, cfg.universe
+    through = args.through or pit.latest_month(q)
+    end = pd.Period(through, "M").end_time.strftime("%Y-%m-%d")
+    pairs = pit.archive_pairs(q)
+    print(f"{len(pairs)} {q} pairs in Binance's archive (delisted included); daily candles through {through} "
+          f"(kept in {Path(cfg.data.dir) / 'binance-archive'})...", flush=True)
+    try:
+        daily = pit.fetch_all(OHLCVStore(cfg.data.dir, "binance-archive"), pairs, through, log_fn=print)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+    uni = pit.build(daily, top_n=u.top_n, min_quote_volume=u.min_quote_volume,
+                    min_history_days=u.min_history_days, start=args.start, end=end)
+    out = args.out or f"reports/universe-pit-{args.start}-{through}.json"
+    meta = {"source": "data.binance.vision, spot monthly daily candles", "pairs_in_archive": len(pairs),
+            "rule": {"quote": q, "top_n": u.top_n, "min_quote_volume": u.min_quote_volume,
+                     "min_history_days": u.min_history_days, "ranked_on": "the previous UTC day's quote volume",
+                     "excluded": "stablecoins, pegged (a daily range under 0.3%), leveraged tokens: the live rule",
+                     "historical_pegged": sorted(pit.HISTORICAL_PEGGED), "renames": pit.RENAMES,
+                     "listed_check": "a candle in the 3 days up to the day minus min_history_days, among the top "
+                                     "2 x top_n"},
+            "start": args.start, "end": end, "code": code_version(), "settings": config_hash(settings_snapshot(cfg))}
+    pit.save(out, uni, meta)
+    today = load_universe(args.compare)["symbols"] if args.compare else None
+    sizes = [len(v) for v in uni["days"].values()]
+    print(f"Point-in-time universe {args.start} to {end}: top {u.top_n} {q} pairs by the previous day's volume, "
+          f"traded for at least {u.min_history_days:g} days; {len(uni['listed'])} pairs with candles, "
+          f"{sum(1 for v in uni['days'].values() if len(v) < u.top_n)} of {len(sizes)} days with fewer than "
+          f"{u.top_n} eligible")
+    if today:
+        print(f"Compared with {args.compare}: its {len(today)} coins are 'the list today' below.")
+    print(pit.format_survivorship(pit.survivorship(uni, today), "the list today" if today else None))
+    if uni["reused"]:
+        print("Tickers the archive files two coins under (never splice their candles across the gap): "
+              + "; ".join(f"{p} {', '.join(g)}" for p, g in uni["reused"].items()))
+    print(f"Saved {out} (reporting only: a verdict that uses it is a registered protocol)")
+
+
 def cmd_reconcile(args, cfg):
     import pandas as pd
 
@@ -1280,6 +1329,12 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--csv", default=None, help="also write every signal's row to this CSV file")
     sp = sub.add_parser("config-set", help="change settings in the config file (keeps comments, makes a backup)")
     sp.add_argument("assignments", nargs="+", metavar="key=value", help="e.g. costs.fee_rate=0.00075 core.fraction=0.65")
+    sp = sub.add_parser("universe-history", help="the universe rule on each past day, delisted coins included, from "
+                                                 "Binance's archive (reporting only)")
+    sp.add_argument("--start", default="2018-01-01", help="first UTC day")
+    sp.add_argument("--through", default=None, help="last month, YYYY-MM (default: the last complete month)")
+    sp.add_argument("--out", default=None, help="the universe file (default: reports/universe-pit-<start>-<through>.json)")
+    sp.add_argument("--compare", default=None, help="a universe file whose coin list to compare with (today's list)")
     sp = sub.add_parser("reconcile", help="paper vs backtest, trade by trade (reporting only)")
     sp.add_argument("--since", default=None, help="start of the paper period (default: its first record)")
     sp.add_argument("--end", default=None, help="freeze the candles at this UTC time (default: the last full hour)")
@@ -1341,6 +1396,7 @@ def main(argv: list[str] | None = None) -> None:
         "run": cmd_run, "report": cmd_report, "project": cmd_project, "research": cmd_research,
         "portfolio-backtest": cmd_portfolio_backtest, "dashboard": cmd_dashboard,
         "compare-entries": cmd_compare_entries, "config-set": cmd_config_set, "reconcile": cmd_reconcile,
+        "universe-history": cmd_universe_history,
         "weekly": cmd_weekly, "gate": cmd_gate, "notify": cmd_notify, "testnet": cmd_testnet,
         "telegram-test": cmd_telegram_test,
         "demo": cmd_demo,

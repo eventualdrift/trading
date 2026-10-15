@@ -149,6 +149,17 @@ to be read before the protocol is registered. `oos-show` prints the recorded res
 notes added later by `tradebot research note --id core-btc-pre2017-v1 --text "..."` (a note
 never changes the result).
 
+**Survivorship.** "Today's top 30" flatters every backtest: coins that collapsed or were
+delisted since aren't in it. `tradebot universe-history` builds the list the universe rule would
+have picked on each past day, delisted coins included, from Binance's public archive of daily
+candles (every USDT pair it ever listed). It ranks on the previous day's volume, takes the first
+2 x 30, keeps those that traded a year earlier, and excludes stable, pegged and leveraged tokens,
+as live does. It prints per year how many coins were in the list, how many have stopped trading
+since (renamed coins counted apart), and how many aren't in a given universe file's list. The
+saved file (`reports/universe-pit-<start>-<through>.json`) is reporting only: a verdict that uses
+it is a registered protocol. Tickers the archive files two coins under (Terra's LUNA and the new
+LUNA) are flagged there; never splice their candles.
+
 **Reproducible runs.** The coin list is "today's top 30", so it drifts from hour to hour, and a
 backtest run later can differ. Each `portfolio-backtest` prints its full coin list and data end
 date, and saves both to `reports/universe-<date>.json`, with the whole strategy selection:
@@ -581,6 +592,7 @@ Each instance needs its own `state_dir` and dashboard port. They can share the p
 | `tradebot gate drawdown [--set-limits --reference f --paper-from t] [--notify]` | the drawdown limits (set once) and the daily check: on a hit, reconcile and range check |
 | `tradebot research register --file p.yaml` → `run --id` → `record --id --verdict --numbers` | a registered test from the CLAUDE.md template: registered, run and recorded once each; three a quarter, each on its own untouched reserve; a pass holds on each half of the period |
 | `tradebot research protocols` | every test in the ledger, with the trial count |
+| `tradebot universe-history [--start d] [--through YYYY-MM] [--compare universe-file]` | the universe rule on each past day, delisted coins included, from Binance's archive; survivorship per year (reporting only) |
 | `tradebot research fidelity --fix <commit> [--universe-file f]` | a fidelity fix's effect on learn's selection (the commit before it vs the fix, on the weekly reference's frozen data), recorded in the ledger; the first weekly check-in after its deploy leads with a change |
 | `tradebot notify --text "..."` (or `--file`) | a Telegram message to the owner |
 | `tradebot telegram-test` | Telegram setup helper |
@@ -641,9 +653,10 @@ tradebot/
   weekly.py       the weekly check-in, its STATUS.md entry and Telegram summary
   protocols.py    registered tests: template check, register, run once, record once, trial counts
   fidelity.py     a fidelity fix's effect on learn's selection (the commit before vs the fix), for the ledger
+  pit_universe.py the universe rule on each past day from Binance's archive, delisted coins included
   gates/          same-trades replay (fixed dataset + golden orders), deploy gate, drawdown gate
 scripts/          weekly.sh (Monday), daily.sh (drawdown gate), backup.sh (nightly), install-cron.sh
-tests/            410 tests: look-ahead checks, live-vs-backtest parity (signals and core),
+tests/            419 tests: look-ahead checks, live-vs-backtest parity (signals and core),
                   a fake exchange with trigger-order routing, partial fills, races and timeouts
 CLAUDE.md         rules for the agent working on this repo (hard rules, the gates, protocol template, when to ask)
 BACKLOG.md        open work with acceptance criteria; STATUS.md: one entry per session or week
