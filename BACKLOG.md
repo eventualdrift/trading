@@ -52,15 +52,12 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   With every signal counted, taken (+0.074R) and skipped for lack of room (+0.078R) are equal on
   average, and momentum@1d's taken equal its skipped; only breakout@1d (23 taken) shows a gap. Much
   of what motivated the idea came from the old candidate construction.
-- [ ] **Point-in-time universe** - the backtests use today's most traded coins, which flatters the
-  satellite (survivorship). Done when: a universe built from volume ranks as of each date
-  (including delisted coins) exists, and any use of it in a verdict goes through a registered
-  protocol.
-- [ ] **The universe rule's leveraged-token filter also drops JUP** (found 2026-10-14): it excludes
-  every base ending in UP, DOWN, BULL or BEAR (`data/exchange.py: LEVERAGED`), and of the 757 USDT
-  pairs Binance ever listed, the one real coin it catches is JUP (Jupiter, listed 2024). Binance's
-  leveraged tokens are delisted. Changing the filter changes what the bot can trade: a satellite
-  protocol on untouched data, not a fix.
+- [ ] **The universe rule's leveraged-token filter also drops JUP and SYRUP** (found 2026-10-14): it
+  excludes every base ending in UP, DOWN, BULL or BEAR (`data/exchange.py: LEVERAGED`). Of the 757
+  USDT pairs Binance ever listed, the real coins it catches are JUP (Jupiter) and SYRUP (Maple); the
+  leveraged tokens themselves stopped trading by 2024-02-28. With them allowed, JUP would have been
+  in the top 30 on 37 days since 2025-01 and SYRUP on 1. Changing the filter changes what the bot
+  can trade: a satellite protocol on untouched data, not a fix.
 - [ ] **A social-attention signal** (the owner's item, 2026-10-13): X/Twitter mention volume or
   sentiment as an input. Not pursued until a priced historical source exists: there is no historical
   data at a sane price (full-archive search is Enterprise only; pay-per-use covers 7 days), about 14%
@@ -77,6 +74,12 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Done
 
+- [x] Point-in-time universe (survivorship): `tradebot universe-history` builds the universe rule's
+  list for each day since 2018 from Binance's archive, delisted coins included
+  (`reports/universe-pit-2018-01-01-2026-09.json`). Of the coins in the list at some point in 2021,
+  52 of 147 have stopped trading since (11% of member-days); in 2022, 104 of 252 (10%); renamed
+  coins counted apart. On 2026-09-27 it shares 27 of 30 coins with the reference's live-built list.
+  Any use of it in a verdict goes through a registered protocol. f4a6122
 - [x] The take-profit rule in the backtest (fidelity; the owner's decision 2026-10-14): a candle
   reaching the target exits there (an open beyond it at the open; the stop wins a shared candle after
   its open), as paper's 30-second poll sees it. Applied to every use of the backtest, learn included;

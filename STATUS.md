@@ -966,3 +966,67 @@ trading refused in code
    ones included); first run in progress.
 3. Monday 10-19: the first cron weekly, led by the take-profit rule's selection change.
 4. The `ml` protocol: paper has 15 of the 100 trades it needs after 2026-09-27.
+
+## 2026-10-15 - session (continued): the candle-window check deployed; a point-in-time universe
+
+Code 680f963 deployed (gate run started 00:20 UTC) · f4a6122 on the branch (agent-side reporting only) ·
+settings 75a58dc389 (unchanged)
+
+**What changed**
+- **The reconcile re-checks a signal only one side had on the scan's own candles** (45a30ab; BACKLOG
+  "Live vs backtest candle history").
+  - A backtest signal live scanned and didn't find, and a paper signal whose entry condition is false
+    on the full history, are evaluated again on the last 999 closed candles the scan had.
+  - The row says whether live's candle window explains it, and the weekly counts them. Those it
+    explains are no longer flagged as "live candles differ".
+  - Reviewed: 5 findings, 2 confirmed and fixed (a test with built candles now shows a long EMA
+    flipping the condition; the weekly flag), 3 refuted.
+  - Deployed through gate 1 as 680f963: same-trades identical, so the scanner's refactor changes
+    nothing. The item now waits for its four weeks above 95% uptime.
+- **A point-in-time universe** (f4a6122; BACKLOG "Later", now done). `tradebot universe-history`
+  builds the list the universe rule would have picked on each day since 2018. It uses Binance's
+  public archive: all 757 USDT pairs it ever listed, delisted ones included.
+  - The rule is applied as live does it: ranked on the previous day's volume; of the first 60, those
+    that traded a year earlier; stable, pegged and leveraged tokens out.
+  - Reviewed: 13 findings, 11 confirmed and fixed, 2 refuted. The fixes:
+    - URLs quoted (two pairs have Chinese names) and server errors retried;
+    - renames counted apart from delistings (MATIC -> POL, FTM -> S, EOS -> A and 13 more);
+    - historical stable or fiat tickers excluded (PAX, AUD, USDSB, BKRW, KGST);
+    - live's order: the top 2 x 30 first, then the one-year check, which needs a candle at the
+      cutoff, so a relisted coin is new again;
+    - the default month and cache spill-over.
+  - Reporting only: a verdict that uses it is a registered protocol.
+- **BACKLOG:** the leveraged-token filter also drops JUP and SYRUP (corrected from "JUP" alone); the
+  leveraged tokens themselves stopped trading by 2024-02-28.
+
+**What the numbers say** (`reports/universe-pit-2018-01-01-2026-09.json`, code f4a6122)
+- How the list churns, and what dropped out (renamed coins counted apart):
+
+  | year | coins in the list at some point | stopped trading since | share of member-days | not in the reference's 30 |
+  |---|---|---|---|---|
+  | 2020 | 62 | 13 | 8% | 50 |
+  | 2021 | 147 | 52 | 11% | 128 |
+  | 2022 | 252 | 104 | 10% | 232 |
+  | 2023 | 280 | 98 | 11% | 261 |
+  | 2024 | 286 | 95 | 5% | 264 |
+
+  The backtests' window starts in 2023, when about one member-day in ten was on a coin that has
+  since stopped trading.
+- Fidelity check: on 2026-09-27 it shares 27 of 30 coins with the reference's list, which live's
+  rule built from 24-hour tickers that afternoon.
+- Before 2021 the list is thin (2018: empty until 08-17; 2019: median 7 coins): few USDT pairs had a
+  year of history. Tickers filed as two coins: LUNA (Terra / new), VEN, VIDT.
+- Reproduce:
+    tradebot --config config-agent.yaml universe-history --compare reports/universe-20260927-1513@b068c25-75a58dc389.json
+
+**What needs you**
+- Nothing new.
+
+**What's next** (BACKLOG.md): everything open now waits on time or on you.
+1. Saturday 10-17: the bot's learn is the first with the take-profit touch rule.
+2. Monday 10-19: the first cron weekly, led by that rule's selection change.
+3. The `ml` protocol: paper has 15 of its 100 trades after 2026-09-27.
+4. Live vs backtest candle history: four weeks above 95% uptime.
+5. Whether to measure what survivorship does to the satellite's backtest with the point-in-time
+   list: that is a registered protocol, and it would spend a reserve. My view: worth it before
+   go-live, not yet.
