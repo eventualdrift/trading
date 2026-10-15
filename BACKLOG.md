@@ -11,14 +11,6 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
 
 ## Open
 
-- [ ] **The take-profit rule in the backtest** (fidelity; built 2026-10-13 on the local branch
-  `tp-touch-rule`, 6e61491, held for the owner: under Needs the owner). The backtest counts a target
-  when a candle closes beyond it; paper sells when its 30-second poll sees the price there. The fix
-  (a touch, the stop winning a shared candle after its open) is measured against 1-minute candles: of
-  the 99 exits it adds on the reference, 82 had a full minute beyond the target, 17 only a spike under
-  a minute.
-  - Done when: the owner decides how it reaches paper (it changes learn's selection), then the frozen
-    rerun, ledger notes and gate 1.
 - [ ] **The `ml` protocol** (CLAUDE.md template, family `ml`): decides whether the ML filter comes
   back, on untouched data - at least 100 satellite trades after the reference's data end
   (2026-09-27), so not before the paper reserve has them. The replay models the filter
@@ -51,15 +43,6 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   config and state, the paper bot's strategies); running an instance for a few weeks is the owner's call.
 - [ ] **Paper track record** - the readiness checks in `tradebot report` pass.
 
-## Needs the owner
-
-- [ ] **The take-profit touch rule changes learn's selection** (2026-10-13). On the frozen reference
-  the account replay barely moves, but learn's strategy-alone scores do: run_selection adds
-  breakout@4h (in-sample +0.001R -> +0.090R against the 0.05 floor). Deploying it would change what
-  paper trades at the next weekly learn, and CLAUDE.md makes a registered test the only path to that.
-  Either it lands as a fidelity fix through the weekly learn, or the replay and reconcile take it
-  while learn keeps the close rule until a registered satellite test passes on untouched data.
-
 ## Later
 
 - [ ] **Rank by validated edge?** (low priority; needs untouched data and a registered protocol).
@@ -70,16 +53,36 @@ Mac gave 24% uptime over 09-27 to 10-03 and 16% over the first weekly window.
   satellite (survivorship). Done when: a universe built from volume ranks as of each date
   (including delisted coins) exists, and any use of it in a verdict goes through a registered
   protocol.
+- [ ] **The universe rule's leveraged-token filter also drops JUP** (found 2026-10-14): it excludes
+  every base ending in UP, DOWN, BULL or BEAR (`data/exchange.py: LEVERAGED`), and of the 757 USDT
+  pairs Binance ever listed, the one real coin it catches is JUP (Jupiter, listed 2024). Binance's
+  leveraged tokens are delisted. Changing the filter changes what the bot can trade: a satellite
+  protocol on untouched data, not a fix.
 - [ ] **A social-attention signal** (the owner's item, 2026-10-13): X/Twitter mention volume or
   sentiment as an input. Not pursued until a priced historical source exists: there is no historical
   data at a sane price (full-archive search is Enterprise only; pay-per-use covers 7 days), about 14%
   of crypto accounts are bots, and the effects found are concentrated in memecoins at 1-4 day
   horizons. Then a registered protocol like anything else.
+  - Found 2026-10-14, not yet confirmed (confirming needs an account; the owner's call): LunarCrush
+    (plans $90 / $300 / $900 a month, API included, "daily history back to January 2020"; which plan
+    reaches how far back through the API isn't published) and Santiment (social volume per source
+    from 2016-2018 - Reddit 2016, Twitter 2018-02; Sanbase Pro $49 / Max $249 a month, but their API
+    gives restricted metrics 1-2 years of history; full history on a business plan priced on request).
+    Both aggregate X and other sources, so the bot-share caveat stands.
   - Done when: a historical source with a price is found and recorded here; anything further is a
     registered protocol on untouched data.
 
 ## Done
 
+- [x] The take-profit rule in the backtest (fidelity; the owner's decision 2026-10-14): a candle
+  reaching the target exits there (an open beyond it at the open; the stop wins a shared candle after
+  its open), as paper's 30-second poll sees it. Applied to every use of the backtest, learn included;
+  learn picks with it from its first weekly run after the deploy. Its selection change on the
+  reference (adds breakout@4h) is in the ledger (fidelity-48d1c02) and leads the next Monday summary.
+  48d1c02, deployed in e4f7edd
+- [x] A fidelity fix applies to learn too (the owner's rule, in CLAUDE.md): `tradebot research
+  fidelity --fix <commit>` records the selection change in the ledger; the weekly leads with it once
+  the fix is deployed. e4f7edd
 - [x] Sleeve transfers and the breakers' thresholds: live scales `peak_equity` and `day_start_equity`
   with each transfer, so the satellite stays as far from both limits in percent as the replay's
   rescaled path (under the owner's risk policy: the replay models it, the breakers scenario covers a

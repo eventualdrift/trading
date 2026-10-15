@@ -884,3 +884,85 @@ trade, 2023-01-14)
 3. The `ml` protocol, once the paper reserve has 100 trades after 2026-09-27.
 4. Live vs backtest candle history, which needs four weeks above 95% uptime.
 5. A testnet instance running for a few weeks: your call (`mode: testnet` exists, verified).
+
+## 2026-10-14 - session: the take-profit touch rule deployed; a fidelity fix reaches learn too
+
+Code e4f7edd deployed (the bot restarted 2026-10-15 00:02 UTC) · settings 75a58dc389 (unchanged) · live
+trading refused in code
+
+**What changed** (your decision of 2026-10-14)
+- **The take-profit touch rule is in** (48d1c02, held since 10-13 on `tp-touch-rule`). The backtest
+  counts a target when a candle reaches it, as paper's 30-second poll sees it: a candle opening beyond
+  the target exits at the open, and the stop wins a candle both touch, after its open. It applies to
+  every use of the backtest: the replay, the reconcile, and learn's scoring. The bot's next weekly
+  learn (Saturday 10-17, about 18:37 UTC) is the first to pick strategies with it.
+- **Your rule in CLAUDE.md** (working rules, the fidelity-fix bullet): a fidelity fix applies to every
+  use of the backtest, learn included; a selection change it causes is recorded in the ledger and
+  leads the Monday summary, and is not a stop-and-ask. e4f7edd:
+  - `tradebot research fidelity --fix <commit>` runs learn's selection on the weekly reference's
+    frozen data with the commit before the fix and with the fix, each from a clean copy of its
+    commit. It records the difference in the ledger, once per fix (not a trial: nothing is chosen
+    on it).
+  - `tradebot weekly` puts that change first under "What changed" and in the Telegram summary, at
+    the first check-in after a deploy that contains the fix. Monday 10-19's summary leads with this
+    one.
+- **Review of the new command** (three lenses, a skeptic per finding): 13 findings, 8 confirmed (5
+  distinct, all fixed with tests), 5 refuted. The fixes:
+  - It read only the agent's candle cache. BCH had no 15m/1h candles there, and six coins' 15m/1h
+    stopped about five hours before the data end. On that data, momentum@1h looked selected on both
+    sides. It now fetches what the cache lacks (never saving it) and prints the coins per timeframe;
+    the recorded run had all 30 on every timeframe.
+  - A BTC filter switched on or off for a strategy that stays selected now counts as a change.
+  - The Monday line waits for a deploy containing the fix.
+  - Timeouts are reported cleanly, and two tests now fail if the feature breaks.
+- **Gate 1:** the first run stopped during its first suite (I had wrapped it in a 60-minute timeout
+  and then removed the wrapper, which took the gate with it). Nothing was deployed; the bot stayed on
+  65a1b81. The rerun passed every step: lint, the suite, the suite in a fresh clone, same-trades
+  identical (plain orders and all four scenarios), same orders as the running commit, the container
+  up 45 s.
+- **Ledger:** `fidelity-48d1c02` (the selection change) and fidelity notes on
+  sizing-open-risk-budget-v1, core-robustness, drawdown-limits-v1 and ml-replay-a2.
+- **BACKLOG "Later":** two additions.
+  - Priced social-attention sources: LunarCrush, $90-$900 a month, says daily history from 2020-01.
+    Santiment has social volume per source from 2016-18, but its individual API plans give 1-2 years.
+  - The universe's leveraged-token filter also drops JUP (below).
+
+**What the numbers say** (`--config config-agent.yaml`; the pinned reference
+`reports/universe-20260927-1513@b068c25-75a58dc389.json`; from the satellite's first trade, 2023-01-14)
+- **The account replay barely moves** (ffe53b1 -> 48d1c02, each from a clean copy):
+  - combined Sharpe 1.10 -> 1.10 (end value 2,595 -> 2,594);
+  - satellite 0.59 -> 0.59 (1,413 -> 1,411);
+  - like-for-like worst dips 24.34% and 21.16%, unchanged;
+  - 512 trades taken instead of 511.
+  The drawdown gate's limits from this replay would be 36.51% / 31.74% / 11, unchanged; the set
+  36.48% / 31.71% / 11 stand.
+- **Learn's selection on the same coins and data end** (all 30 coins on 15m, 1h, 4h and 1d):
+  - before the fix: breakout@1d and momentum@1d, both with the BTC filter;
+  - with the fix: those two plus breakout@4h. Its in-sample score goes from +0.001R to +0.090R per
+    trade (1,587 -> 1,649 trades) against the 0.05 floor, out-of-sample from +0.029R to +0.114R.
+  - Every breakout, trend and mean-reversion combination scores higher in-sample, since target
+    exits come earlier; momentum barely moves.
+  - The bot's own learn on 10-17 uses newer data and today's top coins, so its pick can differ.
+    The Monday summary will show both the recorded change and what learn actually did.
+- Reproduce:
+    tradebot --config config-agent.yaml research fidelity --fix 48d1c02   (recorded; a second run is refused)
+    tradebot portfolio-backtest --core-fraction 0.65 --universe-file reports/universe-20260927-1513@b068c25-75a58dc389.json
+
+**What needs you**
+- Nothing to decide. For information:
+  - Saturday's learn is the first with the touch rule, and Monday's summary leads with its effect.
+  - The social-attention sources would need an account to confirm their history depth; only if you
+    want to pursue it.
+  - JUP: the universe rule drops it because its name ends in UP, like a leveraged token. Changing
+    the filter is a registered test, not a fix, so it waits in "Later".
+  - `~/tradebot/config.yaml` still says `# halt (until /resume)` on the max_drawdown_pct line; the
+    code resumes at the next daily close.
+
+**What's next** (BACKLOG.md)
+1. The candle-window check in the reconcile (built and reviewed, next through gate 1): a signal only
+   one side had is re-checked on the candles live's scan had, which says whether live's 1000-candle
+   window explains it. The backlog item then needs its four weeks above 95% uptime.
+2. The point-in-time universe ("Later"): built from Binance's public archive (757 USDT pairs, delisted
+   ones included); first run in progress.
+3. Monday 10-19: the first cron weekly, led by the take-profit rule's selection change.
+4. The `ml` protocol: paper has 15 of the 100 trades it needs after 2026-09-27.
